@@ -469,7 +469,22 @@ J2O_DATA
         data_json = json.dumps(data, ensure_ascii=False)
         # Use Ruby heredoc with literal syntax (<<-'X') to prevent \u escape interpretation
         # NOTE: OpenProject 15+ requires using journal_notes/journal_user + save!
-        # instead of direct journals.create! to properly set validity_period and data_type
+        # instead of direct journals.create! to properly set validity_period and data_type.
+        #
+        # Date fidelity (#260): OpenProject has no DB trigger on journals —
+        # validity_period is derived in Ruby from a journal's created_at only
+        # when the *next* journal for the same journable is created (closing
+        # the previous one). update_columns(created_at:) therefore leaves
+        # validity_period stale until some later journal closes it — at which
+        # point OpenProject re-reads the now-backdated created_at and produces
+        # a range that overlaps whatever was already closed before it,
+        # tripping the non_overlapping_journals_validity_periods exclusion
+        # constraint. Confirmed via psql: no trigger on `journals`, and the
+        # constraint is DEFERRABLE. So instead of patching created_at
+        # per-comment, all of a WP's comments are created first, then its
+        # whole validity_period chain is rebuilt once with the constraint
+        # deferred to COMMIT — Postgres only checks for overlaps against the
+        # final state, not each intermediate write.
         script = f"""
           require 'json'
           data = JSON.parse(<<-'J2O_DATA'
@@ -477,7 +492,7 @@ J2O_DATA
 J2O_DATA
 )
 
-          results = {{ created: 0, skipped: 0, failed: 0, errors: [] }}
+          results = {{ created: 0, skipped: 0, failed: 0, errors: [], date_not_backdated: 0 }}
           default_user = User.current || User.find_by(admin: true)
 
           # Pre-fetch all referenced WPs and Users to avoid N+1 queries
@@ -499,56 +514,131 @@ J2O_DATA
               set.add([wp_id, m[1]]) if m
             end
 
-          data.each do |item|
-            begin
-              wp = wps[item['work_package_id']]
-              unless wp
+          # Group by work package: every comment for a WP must exist before
+          # its validity_period chain is rebuilt once, atomically (#260).
+          by_wp = data.group_by {{ |d| d['work_package_id'] }}
+
+          by_wp.each do |wp_id, items|
+            wp = wps[wp_id]
+            unless wp
+              items.each do |item|
                 results[:failed] += 1
-                results[:errors] << {{ wp_id: item['work_package_id'], error: 'WorkPackage not found' }}
-                next
+                results[:errors] << {{ wp_id: wp_id, error: 'WorkPackage not found' }}
+              end
+              next
+            end
+
+            backdates = []
+
+            items.each do |item|
+              begin
+                # Idempotency: skip if this jira_comment_id already migrated for this WP
+                jira_cid = item['jira_comment_id']
+                if jira_cid && migrated_pairs.include?([wp_id, jira_cid])
+                  results[:skipped] += 1
+                  next
+                end
+
+                user = item['user_id'] ? (users[item['user_id']] || default_user) : default_user
+                user ||= default_user
+
+                comment_text = item['comment'].to_s
+                next if comment_text.empty?
+
+                # The same WorkPackage object is reused for every comment of this
+                # WP (pre-fetched once into `wps`). Reload it so each comment
+                # starts from fresh persisted state — reusing the stale in-memory
+                # object (cached journals association / lock_version) made the
+                # 2nd+ save fail, so only the first comment per WP persisted (#260).
+                wp.reload
+
+                # OpenProject 15+ journal creation - use journal_notes/journal_user
+                wp.journal_notes = comment_text
+                wp.journal_user = user
+                wp.save!
+
+                # Record the target date for the chain rebuild below instead of
+                # patching created_at right away (#260 — see method docstring).
+                raw_created = item['created_at']
+                if raw_created && !raw_created.to_s.strip.empty?
+                  ts = Time.zone.parse(raw_created.to_s)
+                  backdates << [wp.journals.last.id, ts] if ts
+                end
+
+                results[:created] += 1
+              rescue => e
+                results[:failed] += 1
+                results[:errors] << {{ wp_id: wp_id, error: e.message }}
+              end
+            end
+
+            next if backdates.empty?
+
+            begin
+              ActiveRecord::Base.transaction do
+                ActiveRecord::Base.connection.execute(
+                  'SET CONSTRAINTS non_overlapping_journals_validity_periods DEFERRED',
+                )
+
+                backdate_by_id = backdates.to_h
+                chain = Journal
+                  .where(journable_type: 'WorkPackage', journable_id: wp_id)
+                  .order(:id)
+                  .pluck(:id, :created_at)
+                  .map {{ |jid, created_at| [jid, backdate_by_id[jid] || created_at] }}
+                  .sort_by {{ |_, effective_created_at| effective_created_at }}
+
+                # Two journals sharing the exact same timestamp (e.g. two Jira
+                # comments posted the same second) would otherwise produce a
+                # zero-width [t, t) range for the earlier one, violating the
+                # journals_validity_period_not_empty check constraint. Nudge
+                # each colliding timestamp 1ms past its predecessor — same
+                # fix as the original #260 duplicate-timestamp bug, applied
+                # here to the chain-rebuild's own sort order.
+                chain.each_cons(2) do |earlier, later|
+                  later[1] = earlier[1] + 0.001 if later[1] <= earlier[1]
+                end
+
+                chain.each_with_index do |(jid, lower), idx|
+                  upper = idx < chain.length - 1 ? chain[idx + 1][1] : nil
+                  lower_lit = ActiveRecord::Base.connection.quote(lower.utc.iso8601(6))
+                  # validity_period is tstzrange (timestamp WITH time zone), not
+                  # tsrange — tsrange has no overload accepting timestamptz
+                  # arguments, which raised PG::UndefinedFunction here.
+                  range_sql = if upper
+                                upper_lit = ActiveRecord::Base.connection.quote(upper.utc.iso8601(6))
+                                "tstzrange(#{{lower_lit}}::timestamptz, #{{upper_lit}}::timestamptz, '[)')"
+                              else
+                                "tstzrange(#{{lower_lit}}::timestamptz, NULL, '[)')"
+                              end
+
+                  if backdate_by_id.key?(jid)
+                    ts_lit = ActiveRecord::Base.connection.quote(backdate_by_id[jid].utc.iso8601(6))
+                    sql = "UPDATE journals SET created_at = #{{ts_lit}}::timestamptz, " +
+                          "updated_at = #{{ts_lit}}::timestamptz, validity_period = #{{range_sql}} " +
+                          "WHERE id = #{{jid}}"
+                    ActiveRecord::Base.connection.execute(sql)
+                  else
+                    ActiveRecord::Base.connection.execute(
+                      "UPDATE journals SET validity_period = #{{range_sql}} WHERE id = #{{jid}}",
+                    )
+                  end
+                end
               end
 
-              # Idempotency: skip if this jira_comment_id already migrated for this WP
-              jira_cid = item['jira_comment_id']
-              if jira_cid && migrated_pairs.include?([item['work_package_id'], jira_cid])
-                results[:skipped] += 1
-                next
-              end
-
-              user = item['user_id'] ? (users[item['user_id']] || default_user) : default_user
-              user ||= default_user
-
-              comment_text = item['comment'].to_s
-              next if comment_text.empty?
-
-              # The same WorkPackage object is reused for every comment of this
-              # WP (pre-fetched once into `wps`). Reload it so each comment
-              # starts from fresh persisted state — reusing the stale in-memory
-              # object (cached journals association / lock_version) made the
-              # 2nd+ save fail, so only the first comment per WP persisted (#260).
-              wp.reload
-
-              # OpenProject 15+ journal creation - use journal_notes/journal_user
-              wp.journal_notes = comment_text
-              wp.journal_user = user
-              wp.save!
-              # Back-date the journal to the original Jira comment date (#260).
-              # journal_notes/save! stamps created_at = NOW; update_columns
-              # bypasses callbacks/validations to set the historical timestamp
-              # OpenProject displays as the comment date. validity_period is left
-              # as OpenProject set it (used only for historical baseline queries).
-              # Time.zone.parse returns nil (not an exception) for unparseable
-              # input, so a bad date simply leaves the journal's default timestamp.
-              raw_created = item['created_at']
-              if raw_created && !raw_created.to_s.strip.empty?
-                ts = Time.zone.parse(raw_created.to_s)
-                j = wp.journals.last
-                j.update_columns(created_at: ts, updated_at: ts) if j && ts
-              end
-              results[:created] += 1
+              # Verify the write actually stuck instead of trusting it blindly
+              # (#260) — if some undocumented OpenProject behavior re-derives
+              # validity_period differently than assumed, this fails loudly
+              # here rather than silently keeping the wrong date.
+              actual = Journal.where(id: backdates.map(&:first)).pluck(:id, :created_at).to_h
+              bad = backdates.reject {{ |jid, ts| actual[jid] && (actual[jid] - ts).abs < 0.001 }}
+              raise "post-write verification failed for journal ids: #{{bad.map(&:first)}}" if bad.any?
             rescue => e
-              results[:failed] += 1
-              results[:errors] << {{ wp_id: item['work_package_id'], error: e.message }}
+              results[:date_not_backdated] += backdates.size
+              results[:errors] << {{
+                wp_id: wp_id,
+                warning: "created_at not backdated for #{{backdates.size}} comment(s): #{{e.message}}",
+              }}
             end
           end
 

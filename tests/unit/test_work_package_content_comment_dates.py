@@ -200,11 +200,60 @@ class TestBulkCreateBackdatesJournal:
                 fromlist=["OpenProjectWorkPackageContentService"],
             ).OpenProjectWorkPackageContentService.bulk_create_work_package_activities
         )
-        # The script must, after save!, set the new journal's created_at from the
-        # comment date (guarded by presence of created_at).
+        # The script must, after save!, capture the comment date for the later
+        # chain rebuild (guarded by presence of created_at).
         assert "created_at" in source, "bulk script never references created_at"
-        assert "update_columns" in source, "bulk script must update_columns the journal's created_at"
         assert "Time.zone.parse" in source, "bulk script must parse the ISO comment date"
+
+    def test_ruby_script_rebuilds_validity_period_chain_with_deferred_constraint(self) -> None:
+        """Date fidelity (#260): update_columns alone leaves validity_period stale
+        until a later journal for the same WP closes it, at which point
+        OpenProject re-derives the range from the now-backdated created_at and
+        can overlap an already-closed sibling range (PG::ExclusionViolation on
+        non_overlapping_journals_validity_periods). Confirmed via psql: no DB
+        trigger maintains validity_period, and the exclusion constraint is
+        DEFERRABLE. So the whole chain for a WP must be rebuilt in one
+        transaction with the constraint deferred to COMMIT, not patched
+        journal-by-journal.
+        """
+        source = inspect.getsource(
+            __import__(
+                "src.infrastructure.openproject.openproject_work_package_content_service",
+                fromlist=["OpenProjectWorkPackageContentService"],
+            ).OpenProjectWorkPackageContentService.bulk_create_work_package_activities
+        )
+        assert "group_by" in source, "comments must be grouped by work package before rebuilding the chain"
+        assert "SET CONSTRAINTS" in source and "DEFERRED" in source, (
+            "the non_overlapping_journals_validity_periods exclusion constraint must be "
+            "deferred to COMMIT so the whole chain can be rewritten atomically"
+        )
+        assert "non_overlapping_journals_validity_periods" in source
+        assert "tstzrange" in source, (
+            "validity_period is tstzrange (timestamptz), not tsrange (bare timestamp) — "
+            "tsrange has no overload accepting timestamptz args (PG::UndefinedFunction)"
+        )
+        assert "date_not_backdated" in source, (
+            "a failed chain rebuild must be counted separately from a failed comment — "
+            "the comment itself is still migrated, only its date fidelity is lost"
+        )
+
+    def test_ruby_script_dedupes_colliding_timestamps_before_building_ranges(self) -> None:
+        """Two journals sharing the exact same timestamp (e.g. two Jira comments
+        posted the same second) sort adjacently with an equal created_at, which
+        would produce a zero-width [t, t) range for the earlier one and violate
+        the journals_validity_period_not_empty check constraint — the same
+        duplicate-timestamp bug (#260) previously fixed with a 1ms offset, now
+        needed again in the chain-rebuild's own sort order.
+        """
+        source = inspect.getsource(
+            __import__(
+                "src.infrastructure.openproject.openproject_work_package_content_service",
+                fromlist=["OpenProjectWorkPackageContentService"],
+            ).OpenProjectWorkPackageContentService.bulk_create_work_package_activities
+        )
+        assert "each_cons" in source, "chain must be walked pairwise to detect colliding timestamps"
+        assert "0.001" in source, "a colliding timestamp must be nudged forward by 1ms"
+        assert "journals_validity_period_not_empty" in source
 
 
 # ---------------------------------------------------------------------------

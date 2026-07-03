@@ -856,6 +856,20 @@ class WorkPackageContentMigration(BaseMigration):
                         result.get("success"),
                         (result.get("errors") or [])[:3],
                     )
+                # Comments that were created but couldn't get their validity_period
+                # chain rebuilt keep the migration-run date instead of the true
+                # Jira date — surface this instead of hiding it in the created
+                # count, mirroring how comments_failed is surfaced above (#260).
+                date_not_backdated = int(result.get("date_not_backdated", 0) or 0)
+                results["comment_dates_not_preserved"] = date_not_backdated
+                if date_not_backdated:
+                    self.logger.warning(
+                        "%d comment(s) migrated but kept the migration-run date "
+                        "instead of the original Jira date (validity_period chain "
+                        "rebuild failed) — see #260. First errors: %s",
+                        date_not_backdated,
+                        [e for e in (result.get("errors") or []) if "warning" in e][:3],
+                    )
             except Exception as e:
                 # A thrown bulk call drops the whole batch of comments; record
                 # and warn rather than swallowing it at debug level (#260).
