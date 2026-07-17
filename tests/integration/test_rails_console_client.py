@@ -315,6 +315,18 @@ irb(main):002:0>
         ):
             self.rails_client.execute("some command")
 
+    def test_escape_command_passes_through_unchanged(self) -> None:
+        r"""``send-keys`` runs via subprocess argv (no shell), so a command
+        built with ``escape_ruby_single_quoted`` — which already produces a
+        valid Ruby escape like ``\\'`` for an apostrophe — must reach the
+        pane byte-for-byte. Re-escaping its backslash here (the old
+        behaviour) turned ``\\'`` into ``\\\\'``, which Ruby reads as an
+        escaped backslash followed by an unescaped quote, terminating the
+        string early and stalling the console mid-statement.
+        """
+        command = r"cv.value = 'state=\'OPEN\' cost=$100 cmd=`date`'"
+        assert self.rails_client._escape_command(command) == command
+
 
 if __name__ == "__main__":
     unittest.main()

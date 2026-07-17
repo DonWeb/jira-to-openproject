@@ -143,6 +143,14 @@ class CustomFieldsGenericMigration(BaseMigration):  # noqa: D101
         failed = 0
         # Track projects per CF for selective enablement
         cf_to_projects: dict[int, set[int]] = {}
+        # Fields like "Development" or "Rank" repeat across most work
+        # packages; resolving the same (name, format) via a fresh Rails
+        # console round-trip for every WP turned a handful of distinct
+        # fields into ~700 redundant lookups on a 487-item run, piling
+        # enough load on the single persistent console/tmux pipe to make it
+        # occasionally miss the "Console not ready" timeout. Cache the
+        # resolved id per (name, format) for the rest of this run.
+        cf_id_by_name_format: dict[tuple[str, str], int] = {}
 
         # Ensure CFs exist and apply values per WP
         for wp_id, cf_specs in values_by_wp.items():
@@ -154,7 +162,11 @@ class CustomFieldsGenericMigration(BaseMigration):  # noqa: D101
                     continue
                 seen.add(name)
                 try:
-                    cf_id = self._ensure_wp_custom_field(name, field_format or "text")
+                    cache_key = (name, field_format or "text")
+                    cf_id = cf_id_by_name_format.get(cache_key)
+                    if cf_id is None:
+                        cf_id = self._ensure_wp_custom_field(*cache_key)
+                        cf_id_by_name_format[cache_key] = cf_id
                     # Track project for selective enablement
                     if project_id:
                         cf_to_projects.setdefault(cf_id, set()).add(project_id)

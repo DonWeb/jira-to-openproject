@@ -150,3 +150,62 @@ def test_load_writes_actual_cf_value_not_placeholder(monkeypatch: pytest.MonkeyP
     joined = "\n".join(set_scripts)
     assert "Free text" in joined, "actual Jira CF value must be written, not discarded"
     assert "=> 'set'" not in joined, "placeholder 'set' must not replace the real value"
+
+
+def test_load_resolves_each_cf_name_only_once_across_work_packages(monkeypatch: pytest.MonkeyPatch):
+    """Custom fields shared by many WPs (e.g. Jira's "Development" field)
+    must be resolved via ``_ensure_wp_custom_field`` once per run, not once
+    per work package. On a 487-item production run this repeat lookup
+    turned 4 distinct field names into ~700 redundant Rails console
+    round-trips, piling enough load on the single persistent console to
+    make it occasionally miss the "Console not ready" timeout.
+    """
+    import src.config as cfg
+
+    class MultiWpMappings:
+        def __init__(self) -> None:
+            self._m = {
+                "work_package": {
+                    "144952": {"jira_key": "PRJ-1", "openproject_id": 20001},
+                    "144953": {"jira_key": "PRJ-2", "openproject_id": 20002},
+                    "144954": {"jira_key": "PRJ-3", "openproject_id": 20003},
+                },
+                "custom_field": {
+                    "customfield_10011": {
+                        "jira_id": "customfield_10011",
+                        "jira_name": "Text Field",
+                        "openproject_name": "Text Field",
+                        "openproject_type": "text",
+                    },
+                },
+            }
+
+        def get_mapping(self, name: str):
+            return self._m.get(name, {})
+
+    monkeypatch.setattr(cfg, "mappings", MultiWpMappings(), raising=False)
+
+    class CountingJira(DummyJira):
+        def batch_get_issues(self, keys):
+            return {k: DummyIssue(k) for k in ["PRJ-1", "PRJ-2", "PRJ-3"]}
+
+    class CountingOp(DummyOp):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_calls = 0
+
+        def ensure_wp_custom_field_id(self, name: str, field_format: str = "text") -> int:
+            self.ensure_calls += 1
+            return 801
+
+    op = CountingOp()
+    mig = CustomFieldsGenericMigration(jira_client=CountingJira(), op_client=op)  # type: ignore[arg-type]
+    ld = mig._load(mig._map(mig._extract()))
+    # Each DummyIssue carries 2 custom fields (see FieldsObj), so 3 work
+    # packages x 2 fields = 6 value-set calls — but only 2 *distinct*
+    # (name, format) pairs across the whole run.
+    assert ld.updated == 6, "all three work packages must still get both their values written"
+    assert op.ensure_calls == 2, (
+        "each distinct (name, format) custom field must be resolved once for the "
+        f"whole run, not once per work package (was called {op.ensure_calls} times)"
+    )

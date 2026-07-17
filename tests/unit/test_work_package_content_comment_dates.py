@@ -255,6 +255,31 @@ class TestBulkCreateBackdatesJournal:
         assert "0.001" in source, "a colliding timestamp must be nudged forward by 1ms"
         assert "journals_validity_period_not_empty" in source
 
+    def test_ruby_script_keeps_chain_in_id_order_not_effective_date_order(self) -> None:
+        """OpenProject always closes the highest-id ("last") journal for a
+        journable when creating the next one — that journal is the only one
+        whose validity_period may be open (upper=nil) at any given time.
+
+        Sorting the rebuilt chain by effective/backdated timestamp instead of
+        id would let a Jira comment backdated earlier than a same-WP journal
+        created earlier in this run (e.g. a description/custom-field save
+        with a real, migration-time timestamp) push that earlier-id journal
+        to the end of the chain and mark it open instead. The work package
+        then carries two simultaneously-open journals, and the next native
+        save (e.g. customfields_generic's wp.save!) trips
+        non_overlapping_journals_validity_periods trying to open a third.
+        """
+        source = inspect.getsource(
+            __import__(
+                "src.infrastructure.openproject.openproject_work_package_content_service",
+                fromlist=["OpenProjectWorkPackageContentService"],
+            ).OpenProjectWorkPackageContentService.bulk_create_work_package_activities
+        )
+        assert "sort_by" not in source, (
+            "the chain must stay in id (creation) order — sorting by effective/backdated "
+            "timestamp can mark the wrong journal as the open (upper=nil) one"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 4. Single-comment path forwards + back-dates

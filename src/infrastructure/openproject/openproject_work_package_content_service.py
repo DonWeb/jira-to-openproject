@@ -580,21 +580,37 @@ J2O_DATA
                   'SET CONSTRAINTS non_overlapping_journals_validity_periods DEFERRED',
                 )
 
+                # The chain MUST stay in id order (real creation order), not
+                # be re-sorted by effective/backdated timestamp. OpenProject's
+                # own journal creation always closes the highest-id ("last")
+                # journal for a journable when it creates the next one — that
+                # is the only journal with an open (upper=nil) validity_period
+                # at any given time. A WP whose comments are backdated to Jira
+                # dates earlier than a same-WP journal created earlier in this
+                # run (e.g. a description/custom-field save with a real,
+                # migration-time timestamp) would, if the chain were sorted by
+                # effective date, push that earlier-id/later-timestamp journal
+                # to the end of the chain and mark IT open instead of the
+                # highest-id comment journal. The WP then ends up with two
+                # journals whose validity_period is open at once, and the
+                # next native save (e.g. customfields_generic's wp.save!)
+                # trips non_overlapping_journals_validity_periods trying to
+                # open a third.
                 backdate_by_id = backdates.to_h
                 chain = Journal
                   .where(journable_type: 'WorkPackage', journable_id: wp_id)
                   .order(:id)
                   .pluck(:id, :created_at)
                   .map {{ |jid, created_at| [jid, backdate_by_id[jid] || created_at] }}
-                  .sort_by {{ |_, effective_created_at| effective_created_at }}
 
-                # Two journals sharing the exact same timestamp (e.g. two Jira
-                # comments posted the same second) would otherwise produce a
-                # zero-width [t, t) range for the earlier one, violating the
-                # journals_validity_period_not_empty check constraint. Nudge
-                # each colliding timestamp 1ms past its predecessor — same
-                # fix as the original #260 duplicate-timestamp bug, applied
-                # here to the chain-rebuild's own sort order.
+                # A backdated (or duplicate-timestamp) journal can end up with
+                # an effective timestamp at or before its id-order predecessor
+                # — e.g. a Jira comment dated earlier than a same-WP journal
+                # created earlier in this run, or two comments posted the same
+                # second. Either would produce a zero-width or negative-width
+                # range, violating journals_validity_period_not_empty. Nudge
+                # each such timestamp 1ms past its predecessor, preserving id
+                # order (#260).
                 chain.each_cons(2) do |earlier, later|
                   later[1] = earlier[1] + 0.001 if later[1] <= earlier[1]
                 end

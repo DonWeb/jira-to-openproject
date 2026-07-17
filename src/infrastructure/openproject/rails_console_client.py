@@ -317,16 +317,33 @@ class RailsConsoleClient:
             raise ConsoleNotReadyError(msg) from e
 
     def _escape_command(self, command: str) -> str:
-        """Escape a command for tmux send-keys.
+        r"""Pass a command through unchanged for tmux send-keys.
+
+        ``send-keys`` is invoked via ``subprocess.run`` with an argv list (no
+        ``shell=True``), so the pane never runs the text through a shell —
+        tmux either matches the whole argument to a key name (``Enter``,
+        ``C-c``, ...) or types it as literal UTF-8 keystrokes. There is no
+        shell metacharacter to protect against, so backslash/backtick/dollar
+        must reach the pane byte-for-byte.
+
+        This used to double backslashes and escape ``$``/backtick as if
+        headed for a shell. Any caller building a query with
+        ``escape_ruby_single_quoted`` (e.g. customfields_generic setting a
+        value containing a quote) already emits a valid Ruby escape like
+        ``\\'``; re-escaping its backslash here turned that into ``\\\\'``,
+        which Ruby reads as an escaped backslash followed by an *unescaped*
+        quote — terminating the string early and leaving the console stuck
+        in a multi-line continuation prompt (reported upstream as "Console
+        not ready").
 
         Args:
-            command: Command to escape
+            command: Command to send.
 
         Returns:
-            Escaped command
+            The command unchanged.
 
         """
-        return command.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
+        return command
 
     def execute(
         self,
