@@ -309,7 +309,9 @@ class AgileBoardMigration(BaseMigration):
         versions: list[dict[str, Any]] = mapped.data.get("versions", [])
 
         created_queries = 0
+        existing_queries = 0
         created_versions = 0
+        existing_versions = 0
         errors = 0
         sprint_mapping_updates: dict[str, Any] = {}
 
@@ -317,8 +319,17 @@ class AgileBoardMigration(BaseMigration):
             try:
                 result = self.op_client.create_or_update_query(**payload)
                 if result.get("success"):
+                    # ``created`` distinguishes a brand-new row from one that
+                    # ``find_or_initialize_by`` matched by name — both count
+                    # as success, but only the former is a net-new query.
+                    # Tracking both (instead of only ``created``) is what
+                    # made a re-run's "0 created" distinguishable from
+                    # "0 attempted" — previously indistinguishable from the
+                    # logs alone.
                     if result.get("created"):
                         created_queries += 1
+                    else:
+                        existing_queries += 1
                 else:
                     errors += 1
             except Exception as exc:
@@ -332,6 +343,8 @@ class AgileBoardMigration(BaseMigration):
                 if result.get("success"):
                     if result.get("created"):
                         created_versions += 1
+                    else:
+                        existing_versions += 1
                     if jira_sprint_id:
                         entry = {
                             "openproject_id": result.get("id"),
@@ -364,7 +377,9 @@ class AgileBoardMigration(BaseMigration):
             failed_count=errors,
             details={
                 "queries_created": created_queries,
+                "queries_existing": existing_queries,
                 "versions_created": created_versions,
+                "versions_existing": existing_versions,
                 "errors": errors,
                 "skipped_boards": len(mapped.data.get("skipped_boards", [])),
                 "skipped_sprints": len(mapped.data.get("skipped_sprints", [])),
@@ -394,9 +409,11 @@ class AgileBoardMigration(BaseMigration):
         result = self._load(mapped)
         if result.success:
             self.logger.info(
-                "Agile migration complete (queries=%s, versions=%s)",
+                "Agile migration complete (queries=%s created + %s existing, versions=%s created + %s existing)",
                 result.details.get("queries_created", 0),
+                result.details.get("queries_existing", 0),
                 result.details.get("versions_created", 0),
+                result.details.get("versions_existing", 0),
             )
         else:
             self.logger.error(

@@ -38,17 +38,18 @@ class DummyJira:
 
 
 class DummyOp:
-    def __init__(self) -> None:
+    def __init__(self, *, report_as_created: bool = True) -> None:
         self.created_queries: list[dict] = []
         self.created_versions: list[dict] = []
+        self._report_as_created = report_as_created
 
     def create_or_update_query(self, **payload):
         self.created_queries.append(payload)
-        return {"success": True, "created": True, "id": 700 + len(self.created_queries)}
+        return {"success": True, "created": self._report_as_created, "id": 700 + len(self.created_queries)}
 
     def ensure_project_version(self, **payload):
         self.created_versions.append(payload)
-        return {"success": True, "created": True, "id": 800 + len(self.created_versions)}
+        return {"success": True, "created": self._report_as_created, "id": 800 + len(self.created_versions)}
 
 
 @pytest.fixture
@@ -121,6 +122,39 @@ def test_agile_board_migration_end_to_end_creates_query_and_version(
     assert result.details["versions_created"] == 1
     # Closed status only on `state == 'closed'`; an active sprint must remain "open".
     assert op.created_versions[0]["status"] == "open"
+
+
+def test_agile_board_migration_distinguishes_created_from_already_existing(
+    _mock_mappings: None,
+) -> None:
+    """A re-run where Rails matches existing rows must report *_existing, not just 0 created.
+
+    Previously ``queries_created``/``versions_created`` staying at 0 on a re-run was
+    indistinguishable from "nothing was even attempted" — this regression covers the
+    fix: a successful ``create_or_update_query``/``ensure_project_version`` call with
+    ``created: False`` (an idempotent match on a pre-existing row) must count toward
+    ``queries_existing``/``versions_existing`` instead of vanishing from the totals.
+    """
+    boards = [
+        {"id": 1, "name": "Sprint Board", "type": "scrum", "location": {"projectKey": "PROJ"}},
+    ]
+    configs = {1: {"columnConfig": {"columns": []}, "filter": {}}}
+    sprints = {1: [{"id": 42, "name": "Sprint 1", "state": "active"}]}
+    op = DummyOp(report_as_created=False)
+    mig = AgileBoardMigration(
+        jira_client=DummyJira(boards=boards, sprints_by_board=sprints, configurations_by_board=configs),
+        op_client=op,
+    )  # type: ignore[arg-type]
+
+    extracted = mig._extract()
+    mapped = mig._map(extracted)
+    result = mig._load(mapped)
+
+    assert result.success is True
+    assert result.details["queries_created"] == 0
+    assert result.details["queries_existing"] == 1
+    assert result.details["versions_created"] == 0
+    assert result.details["versions_existing"] == 1
 
 
 def test_agile_board_migration_resolves_project_via_board_projects_endpoint_when_location_missing(
