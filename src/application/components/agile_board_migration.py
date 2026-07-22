@@ -95,23 +95,28 @@ class AgileBoardMigration(BaseMigration):
             except Exception:
                 board_sprints = []
 
-            # The Jira Agile REST API (v1.0, Server/DC and Cloud alike) puts
-            # the project key at ``location.key`` — ``projectKey`` is not a
-            # field this endpoint returns. Check it first; keep the other
-            # two as a defensive fallback in case a specific Jira version
-            # emits a different shape.
+            # ``location`` (and hence ``location.key``/``projectKey``) is a
+            # Cloud-only field — confirmed live on this Jira Server/DC
+            # instance, where every board dict only has
+            # ``id``/``name``/``self``/``type`` and ``location`` is always
+            # absent. Fall back to the dedicated project-association
+            # endpoint (``GET /rest/agile/1.0/board/{id}/project``), which
+            # this Jira version does support.
             location = board.get("location") or {}
             project_key = location.get("key") or location.get("projectKey") or board.get("locationProjectKey")
 
             if not project_key:
-                # ``location.key`` alone did not resolve it either (confirmed
-                # live: still 0 boards mapped after that fix), so this Jira
-                # Server/DC version's ``/rest/agile/1.0/board`` list response
-                # must have a different shape than assumed. Log the raw board
-                # dict's keys and its ``location`` value to get ground truth
-                # instead of guessing at another field name blind.
+                try:
+                    board_projects = self.jira_client.get_board_projects(board_id)
+                except Exception:
+                    board_projects = []
+                if board_projects:
+                    project_key = board_projects[0].get("key")
+
+            if not project_key:
                 self.logger.warning(
-                    "Board %s ('%s') has no resolvable project key; raw board keys=%s, location=%r",
+                    "Board %s ('%s') has no resolvable project key via location or "
+                    "the board/project endpoint; raw board keys=%s, location=%r",
                     board_id,
                     board.get("name"),
                     sorted(board.keys()),

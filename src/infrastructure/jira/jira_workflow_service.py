@@ -240,10 +240,30 @@ class JiraWorkflowService:
             response.raise_for_status()
             payload = response.json()
             values = payload.get("values") if isinstance(payload, dict) else None
+            if isinstance(values, list) and not values:
+                # A 200 with zero matches means ``workflowName`` did not match
+                # any workflow on the server — could be a permission filter
+                # (some Jira admin endpoints silently drop results the token's
+                # user can't see), a name mismatch, or an unsupported filter
+                # param on this Jira version. Log at WARNING (not the usual
+                # DEBUG) so the next live run shows which case it is instead
+                # of silently looking identical to "workflow has 0 transitions".
+                self._logger.warning(
+                    "Workflow '%s' matched 0 entries via /workflow/search (workflowName filter); "
+                    "raw payload keys=%s, total=%s",
+                    workflow_name,
+                    sorted(payload.keys()) if isinstance(payload, dict) else None,
+                    payload.get("total") if isinstance(payload, dict) else None,
+                )
+                return []
             workflow = values[0] if isinstance(values, list) and values else None
             transitions = workflow.get("transitions") if isinstance(workflow, dict) else None
             if not isinstance(transitions, list):
-                self._logger.warning("Unexpected workflow transitions payload for %s", workflow_name)
+                self._logger.warning(
+                    "Unexpected workflow transitions payload for %s; workflow entry keys=%s",
+                    workflow_name,
+                    sorted(workflow.keys()) if isinstance(workflow, dict) else type(workflow).__name__,
+                )
                 return []
             self._logger.debug(
                 "Workflow '%s' returned %s transitions",

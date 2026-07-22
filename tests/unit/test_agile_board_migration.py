@@ -17,10 +17,12 @@ class DummyJira:
         boards: list[dict] | None = None,
         sprints_by_board: dict[int, list[dict]] | None = None,
         configurations_by_board: dict[int, dict] | None = None,
+        projects_by_board: dict[int, list[dict]] | None = None,
     ) -> None:
         self._boards = boards if boards is not None else []
         self._sprints = sprints_by_board or {}
         self._configs = configurations_by_board or {}
+        self._projects = projects_by_board or {}
 
     def get_boards(self):
         return self._boards
@@ -30,6 +32,9 @@ class DummyJira:
 
     def get_board_sprints(self, board_id):
         return self._sprints.get(board_id, [])
+
+    def get_board_projects(self, board_id):
+        return self._projects.get(board_id, [])
 
 
 class DummyOp:
@@ -116,6 +121,35 @@ def test_agile_board_migration_end_to_end_creates_query_and_version(
     assert result.details["versions_created"] == 1
     # Closed status only on `state == 'closed'`; an active sprint must remain "open".
     assert op.created_versions[0]["status"] == "open"
+
+
+def test_agile_board_migration_resolves_project_via_board_projects_endpoint_when_location_missing(
+    _mock_mappings: None,
+) -> None:
+    """Server/DC boards with no ``location`` field fall back to ``get_board_projects``."""
+    boards = [
+        {
+            "id": 2,
+            "name": "Kanban Board",
+            "type": "kanban",
+            # No "location" key at all — confirmed live shape on Jira Server/DC.
+        },
+    ]
+    configs = {2: {"columnConfig": {"columns": []}, "filter": {}}}
+    projects = {2: [{"key": "PROJ", "id": "11", "name": "Project"}]}
+    op = DummyOp()
+    mig = AgileBoardMigration(
+        jira_client=DummyJira(boards=boards, configurations_by_board=configs, projects_by_board=projects),
+        op_client=op,
+    )  # type: ignore[arg-type]
+
+    extracted = mig._extract()
+    mapped = mig._map(extracted)
+    result = mig._load(mapped)
+
+    assert mapped.details["skipped_boards"] == 0
+    assert mapped.details["queries"] == 1
+    assert result.details["queries_created"] == 1
 
 
 def test_agile_board_migration_skips_unmapped_project_boards_and_sprints(

@@ -763,6 +763,10 @@ class JiraClient:
         """Thin delegator over ``self.agile.get_board_sprints``."""
         return self.agile.get_board_sprints(board_id)
 
+    def get_board_projects(self, board_id: int) -> list[dict[str, Any]]:
+        """Thin delegator over ``self.agile.get_board_projects``."""
+        return self.agile.get_board_projects(board_id)
+
     # ---------------------------------------------------------------------- #
     # Reporting helpers (filters & dashboards)                               #
     # ---------------------------------------------------------------------- #

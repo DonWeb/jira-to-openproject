@@ -164,3 +164,50 @@ class JiraAgileService:
             error_msg = f"Failed to fetch sprints for board {board_id}: {exc!s}"
             self._logger.exception(error_msg)
             raise JiraApiError(error_msg) from exc
+
+    def get_board_projects(self, board_id: int) -> list[dict[str, Any]]:
+        """Return the Jira projects associated with a Jira Software board.
+
+        ``GET /rest/agile/1.0/board`` (``get_boards``) does not include a
+        ``location`` field on every Jira Server/DC version — confirmed live
+        on this instance, where each board dict only has
+        ``id``/``name``/``self``/``type``. This dedicated endpoint is the
+        documented way to resolve a board's project association when
+        ``location`` is absent.
+        """
+        client = self._client
+        if not client.jira:
+            msg = "Jira client is not initialized"
+            raise JiraConnectionError(msg)
+
+        url = f"{client.base_url}/rest/agile/1.0/board/{board_id}/project"
+        self._logger.debug("Fetching projects for board %s", board_id)
+
+        try:
+            start_at = 0
+            max_results = 50
+            projects: list[dict[str, Any]] = []
+
+            while True:
+                params = {"startAt": start_at, "maxResults": max_results}
+                response = client.jira._session.get(
+                    url,
+                    params=params,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                values = payload.get("values") if isinstance(payload, dict) else None
+                batch = values if isinstance(values, list) else []
+                projects.extend(batch)
+
+                is_last = payload.get("isLast", False) if isinstance(payload, dict) else True
+                if is_last or not batch:
+                    break
+                start_at += max_results
+
+            self._logger.debug("Board %s is associated with %s project(s)", board_id, len(projects))
+            return projects
+        except Exception as exc:
+            error_msg = f"Failed to fetch projects for board {board_id}: {exc!s}"
+            self._logger.exception(error_msg)
+            raise JiraApiError(error_msg) from exc
