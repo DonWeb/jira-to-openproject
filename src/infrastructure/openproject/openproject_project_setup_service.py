@@ -295,7 +295,7 @@ JSON_DATA
               attrs = {{ name: input['name'], sharing: input['sharing'] || 'none' }}
               attrs[:description] = input['description'] if input['description']
               attrs[:start_date] = input['start_date'] if input['start_date']
-              attrs[:due_date] = input['due_date'] if input['due_date']
+              attrs[:effective_date] = input['due_date'] if input['due_date']
               attrs[:status] = input['status'] if input['status']
               version.assign_attributes(attrs)
 
