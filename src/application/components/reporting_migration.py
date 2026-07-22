@@ -36,27 +36,37 @@ class ReportingMigration(BaseMigration):
         self.project_mapping = config.mappings.get_mapping("project") or {}
 
     def _get_current_entities_for_type(self, entity_type: str) -> list[dict[str, Any]]:
-        """Get current entities from Jira for a specific type.
+        """Get current entities for change detection.
 
-        This method enables idempotent workflow caching by providing a standard
-        interface for entity retrieval. Called by run_with_change_detection() to fetch data
-        with automatic thread-safe caching.
+        ReportingMigration aggregates filters and dashboards into a single
+        wrapper payload (see ``_fetch_filters_and_dashboards``) rather than a
+        list of independently identifiable entities, so the generic
+        ``ChangeDetector`` (which keys entities by ``id``/``key``/``name``)
+        cannot track created/updated/deleted filters or dashboards across
+        runs — every run would otherwise see 0 current entities and skip the
+        real migration permanently. This migration is therefore
+        transformation-only from the change-detector's point of view; it
+        always re-fetches and re-applies filters/dashboards, and
+        ``create_or_update_query`` / ``create_or_update_wiki_page`` in
+        ``_load`` make that idempotent.
 
         Args:
-            entity_type: The type of entities to retrieve (e.g., "reporting")
+            entity_type: Type of entities
+
+        Raises:
+            ValueError: Always, as this migration does not support change detection
+
+        """
+        msg = f"{type(self).__name__} does not support change detection for entity type: {entity_type}"
+        raise ValueError(msg)
+
+    def _fetch_filters_and_dashboards(self) -> list[dict[str, Any]]:
+        """Fetch Jira filters and dashboards (with details) from Jira.
 
         Returns:
             List containing aggregated reporting entities (filters + dashboards)
 
-        Raises:
-            ValueError: If entity_type is not supported by this migration
-
         """
-        # Check if this is the entity type we handle
-        if entity_type != "reporting":
-            msg = f"ReportingMigration does not support entity type: {entity_type}. Supported types: ['reporting']"
-            raise ValueError(msg)
-
         # Fetch filters (API call 1)
         try:
             filters = self.jira_client.get_filters()
@@ -95,7 +105,7 @@ class ReportingMigration(BaseMigration):
     def _extract(self) -> ComponentResult:
         """Fetch Jira filters and dashboards."""
         try:
-            data_list = self._get_current_entities_for_type("reporting")
+            data_list = self._fetch_filters_and_dashboards()
             data = data_list[0] if data_list else {}
             filters = data.get("filters", [])
             dashboards = data.get("dashboards", [])

@@ -38,30 +38,36 @@ class AgileBoardMigration(BaseMigration):
     # ------------------------------------------------------------------ #
 
     def _get_current_entities_for_type(self, entity_type: str) -> list[dict[str, Any]]:
-        """Get current entities from Jira for a specific type.
+        """Get current entities for change detection.
 
-        This method enables idempotent workflow caching by providing a standard
-        interface for entity retrieval. Called by run_with_change_detection() to fetch data
-        with automatic thread-safe caching.
+        AgileBoardMigration aggregates boards, board configuration, and
+        sprints into a single wrapper payload (see ``_fetch_boards_and_sprints``)
+        rather than a list of independently identifiable entities, so the
+        generic ``ChangeDetector`` (which keys entities by ``id``/``key``/
+        ``name``) cannot track created/updated/deleted boards across runs —
+        every run would otherwise see 0 current entities and skip the real
+        migration permanently. This migration is therefore transformation-only
+        from the change-detector's point of view; it always re-fetches and
+        re-applies boards/sprints, and ``create_or_update_query`` /
+        ``ensure_project_version`` in ``_load`` make that idempotent.
 
         Args:
-            entity_type: The type of entities to retrieve (e.g., "agile_boards", "sprints")
+            entity_type: Type of entities
+
+        Raises:
+            ValueError: Always, as this migration does not support change detection
+
+        """
+        msg = f"{type(self).__name__} does not support change detection for entity type: {entity_type}"
+        raise ValueError(msg)
+
+    def _fetch_boards_and_sprints(self) -> list[dict[str, Any]]:
+        """Fetch boards, their configuration, and sprints from Jira.
 
         Returns:
             List containing aggregated board and sprint data
 
-        Raises:
-            ValueError: If entity_type is not supported by this migration
-
         """
-        # Check if this is one of the entity types we handle
-        if entity_type not in ("agile_boards", "sprints"):
-            msg = (
-                f"AgileBoardMigration does not support entity type: {entity_type}. "
-                f"Supported types: ['agile_boards', 'sprints']"
-            )
-            raise ValueError(msg)
-
         # Fetch boards (API call 1)
         try:
             boards = self.jira_client.get_boards()
@@ -89,8 +95,13 @@ class AgileBoardMigration(BaseMigration):
             except Exception:
                 board_sprints = []
 
+            # The Jira Agile REST API (v1.0, Server/DC and Cloud alike) puts
+            # the project key at ``location.key`` — ``projectKey`` is not a
+            # field this endpoint returns. Check it first; keep the other
+            # two as a defensive fallback in case a specific Jira version
+            # emits a different shape.
             location = board.get("location") or {}
-            project_key = location.get("projectKey") or board.get("locationProjectKey")
+            project_key = location.get("key") or location.get("projectKey") or board.get("locationProjectKey")
 
             columns = configuration.get("columnConfig", {}).get("columns", [])
             statuses: list[str] = []
@@ -145,7 +156,7 @@ class AgileBoardMigration(BaseMigration):
     def _extract(self) -> ComponentResult:
         """Fetch boards, configurations, and sprints from Jira."""
         try:
-            data_list = self._get_current_entities_for_type("agile_boards")
+            data_list = self._fetch_boards_and_sprints()
             data = data_list[0] if data_list else {}
             return ComponentResult(
                 success=True,

@@ -238,6 +238,13 @@ class ChangeDetector:
             "priorities": "id",
             "resolutions": "id",
             "customfields": "id",
+            # AdminSchemeMigration._get_current_entities_for_type() already
+            # returns one dict per project (not an aggregated wrapper), keyed
+            # by "project_key" rather than "id"/"key"/"name" — without this
+            # entry, _get_entity_id() falls through to None for every
+            # project and change detection permanently reports 0 current
+            # entities, skipping the real migration forever.
+            "admin_schemes": "project_key",
         }
 
         # Try specific field for entity type

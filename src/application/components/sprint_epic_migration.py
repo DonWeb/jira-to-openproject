@@ -10,9 +10,14 @@ Phase 7d notes
 --------------
 Both ``Sprint`` and ``Epic Link`` are tenant-specific Jira custom fields
 exposed under instance-dependent attribute names (``customfield_10008``,
-``customfield_10020``, ``epicLink``, ``Sprints`` …). They are *not*
-modelled by :class:`JiraIssueFields`, so the boundary parse for these
-fields stays as defensive ``getattr``/dict probing — same rationale as
+``customfield_10020``, ``epicLink``, ``Sprints`` …) — the numeric id is
+never portable across Jira instances, so the primary lookup resolves the
+real id by display name via the already-populated ``custom_field``
+mapping (see ``_build_custom_field_name_index``); the guessed Cloud-sample
+ids and wide ``dir()`` scan stay only as a fallback for instances where
+that mapping lookup misses. Neither path is modelled by
+:class:`JiraIssueFields`, so the boundary parse for these fields stays as
+defensive ``getattr``/dict probing — same rationale as
 ``story_points_migration`` and ``customfields_generic_migration``. What
 this phase does change: the polymorphic ``wp_map`` (``dict | int``)
 ladder is normalised through
@@ -33,28 +38,59 @@ from src.infrastructure.openproject.openproject_client import OpenProjectClient,
 from src.models import ComponentResult, WorkPackageMappingEntry
 
 SPRINT_CF_NAME = "Sprint"
+EPIC_LINK_JIRA_FIELD_NAME = "Epic Link"
 
 
 @register_entity_types("sprint_epic")
 class SprintEpicMigration(BaseMigration):  # noqa: D101
     def __init__(self, jira_client: JiraClient, op_client: OpenProjectClient) -> None:
         super().__init__(jira_client=jira_client, op_client=op_client)
+        self._custom_field_ids_by_name = self._build_custom_field_name_index()
+
+    @staticmethod
+    def _build_custom_field_name_index() -> dict[str, str]:
+        """Map Jira custom field display name to its real ``customfield_<id>``.
+
+        Sprint and Epic Link are tenant-specific custom fields — their numeric
+        id varies per Jira instance (this instance uses ``customfield_10104``
+        for "Sprint" and ``customfield_10100`` for "Epic Link", not the
+        commonly-guessed Cloud sample ids ``customfield_10020``/
+        ``customfield_10008``). The ``custom_field`` mapping is already
+        populated by ``CustomFieldMigration`` earlier in the pipeline, so
+        resolving by name here avoids guessing.
+        """
+        cf_mapping = config.mappings.get_mapping("custom_field") or {}
+        index: dict[str, str] = {}
+        for jira_id, entry in cf_mapping.items():
+            name = entry.get("jira_name") if isinstance(entry, dict) else None
+            if name:
+                index[str(name)] = str(jira_id)
+        return index
 
     def _get_current_entities_for_type(self, entity_type: str) -> list[dict]:
         """Get current entities for change detection.
 
         SprintEpicMigration is a transformation-only component that operates on
         already-migrated work packages. It doesn't fetch source data from Jira,
-        so this returns an empty list to indicate no changes to detect.
+        so change detection is not supported.
+
+        Note: returning ``[]`` here (instead of raising) would make the
+        ``ChangeDetector`` see a permanently empty baseline/current pair —
+        ``total_changes`` would always be 0 and ``run()`` would never
+        execute. Raising, per the project's established convention for
+        transformation-only migrations (see ``ResolutionMigration``,
+        ``AffectsVersionsMigration``), makes ``should_skip_migration``
+        always proceed with the real run instead.
 
         Args:
-            entity_type: Type of entities (should be "sprint_epic")
+            entity_type: Type of entities
 
-        Returns:
-            Empty list (transformation-only, no source entities)
+        Raises:
+            ValueError: Always, as this migration is transformation-only
 
         """
-        return []
+        msg = f"{type(self).__name__} is transformation-only and does not support change detection for entity type: {entity_type}"
+        raise ValueError(msg)
 
     @staticmethod
     def _coerce_sprint_names(sprint_field_value: Any) -> list[str]:
@@ -150,14 +186,22 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
         sprint_by_key: dict[str, list[str]] = {}
         epic_links: list[tuple[str, str]] = []  # (child_key, epic_key)
 
+        # Resolved real field ids go first — they're the ones that will
+        # actually match on this instance. The guessed Cloud-sample ids stay
+        # as a fallback for instances where the mapping lookup misses.
+        sprint_field_id = self._custom_field_ids_by_name.get(SPRINT_CF_NAME)
+        sprint_candidates = [c for c in (sprint_field_id, "sprint", "customfield_10020", "Sprints", "Sprint") if c]
+        epic_field_id = self._custom_field_ids_by_name.get(EPIC_LINK_JIRA_FIELD_NAME)
+        epic_candidates = [c for c in (epic_field_id, "epicLink", "customfield_10008", "Epic Link") if c]
+
         for k, issue in issues.items():
             try:
                 fields = getattr(issue, "fields", None)
                 if not fields:
                     continue
-                # Sprint: look for common fields
+                # Sprint: look for the resolved field id, then common fallbacks
                 sprint_val = None
-                for cand in ("sprint", "customfield_10020", "Sprints", "Sprint"):
+                for cand in sprint_candidates:
                     if hasattr(fields, cand):
                         sprint_val = getattr(fields, cand)
                         break
@@ -168,9 +212,9 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
                 if names:
                     sprint_by_key[k] = names
 
-                # Epic Link: common field customfield_10008 or epicLink
+                # Epic Link: resolved field id, then common fallbacks
                 epic_key = None
-                for cand in ("epicLink", "customfield_10008", "Epic Link"):
+                for cand in epic_candidates:
                     if hasattr(fields, cand):
                         epic_key = getattr(fields, cand)
                         break
