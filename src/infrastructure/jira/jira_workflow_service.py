@@ -14,7 +14,6 @@ no Ruby-script escaping to worry about.
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import quote
 
 from requests import exceptions
 
@@ -214,12 +213,20 @@ class JiraWorkflowService:
             msg = "Jira client is not initialized"
             raise JiraConnectionError(msg)
 
-        safe_name = quote(workflow_name, safe="")
-        url = f"{client.base_url}/rest/api/2/workflow/{safe_name}/transitions"
+        # ``/rest/api/2/workflow/<name>/transitions`` is not part of the public
+        # Jira Server/DC REST API (confirmed live on this instance — see git
+        # history: "fix(jira): treat 404 from per-workflow endpoints as empty,
+        # not error"), so it consistently 404s and this migration always saw
+        # 0 transitions. ``/rest/api/2/workflow/search`` is the documented
+        # replacement that exposes the same data via ``expand=transitions``.
+        url = f"{client.base_url}/rest/api/2/workflow/search"
         self._logger.debug("Fetching Jira workflow transitions for '%s'", workflow_name)
 
         try:
-            response = client.jira._session.get(url)
+            response = client.jira._session.get(
+                url,
+                params={"workflowName": workflow_name, "expand": "transitions"},
+            )
             # Defensive check for callers that return a response object
             # with status_code rather than raising.  The ``jira`` library's
             # ResilientSession raises JIRAError before reaching this point,
@@ -232,7 +239,9 @@ class JiraWorkflowService:
                 return []
             response.raise_for_status()
             payload = response.json()
-            transitions = payload.get("transitions") if isinstance(payload, dict) else payload
+            values = payload.get("values") if isinstance(payload, dict) else None
+            workflow = values[0] if isinstance(values, list) and values else None
+            transitions = workflow.get("transitions") if isinstance(workflow, dict) else None
             if not isinstance(transitions, list):
                 self._logger.warning("Unexpected workflow transitions payload for %s", workflow_name)
                 return []
@@ -243,19 +252,17 @@ class JiraWorkflowService:
             )
             return transitions
         except Exception as exc:
-            # The ``jira`` library's ResilientSession raises JIRAError(status_code=404)
-            # before returning any response object, so the status-code check above
-            # never fires for real 404s.  Catch it here instead and suppress at
-            # DEBUG level — these endpoints do not exist on many Server/DC versions
-            # and 404 is expected, not an error worth alarming on.
+            # ``/workflow/search`` is documented and shouldn't 404 for a real
+            # workflow name, but this stays as a safety net: a stale/renamed
+            # workflow name would 404, and names containing "/" can still hit
+            # the Tomcat encoded-slash 400 in the query-string encoding.
             #
             # In production JiraClient._patch_jira_client wraps every exception
             # into JiraApiError, so exc is never a JIRAError directly — the
             # original JIRAError lives in exc.__cause__.
             # _is_workflow_unfetchable walks the __cause__ chain and handles:
-            #   • HTTP 404 — endpoint not available on this Server/DC version
+            #   • HTTP 404 — workflow name not found
             #   • HTTP 400 "Invalid URI" — Tomcat rejects %2F in URL path
-            #     (workflow name contains "/" and ALLOW_ENCODED_SLASH=false)
             if _is_workflow_unfetchable(exc):
                 self._logger.debug(
                     "Workflow '%s' transitions endpoint unfetchable (404 not-found or Tomcat encoded-slash 400); treating as empty",
@@ -273,12 +280,18 @@ class JiraWorkflowService:
             msg = "Jira client is not initialized"
             raise JiraConnectionError(msg)
 
-        safe_name = quote(workflow_name, safe="")
-        url = f"{client.base_url}/rest/api/2/workflow/{safe_name}"
+        # Same rationale as ``get_workflow_transitions``: the per-name
+        # ``/rest/api/2/workflow/<name>`` endpoint 404s on this Jira
+        # Server/DC version; ``/rest/api/2/workflow/search`` is the
+        # documented endpoint that also exposes ``statuses`` via ``expand``.
+        url = f"{client.base_url}/rest/api/2/workflow/search"
         self._logger.debug("Fetching Jira workflow definition for '%s'", workflow_name)
 
         try:
-            response = client.jira._session.get(url)
+            response = client.jira._session.get(
+                url,
+                params={"workflowName": workflow_name, "expand": "statuses"},
+            )
             # Defensive check for callers that return a response object
             # with status_code rather than raising.  The ``jira`` library's
             # ResilientSession raises JIRAError before reaching this point,
@@ -290,7 +303,9 @@ class JiraWorkflowService:
                 )
                 return []
             response.raise_for_status()
-            workflow = response.json()
+            payload = response.json()
+            values = payload.get("values") if isinstance(payload, dict) else None
+            workflow = values[0] if isinstance(values, list) and values else None
             if isinstance(workflow, dict):
                 statuses = workflow.get("statuses")
                 if isinstance(statuses, list):
@@ -302,19 +317,16 @@ class JiraWorkflowService:
             )
             return []
         except Exception as exc:
-            # The ``jira`` library's ResilientSession raises JIRAError(status_code=404)
-            # before returning any response object, so the status-code check above
-            # never fires for real 404s.  Catch it here instead and suppress at
-            # DEBUG level — these endpoints do not exist on many Server/DC versions
-            # and 404 is expected, not an error worth alarming on.
+            # ``/workflow/search`` is documented and shouldn't 404 for a real
+            # workflow name — see ``get_workflow_transitions`` above for why
+            # this safety net stays in place.
             #
             # In production JiraClient._patch_jira_client wraps every exception
             # into JiraApiError, so exc is never a JIRAError directly — the
             # original JIRAError lives in exc.__cause__.
             # _is_workflow_unfetchable walks the __cause__ chain and handles:
-            #   • HTTP 404 — endpoint not available on this Server/DC version
+            #   • HTTP 404 — workflow name not found
             #   • HTTP 400 "Invalid URI" — Tomcat rejects %2F in URL path
-            #     (workflow name contains "/" and ALLOW_ENCODED_SLASH=false)
             if _is_workflow_unfetchable(exc):
                 self._logger.debug(
                     "Workflow '%s' definition endpoint unfetchable (404 not-found or Tomcat encoded-slash 400); treating as empty",

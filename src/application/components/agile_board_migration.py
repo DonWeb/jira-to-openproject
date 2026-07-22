@@ -103,6 +103,21 @@ class AgileBoardMigration(BaseMigration):
             location = board.get("location") or {}
             project_key = location.get("key") or location.get("projectKey") or board.get("locationProjectKey")
 
+            if not project_key:
+                # ``location.key`` alone did not resolve it either (confirmed
+                # live: still 0 boards mapped after that fix), so this Jira
+                # Server/DC version's ``/rest/agile/1.0/board`` list response
+                # must have a different shape than assumed. Log the raw board
+                # dict's keys and its ``location`` value to get ground truth
+                # instead of guessing at another field name blind.
+                self.logger.warning(
+                    "Board %s ('%s') has no resolvable project key; raw board keys=%s, location=%r",
+                    board_id,
+                    board.get("name"),
+                    sorted(board.keys()),
+                    board.get("location"),
+                )
+
             columns = configuration.get("columnConfig", {}).get("columns", [])
             statuses: list[str] = []
             for column in columns:

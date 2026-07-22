@@ -32,6 +32,14 @@ is ``false`` unless explicitly changed) and returns HTTP 400 with an HTML
 body containing "Invalid URI: [The encoded slash character is not allowed]".
 This is structurally unfetchable — no retry can work around it.  It is
 treated identically to a 404: log at DEBUG, return ``[]``.
+
+Update: the two methods now call ``/rest/api/2/workflow/search`` (the
+documented endpoint, ``workflowName`` + ``expand`` as query params) instead
+of the non-existent per-name endpoints above, since those consistently
+404 on this Jira Server/DC version. The 404/encoded-slash suppression
+logic in this file stays as a safety net for a stale/renamed workflow
+name; the tests below only mock the HTTP layer, so they remain valid
+regardless of which URL is requested.
 """
 
 from __future__ import annotations
@@ -418,7 +426,10 @@ def test_get_workflow_transitions_still_raises_on_other_errors() -> None:
 
 
 def test_get_workflow_transitions_returns_data_on_success() -> None:
-    """Sanity: a 200 with proper payload returns the transitions list."""
+    """Sanity: a 200 with proper ``/workflow/search`` payload returns the transitions list."""
     transitions = [{"id": "1", "name": "To Do → In Progress"}]
-    service = _make_service_returning(status_code=200, json_body={"transitions": transitions})
+    service = _make_service_returning(
+        status_code=200,
+        json_body={"values": [{"transitions": transitions}]},
+    )
     assert service.get_workflow_transitions("X") == transitions

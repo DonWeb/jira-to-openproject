@@ -238,11 +238,21 @@ class WorkflowMigration(BaseMigration):
                 continue
 
             for transition in workflow_transitions.get(workflow_name, []):
-                to_block = transition.get("to") or {}
-                to_status_id = str(to_block.get("id") or "").strip()
-                to_entry = status_by_id.get(to_status_id) or status_by_name.get(
-                    str(to_block.get("name", "")).lower(),
-                )
+                # ``to`` is a plain status id string on ``/rest/api/2/workflow/search``
+                # (the endpoint this migration now uses), but keep the dict shape
+                # handled too in case a different Jira version nests it as
+                # ``{"id": ..., "name": ...}`` like the old per-name endpoint did.
+                to_field = transition.get("to")
+                if isinstance(to_field, dict):
+                    to_status_id = str(to_field.get("id") or "").strip()
+                    to_name = str(to_field.get("name", "")).lower()
+                elif isinstance(to_field, str):
+                    to_status_id = to_field.strip()
+                    to_name = ""
+                else:
+                    to_status_id = ""
+                    to_name = ""
+                to_entry = status_by_id.get(to_status_id) or status_by_name.get(to_name)
                 if not to_entry:
                     skipped.append(
                         {
