@@ -28,6 +28,7 @@ ladder is normalised through
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from src import config
@@ -39,6 +40,17 @@ from src.models import ComponentResult, WorkPackageMappingEntry
 
 SPRINT_CF_NAME = "Sprint"
 EPIC_LINK_JIRA_FIELD_NAME = "Epic Link"
+
+# The classic Jira Server/DC "Sprint" custom field renderer serialises each
+# sprint as a GreenHopper Java object's ``toString()`` rather than clean
+# JSON — confirmed live via var/debug tmux captures, where the OpenProject
+# custom field ended up literally set to
+# "com.atlassian.greenhopper.service.sprint.Sprint@f4203e6[id=84,...,name=Sprint v0.0.104,...]".
+# Extract the real sprint name out of that ``name=...`` segment instead of
+# treating the whole toString() blob as the name — otherwise it never
+# matches the clean sprint names used as keys in the ``sprint`` mapping,
+# so version_assignments always stayed at 0.
+_GREENHOPPER_TOSTRING_NAME_RE = re.compile(r"[,\[]name=([^,\]]*)")
 
 
 @register_entity_types("sprint_epic")
@@ -93,6 +105,19 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
         raise ValueError(msg)
 
     @staticmethod
+    def _clean_sprint_string(raw: str) -> str:
+        """Strip the GreenHopper ``toString()`` wrapper off a raw sprint string.
+
+        Classic Jira Server/DC sometimes hands back the sprint field as
+        ``com.atlassian.greenhopper.service.sprint.Sprint@f4203e6[id=84,...,
+        name=Sprint v0.0.104,...]`` instead of a clean name — the real name
+        lives in the ``name=...`` segment. Non-matching strings (already a
+        clean name) pass through unchanged.
+        """
+        match = _GREENHOPPER_TOSTRING_NAME_RE.search(raw)
+        return match.group(1).strip() if match else raw.strip()
+
+    @staticmethod
     def _coerce_sprint_names(sprint_field_value: Any) -> list[str]:
         """Best-effort extract sprint names from Jira field values.
 
@@ -109,7 +134,7 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
             if isinstance(sprint_field_value, list):
                 for item in sprint_field_value:
                     if isinstance(item, str) and item.strip():
-                        out.append(item.strip())
+                        out.append(SprintEpicMigration._clean_sprint_string(item))
                     elif isinstance(item, dict):
                         name = item.get("name")
                         if isinstance(name, str) and name.strip():
@@ -120,7 +145,7 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
                             out.append(name.strip())
             elif isinstance(sprint_field_value, str):
                 if sprint_field_value.strip():
-                    out.append(sprint_field_value.strip())
+                    out.append(SprintEpicMigration._clean_sprint_string(sprint_field_value))
             elif isinstance(sprint_field_value, dict):
                 name = sprint_field_value.get("name")
                 if isinstance(name, str) and name.strip():

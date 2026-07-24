@@ -91,3 +91,25 @@ def test_sprint_epic_migration_sets_parent_and_sprint_cf():
     # Expect: 1 parent link (PRJ-1 -> EPIC-1) + 2 sprint CF updates (EPIC-1, PRJ-1)
     # batch_update_work_packages updated=1, CF updates add 2 more -> updated==3
     assert ld.updated == 3
+
+
+def test_coerce_sprint_names_extracts_name_from_greenhopper_tostring():
+    """Classic Jira Server/DC sometimes serialises the Sprint field as a
+    GreenHopper Java object's toString() instead of clean JSON — confirmed
+    live via var/debug tmux captures, where the OpenProject custom field
+    ended up literally set to this string. The real name lives in the
+    embedded ``name=...`` segment.
+    """
+    raw = (
+        "com.atlassian.greenhopper.service.sprint.Sprint@f4203e6[id=84,rapidViewId=4,"
+        "state=CLOSED,name=Sprint v0.0.104,startDate=2020-04-07T08:37:18.068-03:00,"
+        "endDate=2020-04-28T08:37:00.000-03:00,completeDate=2020-05-04T09:17:30.494-03:00,"
+        "activatedDate=2020-04-07T08:37:18.068-03:00,sequence=84,goal=,synced=false,"
+        "autoStartStop=false,incompleteIssuesDestinationId=<null>]"
+    )
+    assert SprintEpicMigration._coerce_sprint_names(raw) == ["Sprint v0.0.104"]
+    assert SprintEpicMigration._coerce_sprint_names([raw]) == ["Sprint v0.0.104"]
+
+
+def test_coerce_sprint_names_passes_through_clean_string_unchanged():
+    assert SprintEpicMigration._coerce_sprint_names("Sprint 5") == ["Sprint 5"]

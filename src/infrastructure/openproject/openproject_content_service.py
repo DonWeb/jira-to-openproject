@@ -106,7 +106,19 @@ JSON_DATA
           if user.nil?
             result = {{ success: false, error: 'no available user to own query' }}
           else
+            # Query is an STI base class on OpenProject 12+; the Work
+            # Packages module's saved-view selector filters by
+            # type = 'WorkPackageQuery', so a row left with type: nil
+            # (what plain Query.create leaves it as) is a valid row but
+            # invisible in that UI. Look up via the untyped base class
+            # (STI type-scoping only applies when querying through a
+            # subclass, so this still matches existing untyped rows from
+            # before this fix) and backfill the type on both new and
+            # previously-created rows.
             query = Query.find_or_initialize_by(name: input['name'], project: project)
+            if query.respond_to?(:type=) && query.type.nil? && defined?(WorkPackageQuery)
+              query.type = 'WorkPackageQuery'
+            end
             query.user ||= user
 
             # Apply the description if the model exposes one — older
