@@ -1,18 +1,22 @@
-"""Regression test: ``create_or_update_query`` must backfill the STI ``type``.
+"""Regression test: ``create_or_update_query`` keeps its guarded ``type`` backfill.
 
-OpenProject 12+ models ``Query`` as an STI base class — the Work Packages
-module's saved-view selector only lists rows where ``type =
-'WorkPackageQuery'``. The generated Ruby script previously did
-``Query.find_or_initialize_by(name:, project:)`` and never set ``type``,
-so rows were created successfully (``success: true``, confirmed live via a
-user-run Rails console check: ``Query.where("name LIKE '[Board]%'").count``
-returned 8) but never showed up as usable saved views, because they were
-left with ``type: nil``.
+Some OpenProject versions model ``Query`` as an STI base class where the
+Work Packages module's saved-view selector only lists rows with
+``type = 'WorkPackageQuery'`` — a plain ``Query.find_or_initialize_by``
+would leave ``type: nil``, valid in the DB but invisible in that specific
+UI. This was the working theory for why 8 migrated "[Board]" queries
+existed (confirmed via ``Query.where("name LIKE '[Board]%'").count`` → 8)
+but weren't showing up as usable saved views.
 
-The fix looks the row up via the untyped base class (so it still matches
-existing pre-fix rows regardless of their current ``type``) and backfills
-``type = 'WorkPackageQuery'`` when it's nil and the constant is defined —
-self-healing for both new and previously-created rows, no duplicate risk.
+NOT CONFIRMED on the self-hosted instance this project targets: a live
+``Query.pluck(:type)`` check errored there, consistent with that schema
+not having a ``type`` column at all — meaning ``respond_to?(:type=)``
+likely evaluates to false and the backfill is a no-op on that instance.
+The real cause of the invisible-queries symptom there is still open. This
+test only asserts the code stays defensively guarded (never touches a
+column that doesn't exist) so it's harmless where the column is absent and
+still helpful on installs where it's present — not that it's the fix for
+this project's specific environment.
 """
 
 from __future__ import annotations
