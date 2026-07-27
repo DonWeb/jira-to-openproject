@@ -768,6 +768,7 @@ class OpenProjectClient:
         description: str | None = None,
         project_id: int | None = None,
         is_public: bool = True,
+        starred: bool = False,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create or update an OpenProject query (saved filter).
@@ -779,6 +780,7 @@ class OpenProjectClient:
             description=description,
             project_id=project_id,
             is_public=is_public,
+            starred=starred,
             options=options,
         )
 

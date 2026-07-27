@@ -45,6 +45,7 @@ class OpenProjectContentService:
         description: str | None = None,
         project_id: int | None = None,
         is_public: bool = True,
+        starred: bool = False,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create or update an OpenProject query (saved filter).
@@ -60,6 +61,14 @@ class OpenProjectContentService:
         before serialisation so a stray non-numeric value produces a
         ``ValueError`` at the Python boundary instead of leaking
         through to Ruby.
+
+        ``starred`` defaults to ``False`` to preserve existing behaviour
+        for callers that don't care about it (e.g. ``reporting_migration``).
+        A public, unstarred query row is real and queryable
+        (``project_id``/``public`` both correct — confirmed live via a
+        schema dump, ``var/`` round 8) but doesn't show up in the Work
+        Packages sidebar's quick-access "Views" list, which is what a
+        user actually browsing for it would see first.
         """
         # Defensive ``int()`` coercion at the Python boundary — see
         # module docstring. Ruby additionally re-coerces via ``.to_i``.
@@ -70,6 +79,7 @@ class OpenProjectContentService:
             "description": description,
             "project_id": coerced_project_id,
             "is_public": bool(is_public),
+            "starred": bool(starred),
             "options": options or {},
         }
 
@@ -106,19 +116,13 @@ JSON_DATA
           if user.nil?
             result = {{ success: false, error: 'no available user to own query' }}
           else
-            # On some OpenProject versions Query is an STI base class and
-            # the Work Packages saved-view selector filters by
-            # type = 'WorkPackageQuery' — a row left with type: nil is
-            # valid but invisible there. NOT CONFIRMED on this specific
-            # self-hosted instance: a live `Query.pluck(:type)` check
-            # errored, which is consistent with this schema not having a
-            # `type` column at all, so `respond_to?(:type=)` below likely
-            # already evaluates to false here and this is a no-op. Kept
-            # guarded (never touches a column that doesn't exist) for
-            # installs where it does apply; the real cause of "queries
-            # exist but aren't visible" on THIS instance is still
-            # unconfirmed pending the schema dump requested in this
-            # round's report.
+            # CONFIRMED via a live schema dump (round 8): this instance's
+            # `queries` table has no `type` column at all (22 real columns,
+            # `type` not among them) — the STI-based-invisibility theory
+            # from the previous round does not apply here. Kept guarded
+            # (never touches a column that doesn't exist) since it's a
+            # harmless no-op on this schema and may still help on an
+            # OpenProject install where the column is present.
             query = Query.find_or_initialize_by(name: input['name'], project: project)
             if query.respond_to?(:type=) && query.type.nil? && defined?(WorkPackageQuery)
               query.type = 'WorkPackageQuery'
@@ -139,6 +143,18 @@ JSON_DATA
               query.public = is_public
             elsif query.respond_to?(:write_attribute) && query.has_attribute?(:public)
               query.write_attribute(:public, is_public)
+            end
+
+            # The confirmed schema dump showed this migration's query row
+            # with project_id/public/user_id all correct, yet the user
+            # still couldn't find it browsing OpenProject — `starred` is
+            # the real, confirmed-existing column that drives whether a
+            # query shows up in the Work Packages sidebar's quick-access
+            # "Views" list, which is the natural place a user would look
+            # for something meant to stand in for a Jira board.
+            starred = !!input['starred']
+            if query.respond_to?(:starred=)
+              query.starred = starred
             end
 
             filters = input.dig('options', 'filters')

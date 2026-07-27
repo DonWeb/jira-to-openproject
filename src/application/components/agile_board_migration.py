@@ -241,6 +241,15 @@ class AgileBoardMigration(BaseMigration):
                     "description": "\n".join(description_parts),
                     "project_id": op_project_id,
                     "is_public": True,
+                    # A migrated board's view should show up in the Work
+                    # Packages sidebar's quick-access "Views" list — that's
+                    # the natural place a user would look for something
+                    # standing in for a Jira board. Confirmed via a live
+                    # schema dump that project_id/public/user_id were all
+                    # already correct on an existing row, yet it wasn't
+                    # found — ``starred`` is the real, confirmed column
+                    # controlling that list.
+                    "starred": True,
                     "options": {
                         "filters": [],
                         "columns": [],
