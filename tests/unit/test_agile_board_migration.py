@@ -72,8 +72,24 @@ def _mock_mappings(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cfg, "mappings", DummyMappings(), raising=False)
 
 
+@pytest.fixture
+def _legacy_version_strategy(monkeypatch: pytest.MonkeyPatch):
+    """Pin the sprint strategy to ``version``.
+
+    Sprint → Version is no longer the default: ``SprintMigration`` owns
+    sprint creation under the ``native`` strategy, and this component then
+    builds no version payloads at all. The tests below cover the legacy
+    path, which stays reachable for pre-17.3 targets, so they select it
+    explicitly rather than relying on the default.
+    """
+    import src.config as cfg
+
+    monkeypatch.setitem(cfg.migration_config, "sprint_strategy", "version")
+
+
 def test_agile_board_migration_end_to_end_creates_query_and_version(
     _mock_mappings: None,
+    _legacy_version_strategy: None,
 ) -> None:
     """One mapped board → one query; one open sprint → one open version."""
     boards = [
@@ -126,6 +142,7 @@ def test_agile_board_migration_end_to_end_creates_query_and_version(
 
 def test_agile_board_migration_distinguishes_created_from_already_existing(
     _mock_mappings: None,
+    _legacy_version_strategy: None,
 ) -> None:
     """A re-run where Rails matches existing rows must report *_existing, not just 0 created.
 
@@ -155,6 +172,39 @@ def test_agile_board_migration_distinguishes_created_from_already_existing(
     assert result.details["queries_existing"] == 1
     assert result.details["versions_created"] == 0
     assert result.details["versions_existing"] == 1
+
+
+def test_agile_board_migration_creates_no_versions_under_native_strategy(
+    _mock_mappings: None,
+) -> None:
+    """Under the default ``native`` strategy the board queries are still created, sprints are not.
+
+    ``SprintMigration`` owns sprint creation on OpenProject 17.3+, so
+    building Version rows here too would give every sprint two competing
+    representations in the same project.
+    """
+    boards = [
+        {"id": 1, "name": "Sprint Board", "type": "scrum", "location": {"projectKey": "PROJ"}},
+    ]
+    configs = {1: {"columnConfig": {"columns": []}, "filter": {}}}
+    sprints = {1: [{"id": 42, "name": "Sprint 1", "state": "active"}]}
+    op = DummyOp()
+    mig = AgileBoardMigration(
+        jira_client=DummyJira(boards=boards, sprints_by_board=sprints, configurations_by_board=configs),
+        op_client=op,
+    )  # type: ignore[arg-type]
+
+    extracted = mig._extract()
+    mapped = mig._map(extracted)
+    result = mig._load(mapped)
+
+    assert result.success is True
+    # The board half is untouched by the strategy.
+    assert result.details["queries_created"] == 1
+    # The sprint half is delegated entirely.
+    assert mapped.details["versions"] == 0
+    assert mapped.details["sprint_strategy"] == "native"
+    assert op.created_versions == []
 
 
 def test_agile_board_migration_resolves_project_via_board_projects_endpoint_when_location_missing(
@@ -188,6 +238,7 @@ def test_agile_board_migration_resolves_project_via_board_projects_endpoint_when
 
 def test_agile_board_migration_skips_unmapped_project_boards_and_sprints(
     _mock_mappings: None,
+    _legacy_version_strategy: None,
 ) -> None:
     """A board / sprint whose projectKey isn't in project_mapping is skipped."""
     boards = [
@@ -212,6 +263,7 @@ def test_agile_board_migration_skips_unmapped_project_boards_and_sprints(
 
 def test_agile_board_migration_closed_sprint_maps_to_closed_version(
     _mock_mappings: None,
+    _legacy_version_strategy: None,
 ) -> None:
     """state='closed' (case-insensitive) → status='closed' on the version payload."""
     boards = [{"id": 1, "name": "B", "type": "scrum", "location": {"projectKey": "PROJ"}}]

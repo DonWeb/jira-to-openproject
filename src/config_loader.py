@@ -314,6 +314,11 @@ class ConfigLoader:
                     self.config["migration"]["no_confirm"] = no_confirm
                     config_logger.debug("Applied migration no_confirm: %s", no_confirm)
 
+                case ["J2O", "SPRINT", "STRATEGY"]:
+                    strategy = str(env_value).lower()
+                    self.config["migration"]["sprint_strategy"] = strategy
+                    config_logger.debug("Applied sprint strategy: %s", strategy)
+
                 case ["J2O", "STOP", "ON", "ERROR"]:
                     stop_on_error = self._convert_value(env_value) is True
                     self.config["migration"]["stop_on_error"] = stop_on_error

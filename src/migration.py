@@ -60,6 +60,7 @@ from src.application.components.resolution_migration import ResolutionMigration
 from src.application.components.security_levels_migration import SecurityLevelsMigration
 from src.application.components.simpletasks_migration import SimpleTasksMigration
 from src.application.components.sprint_epic_migration import SprintEpicMigration
+from src.application.components.sprint_migration import SprintMigration
 from src.application.components.status_migration import StatusMigration
 from src.application.components.story_points_migration import StoryPointsMigration
 from src.application.components.time_entry_migration import TimeEntryMigration
@@ -527,6 +528,7 @@ def _build_component_factories(
         "accounts": lambda: AccountMigration(jira_client=jira_client, op_client=op_client),
         "workflows": lambda: WorkflowMigration(jira_client=jira_client, op_client=op_client),
         "agile_boards": lambda: AgileBoardMigration(jira_client=jira_client, op_client=op_client),
+        "sprints": lambda: SprintMigration(jira_client=jira_client, op_client=op_client),
         "admin_schemes": lambda: AdminSchemeMigration(jira_client=jira_client, op_client=op_client),
         "reporting": lambda: ReportingMigration(jira_client=jira_client, op_client=op_client),
     }
@@ -1222,6 +1224,7 @@ async def run_migration(
 
         focus_components = [
             "workflows",
+            "sprints",
             "agile_boards",
             "sprint_epic",
             "admin_schemes",

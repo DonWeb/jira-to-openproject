@@ -93,6 +93,75 @@ def test_sprint_epic_migration_sets_parent_and_sprint_cf():
     assert ld.updated == 3
 
 
+def _sprint_mapping_fixture(monkeypatch: pytest.MonkeyPatch, sprint_mapping: dict) -> None:
+    """Re-point ``cfg.mappings`` with a sprint mapping alongside the WP one."""
+    import src.config as cfg
+
+    class DummyMappings:
+        def __init__(self) -> None:
+            self._m = {
+                "work_package": {
+                    "EPIC-1": {"openproject_id": 12000},
+                    "PRJ-1": {"openproject_id": 12001},
+                    "PRJ-2": {"openproject_id": 12002},
+                },
+                "sprint": sprint_mapping,
+            }
+
+        def get_mapping(self, name: str):
+            return self._m.get(name, {})
+
+    monkeypatch.setattr(cfg, "mappings", DummyMappings(), raising=False)
+
+
+def test_native_sprint_id_is_preferred_over_the_legacy_version_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When both ids are mapped, the work package gets sprint_id, not version_id.
+
+    Both are scalar foreign keys on the work package, so only one can win;
+    on OpenProject 17.3+ the native sprint is the real object and the
+    Version is the legacy stand-in.
+    """
+    _sprint_mapping_fixture(
+        monkeypatch,
+        {"Sprint A": {"openproject_id": 800, "openproject_sprint_id": 901, "project_id": 11}},
+    )
+    op = DummyOp()
+    mig = SprintEpicMigration(jira_client=DummyJira(), op_client=op)  # type: ignore[arg-type]
+
+    result = mig._load(mig._map(mig._extract()))
+
+    sprint_assignments = [u for u in op.updates if "sprint_id" in u]
+    assert [u["sprint_id"] for u in sprint_assignments] == [901, 901]
+    assert not [u for u in op.updates if "version_id" in u]
+    assert result.details["sprint_assignments"] == 2
+    assert result.details["version_assignments"] == 0
+
+
+def test_version_id_is_used_when_no_native_sprint_is_mapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``openproject_sprint_id`` the legacy Version path still applies.
+
+    This is the pre-17.3 target, and the reason writing the native id must
+    not clobber the Version id in the sprint mapping.
+    """
+    _sprint_mapping_fixture(
+        monkeypatch,
+        {"Sprint A": {"openproject_id": 800, "project_id": 11}},
+    )
+    op = DummyOp()
+    mig = SprintEpicMigration(jira_client=DummyJira(), op_client=op)  # type: ignore[arg-type]
+
+    result = mig._load(mig._map(mig._extract()))
+
+    assert [u["version_id"] for u in op.updates if "version_id" in u] == [800, 800]
+    assert not [u for u in op.updates if "sprint_id" in u]
+    assert result.details["sprint_assignments"] == 0
+    assert result.details["version_assignments"] == 2
+
+
 def test_coerce_sprint_names_extracts_name_from_greenhopper_tostring():
     """Classic Jira Server/DC sometimes serialises the Sprint field as a
     GreenHopper Java object's toString() instead of clean JSON — confirmed

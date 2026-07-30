@@ -118,6 +118,8 @@ class MigrationConfig(TypedDict):
     log_retention_count: NotRequired[int]
     enable_rails_meta_writes: NotRequired[bool]
     reset_wp_checkpoints: NotRequired[bool]
+    # "native" (default) | "version" | "both" — see SprintMigration.
+    sprint_strategy: NotRequired[str]
 
 
 class DatabaseConfig(TypedDict, total=False):
@@ -155,6 +157,7 @@ type ComponentName = Literal[
     "status_types",
     "resolutions",
     "workflows",
+    "sprints",
     "agile_boards",
     "work_packages",
     "work_packages_skeleton",

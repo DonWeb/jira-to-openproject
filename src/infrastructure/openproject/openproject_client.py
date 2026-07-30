@@ -318,6 +318,7 @@ class OpenProjectClient:
         from src.infrastructure.openproject.openproject_provenance_service import OpenProjectProvenanceService
         from src.infrastructure.openproject.openproject_rails_runner_service import OpenProjectRailsRunnerService
         from src.infrastructure.openproject.openproject_records_service import OpenProjectRecordsService
+        from src.infrastructure.openproject.openproject_sprint_service import OpenProjectSprintService
         from src.infrastructure.openproject.openproject_status_type_service import OpenProjectStatusTypeService
         from src.infrastructure.openproject.openproject_time_entry_service import OpenProjectTimeEntryService
         from src.infrastructure.openproject.openproject_user_service import OpenProjectUserService
@@ -349,6 +350,7 @@ class OpenProjectClient:
         self.wp_cf = OpenProjectWorkPackageCustomFieldService(self)
         self.content = OpenProjectContentService(self)
         self.bulk_create = OpenProjectBulkCreateService(self)
+        self.sprints = OpenProjectSprintService(self)
 
         logger.success(
             "OpenProjectClient initialized for host %s, container %s",
@@ -759,6 +761,30 @@ class OpenProjectClient:
             due_date=due_date,
             status=status,
             sharing=sharing,
+        )
+
+    def detect_native_sprint_support(self) -> dict[str, Any]:
+        """Thin delegator over ``self.sprints.detect_native_sprint_support``."""
+        return self.sprints.detect_native_sprint_support()
+
+    def ensure_project_sprint(
+        self,
+        project_id: int,
+        *,
+        name: str,
+        start_date: str | None = None,
+        finish_date: str | None = None,
+        status: str | None = None,
+        goal: str | None = None,
+    ) -> dict[str, Any]:
+        """Thin delegator over ``self.sprints.ensure_project_sprint``."""
+        return self.sprints.ensure_project_sprint(
+            project_id,
+            name=name,
+            start_date=start_date,
+            finish_date=finish_date,
+            status=status,
+            goal=goal,
         )
 
     def create_or_update_query(

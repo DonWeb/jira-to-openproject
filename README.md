@@ -20,7 +20,7 @@ A robust, modular migration toolset for transferring project management data fro
 - **Attachment Migration:** Issue attachments → Work package files
 - **Time Log Migration:** Tempo worklogs → OpenProject time entries
 - **Workflow Automation:** Jira workflow transitions → OpenProject workflow entries per type/role
-- **Agile Boards & Sprints:** Jira boards → OpenProject saved queries, sprints → versions (not OpenProject's native boards/sprints — see [Entity Mapping §11](docs/ENTITY_MAPPING.md#11-agile-migration))
+- **Agile Boards & Sprints:** Jira sprints → OpenProject's native sprints (17.3+; `J2O_SPRINT_STRATEGY=version` keeps the legacy Version mapping for older targets), Jira boards → OpenProject saved queries (not native boards — see [Entity Mapping §11](docs/ENTITY_MAPPING.md#11-agile-migration))
 - **Admin Schemes:** Jira role memberships → OpenProject project memberships
 - **Reporting Artefacts:** Jira saved filters & dashboards → OpenProject queries and wiki summaries
 
@@ -39,7 +39,7 @@ A robust, modular migration toolset for transferring project management data fro
 ### Supported Targets
 
 - Jira Server/Data Center 9.x (validated on 9.11)
-- OpenProject 17.3+ (currently tested against 17.3)
+- OpenProject 17.3+ (currently tested against 17.6)
 
 Earlier or later releases may work, but they are not part of the supported/tested matrix.
 

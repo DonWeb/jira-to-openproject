@@ -23,7 +23,7 @@ This document provides a comprehensive mapping of how Jira entities are transfor
 | **Resolution** | Custom Field Value | `resolutions` | On "Resolution" CF |
 | **Component** | Custom Field Value | `components` | On "Component" CF |
 | **Version** | Version | `versions` | Release tracking |
-| **Sprint** | Version | `agile_boards` + `sprint_epic` | Not OpenProject's native Sprint object — see [§11](#11-agile-migration) |
+| **Sprint** | Sprint (native, 17.3+) | `sprints` + `sprint_epic` | Version mapping kept for older targets — see [§11](#11-agile-migration) |
 | **Epic** | Work Package (Epic type) | `sprint_epic` | Hierarchy parent |
 | **Label** | Tag | `labels` / `native_tags` | Categorization |
 | **Attachment** | Attachment | `attachments` | File transfer |
@@ -352,30 +352,70 @@ outwardIssue: PROJ-2         ──→  to_id: WP#2
 
 ### 11. Agile Migration
 
-#### Jira Sprint → OpenProject Version
+#### Jira Sprint → OpenProject Sprint (native, default)
 
 ```
-Jira Sprint                       OpenProject Version
+Jira Sprint                       OpenProject Sprint
 ──────────────────────────────    ──────────────────────────────
+name: "Sprint 1"             ──→  name: "Sprint 1"
+startDate: "2024-01-01T10:…" ──→  start_date   (truncated to a plain date)
+endDate: "2024-01-14T18:…"   ──→  finish_date  (truncated to a plain date)
+state: "future"              ──→  status: "in_planning"
+state: "active"              ──→  status: "active"
+state: "closed"              ──→  status: "completed"
+goal: "..."                  ──→  sprint_goals.text (separate table)
+```
+
+The column names are not guessable from `Version` and were read off a live
+OpenProject 17.6.0 instance:
+
+```
+sprints(id, name, status:string, start_date:date, finish_date:date,
+        project_id:integer, created_at, updated_at)
+sprint_goals(id, sprint_id, project_id, text, created_at, updated_at)
+```
+
+Two mismatches with Jira are resolved by `sprints` (`SprintMigration`) before
+anything reaches Rails, and both are reported in the run summary:
+
+- **The same sprint arrives more than once.** `GET /board/{id}/sprint` answers
+  for every board whose filter reaches a sprint, so a sprint shared by two
+  boards is reported twice. It is deduplicated on the Jira sprint id.
+- **Jira allows several active sprints; OpenProject allows one per project.**
+  `Sprint` validates uniqueness of an active status scoped to `project_id`
+  (`only_one_active_sprint_allowed`). The most recently started active sprint
+  per project keeps `active`; the rest are demoted to `in_planning`.
+
+`sprint_epic` (`SprintEpicMigration`) then attaches sprints to work packages:
+
+| Jira | OpenProject | Notes |
+|------|-------------|-------|
+| Issue's sprint | `work_package.sprint_id` | Only the **first** sprint that resolves via the `sprint` mapping |
+| Issue's sprint(s) | CF "Sprint" (text) | **All** names, de-duplicated, sorted, comma-separated |
+
+`work_packages.sprint_id` is a scalar foreign key, exactly like `version_id`
+was, so an issue that belonged to several Jira sprints is still attached to
+only one. The custom field carrying every sprint name is therefore a permanent
+part of this mapping, not a stopgap awaiting native support.
+
+#### Jira Sprint → OpenProject Version (legacy)
+
+Reachable with `J2O_SPRINT_STRATEGY=version` (or `both`), for targets older
+than OpenProject 17.3:
+
+```
 name: "Sprint 1"             ──→  name: "Sprint 1"
 goal: "..."                  ──→  description
 startDate: "2024-01-01"      ──→  start_date
-endDate: "2024-01-14"        ──→  due_date
+endDate: "2024-01-14"        ──→  effective_date
 state: "closed"              ──→  status: "closed" (any other state → "open")
 —                            ──→  sharing: "none"
 ```
 
-The version itself is created by `agile_boards` (`AgileBoardMigration`), which
-also writes the `sprint` mapping. `sprint_epic` (`SprintEpicMigration`) then
-applies the sprint to the work packages:
-
-| Jira | OpenProject | Notes |
-|------|-------------|-------|
-| Issue's sprint | `work_package.version_id` | Only the **first** sprint that resolves via the `sprint` mapping |
-| Issue's sprint(s) | CF "Sprint" (text) | **All** names, de-duplicated, sorted, comma-separated |
-
-An issue that belonged to several sprints therefore keeps every sprint name in
-the "Sprint" custom field, but is assigned to only one version.
+Under this strategy `agile_boards` creates the Versions and `SprintEpicMigration`
+falls back to `work_package.version_id`. The `sprint` mapping holds both ids
+(`openproject_sprint_id` and `openproject_id`), so the fallback survives even
+after a native run.
 
 #### Jira Board → OpenProject Saved Query
 
@@ -394,13 +434,13 @@ query description for reference only — they are **not** translated into query
 filters or column configuration. The resulting query lists the project's work
 packages with OpenProject's default filters.
 
-#### Why boards and sprints are not mapped 1:1
+#### Why boards are not mapped 1:1
 
 **Sprint → Version** matched OpenProject's own data model when this mapping was
 written: in the Backlogs module a sprint *was* a version. OpenProject 17.3
 (2026-04-15) changed that — sprints became independent objects "no longer linked
-to versions". Since this toolset now targets OpenProject 17.3+ (see `README.md`),
-the version-based mapping is a legacy shape.
+to versions" — and the `sprints` component now targets that model directly. The
+version-based mapping is kept only for older targets.
 
 **Board → Saved Query** is a lowest-common-denominator choice driven by
 OpenProject's Enterprise gating:
@@ -415,17 +455,16 @@ OpenProject's Enterprise gating:
 A saved query works on every edition; a faithful board → board migration needs an
 Enterprise target for anything beyond a basic board.
 
-**Planned change** (agreed in [#260](https://github.com/netresearch/jira-to-openproject/issues/260#issuecomment-5100423937),
-not yet implemented): map sprints to native OpenProject sprints and boards to
-boards, keeping board → saved query as an optional fallback for Community
-targets.
+**Remaining planned change** (from [#260](https://github.com/netresearch/jira-to-openproject/issues/260#issuecomment-5100423937)):
+the sprint half is done; mapping boards to native boards is still open, with
+board → saved query staying as the fallback for Community targets.
 
 **References**:
 - [OpenProject 17.3 release notes](https://www.openproject.org/docs/release-notes/17-3-0/) — sprints as independent objects
 - [Agile boards in the Community edition](https://www.openproject.org/blog/agile-boards-for-community/) — basic vs. action boards
 - [Boards user guide](https://www.openproject.org/docs/user-guide/agile-boards/)
 
-**Component**: `agile_boards` (`AgileBoardMigration`), `sprint_epic` (`SprintEpicMigration`)
+**Component**: `sprints` (`SprintMigration`), `agile_boards` (`AgileBoardMigration`), `sprint_epic` (`SprintEpicMigration`)
 
 ---
 
@@ -434,10 +473,15 @@ targets.
 The recommended migration sequence ensures dependencies are satisfied. The
 executable order is `DEFAULT_COMPONENT_SEQUENCE` in
 `src/application/components/registry.py`; where the two differ, the registry
-wins. Known divergence: the registry runs `agile_boards` and `sprint_epic`
-*before* `work_packages_skeleton`, so on a cold full run `sprint_epic` finds an
-empty `work_package` mapping and applies no version assignments, parent links or
-"Sprint" custom-field values.
+wins.
+
+`sprints` and `agile_boards` create their objects early (they only need
+`projects`), while `sprint_epic` — which attaches sprints and Epic Links to
+work packages — runs after `work_packages_content`. Keeping the two apart is
+deliberate: `sprint_epic` used to sit next to `agile_boards`, ahead of
+`work_packages_skeleton`, where it found an empty `work_package` mapping and
+silently applied no assignments, parent links or "Sprint" custom-field values
+on every cold run.
 
 ```
 1. FOUNDATION
@@ -470,8 +514,9 @@ empty `work_package` mapping and applies no version assignments, parent links or
    └── versions       # Depends on: projects
    └── components     # Depends on: projects
    └── labels         # Depends on: work_packages
-   └── agile_boards   # Depends on: projects — creates the sprint versions + board queries
-   └── sprint_epic    # Depends on: agile_boards (sprint mapping), work_packages
+   └── sprints        # Depends on: projects — creates the native sprints (17.3+)
+   └── agile_boards   # Depends on: projects — creates the board saved-queries
+   └── sprint_epic    # Depends on: sprints (sprint mapping), work_packages — runs after work_packages_content
 
 7. RELATIONSHIPS
    └── relations      # Depends on: work_packages

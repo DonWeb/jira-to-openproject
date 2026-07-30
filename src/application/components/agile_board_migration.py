@@ -19,6 +19,10 @@ from typing import Any
 
 from src import config
 from src.application.components.base_migration import BaseMigration, register_entity_types
+from src.application.components.sprint_migration import (
+    SPRINT_STRATEGY_NATIVE,
+    sprint_strategy,
+)
 from src.infrastructure.jira.jira_client import JiraClient
 from src.infrastructure.openproject.openproject_client import OpenProjectClient
 from src.models import ComponentResult
@@ -257,7 +261,15 @@ class AgileBoardMigration(BaseMigration):
                 },
             )
 
-        for sprint in sprints:
+        # Under the default ``native`` strategy the ``sprints`` component
+        # owns sprint creation and has already run, so building Versions
+        # here would duplicate every sprint into a second representation.
+        # ``version``/``both`` keep the legacy behaviour for pre-17.3
+        # targets and for side-by-side comparison.
+        strategy = sprint_strategy()
+        sprint_source = [] if strategy == SPRINT_STRATEGY_NATIVE else sprints
+
+        for sprint in sprint_source:
             project_key = sprint.get("project_key")
             project_entry = self.project_mapping.get(project_key) if project_key else None
             op_project_id = int(project_entry.get("openproject_id", 0)) if isinstance(project_entry, dict) else 0
@@ -302,6 +314,7 @@ class AgileBoardMigration(BaseMigration):
                 "versions": len(version_payloads),
                 "skipped_boards": len(skipped_boards),
                 "skipped_sprints": len(skipped_sprints),
+                "sprint_strategy": strategy,
             },
         )
 

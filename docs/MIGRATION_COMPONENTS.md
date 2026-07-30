@@ -47,8 +47,9 @@ The j2o migration tool consists of 40+ specialized migration components, each ha
 | RelationMigration | `relations` | Stable | Yes | Issue links |
 | WatcherMigration | `watchers` | Stable | Yes | Notifications |
 | **Agile** |
+| SprintMigration | `sprints` | Stable | Yes | Native OpenProject sprints (17.3+) |
 | SprintEpicMigration | `sprint_epic` | Stable | Yes | Sprint/Epic links on WPs |
-| AgileBoardMigration | `agile_boards` | Stable | Yes | Board queries + sprint versions |
+| AgileBoardMigration | `agile_boards` | Stable | Yes | Board saved-queries |
 | VersionsMigration | `versions` | Stable | Yes | Release tracking |
 | AffectsVersionsMigration | `affects_versions` | Stable | Yes | Version links |
 | **Labels & Tags** |
@@ -496,23 +497,53 @@ Migrates Jira issue link types to OpenProject relation types.
 
 ## Agile & Sprint Migrations
 
+### SprintMigration
+
+**Location**: `src/application/components/sprint_migration.py`
+
+Creates OpenProject's **native** sprints (17.3+) from Jira sprints. Creation
+only — attaching them to work packages is `SprintEpicMigration`'s job. Handles
+the entity type `native_sprints`.
+
+**Features**:
+- Sprint → `Sprint` row (`name`, `start_date`, `finish_date`, `status`), persisted
+  in the `sprint` mapping as `openproject_sprint_id`
+- Sprint goal → `sprint_goals.text` (a separate table; `sprints` has no goal column)
+- Deduplicates a sprint reported by several boards, keyed on the Jira sprint id
+- Enforces OpenProject's one-active-sprint-per-project rule: the most recently
+  started active sprint keeps `active`, the rest are demoted to `in_planning`
+  and listed in `details.demoted_active`
+- Degrades to the Version path by itself when the target has no `Sprint` model
+
+**Configuration**: `J2O_SPRINT_STRATEGY` = `native` (default) | `version` | `both`
+
+**Dependencies**: ProjectMigration
+
+**Related**: SprintEpicMigration, [Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration)
+
+---
+
 ### SprintEpicMigration
 
 **Location**: `src/application/components/sprint_epic_migration.py`
 
 Applies Jira sprint membership and Epic Links to already-migrated work packages.
-The sprint versions themselves are created by `AgileBoardMigration`.
+The sprints themselves are created by `SprintMigration` (or, under the legacy
+strategy, by `AgileBoardMigration`). Sequenced after `work_packages_content`,
+since it can only attach to work packages that already exist.
 
 **Features**:
 - Epic Link → `parent_id` hierarchy on the child work package
-- Sprint → `version_id` on the work package, resolved via the `sprint` mapping
-  (first matching sprint only)
-- Sprint → "Sprint" text custom field, holding all sprint names comma-separated
+- Sprint → `sprint_id` on the work package, falling back to `version_id` when no
+  native sprint is mapped; resolved via the `sprint` mapping (first matching
+  sprint only, as both columns are scalar foreign keys)
+- Sprint → "Sprint" text custom field, holding all sprint names comma-separated —
+  the only place multi-sprint membership survives
 
-**Dependencies**: ProjectMigration, WorkPackageMigration, AgileBoardMigration
+**Dependencies**: ProjectMigration, WorkPackageMigration, SprintMigration
 (provides the `sprint` mapping)
 
-**Related**: AgileBoardMigration, [Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration)
+**Related**: SprintMigration, [Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration)
 
 ---
 
@@ -520,19 +551,20 @@ The sprint versions themselves are created by `AgileBoardMigration`.
 
 **Location**: `src/application/components/agile_board_migration.py`
 
-Creates one OpenProject saved query per Jira board and one OpenProject version
-per Jira sprint. Handles the entity types `agile_boards` and `sprints`.
+Creates one OpenProject saved query per Jira board. Handles the entity types
+`agile_boards` and `sprints`.
 
 **Features**:
 - Board → public saved query named `[Board] <name>`; board type, original JQL and
   column/status list go into the query **description** only — filters and columns
   are left empty
-- Sprint → project version (name, goal → description, start/due date, open/closed
-  status), persisted in the `sprint` mapping for `SprintEpicMigration`
+- Sprint → project version — **only** under `J2O_SPRINT_STRATEGY=version`/`both`.
+  On the default `native` strategy `SprintMigration` owns sprint creation and
+  this component builds no version payloads
 
-**Not** mapped to OpenProject's native boards or (since 17.3) native sprints —
-see [Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration) for the reasoning
-and the planned change.
+**Not** mapped to OpenProject's native boards — see
+[Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration) for the reasoning and
+the remaining planned change.
 
 **Dependencies**: ProjectMigration
 
@@ -972,7 +1004,8 @@ UserMigration (foundation)
     │       ├── WatcherMigration
     │       ├── TimeEntryMigration
     │       ├── SprintEpicMigration
-    │       │   └── AgileBoardMigration
+    │       │   └── SprintMigration
+    │       ├── AgileBoardMigration
     │       ├── VotesMigration
     │       ├── LabelsMigration
     │       ├── InlineRefsMigration

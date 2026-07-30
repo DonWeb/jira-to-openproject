@@ -107,8 +107,11 @@ DEFAULT_COMPONENT_SEQUENCE: list[ComponentName] = [
     "projects",
     # === Agile: Workflows, Boards, Sprints ===
     "workflows",
+    # Native OpenProject sprints (17.3+). Creation only, and it has to
+    # precede ``agile_boards`` so the board queries are created against
+    # projects whose sprints already exist.
+    "sprints",
     "agile_boards",
-    "sprint_epic",
     # === Phase 1: Work Package Skeletons (no content) ===
     "work_packages_skeleton",
     # === Phase 2: Attachments (creates mapping for URL conversion) ===
@@ -127,6 +130,11 @@ DEFAULT_COMPONENT_SEQUENCE: list[ComponentName] = [
     # the audit; idempotent — only sets fields where the OP value is
     # currently null/blank).
     "wp_metadata_backfill",
+    # Attaches sprints and Epic Links to work packages, so it can only run
+    # once they exist. It used to sit next to ``agile_boards``, ahead of
+    # ``work_packages_skeleton``, where it found an empty work_package
+    # mapping and silently applied nothing on every cold run.
+    "sprint_epic",
     # === Post-WP Data: Versions, Components, Labels ===
     "versions",
     "components",
@@ -160,6 +168,7 @@ PREDEFINED_PROFILES: dict[str, list[ComponentName]] = {
         "issue_types",
         "status_types",
         "workflows",
+        "sprints",
         "agile_boards",
         "sprint_epic",
         "admin_schemes",
