@@ -20,7 +20,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-stage Dockerfile with `HEALTHCHECK`, OCI labels, and a slimmer runtime image.
 - Expanded `AGENTS.md` with Overview, Setup, Development, Architecture, Testing, and Critical-constraints sections.
 
+### Fixed
+- `sprints` no longer stalls on an OpenProject release whose `Sprint` model lacks
+  a column it writes. The schema is probed once up front and the component stops
+  with the version and missing column named, instead of failing one row at a time;
+  17.4.0 has the model but no `finish_date`, which cost a full poll timeout per
+  sprint. The Ruby also assigns only columns that exist and returns any exception
+  as data — an uncaught one aborts the script before it writes its result file,
+  which the Python side can only observe as a hang.
+- `sprints` resolves a sprint's project from its origin board (`originBoardId`)
+  rather than from whichever board listed it first; boards in different Jira
+  projects can report the same sprint.
+- `sprints` stops after 5 consecutive failures rather than attempting every
+  remaining sprint.
+
 ### Changed
+- `sprints` logs the OpenProject version, the `Sprint` columns it found, and
+  whether `sprint_goals`/`work_packages.sprint_id` exist before writing anything.
 - `sprint_epic` now attaches work packages via `sprint_id`, falling back to
   `version_id` when no native sprint is mapped, and moved after
   `work_packages_content` in the component sequence — it previously ran before

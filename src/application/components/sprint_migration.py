@@ -42,6 +42,14 @@ from src.infrastructure.openproject.openproject_sprint_service import (
 )
 from src.models import ComponentResult
 
+#: Stop the load loop after this many consecutive failures.
+#:
+#: Every failed ``ensure_project_sprint`` costs a Rails round-trip, and a
+#: failure that repeats is almost always systemic (wrong schema, wedged
+#: console) rather than per-sprint. Grinding through 259 sprints to learn the
+#: same thing 259 times is how a one-line mismatch turned into hours.
+MAX_CONSECUTIVE_FAILURES = 5
+
 #: ``native`` uses OpenProject's Sprint model; ``version`` keeps the legacy
 #: sprint-as-Version behaviour; ``both`` writes each sprint twice (useful
 #: while comparing the two representations side by side).
@@ -125,17 +133,29 @@ class SprintMigration(BaseMigration):
                 continue
 
             duplicates += 1
-            # First board wins. The same sprint reachable from boards in
-            # *different* projects would be genuinely ambiguous, so say so
-            # rather than pick in silence. Not observed on this instance.
-            if seen.get("project_key") != sprint.get("project_key"):
-                config.logger.warning(
-                    "Jira sprint %s is reachable from boards in different projects (%s vs %s); keeping %s",
-                    sprint_id,
-                    seen.get("project_key"),
-                    sprint.get("project_key"),
-                    seen.get("project_key"),
-                )
+
+            # The copy resolved through the sprint's own origin board wins;
+            # the others are just boards whose filter happens to reach it.
+            if sprint.get("project_from_origin_board") and not seen.get("project_from_origin_board"):
+                by_id[sprint_id] = sprint
+                seen, sprint = sprint, seen
+
+            if seen.get("project_key") == sprint.get("project_key"):
+                continue
+
+            # Same sprint, two projects, and no origin board settled it —
+            # genuinely ambiguous, so say so instead of picking in silence.
+            config.logger.warning(
+                "Jira sprint %s is reachable from boards in different projects (%s via '%s' vs %s via '%s'); "
+                "keeping %s (origin board %s)",
+                sprint_id,
+                seen.get("project_key"),
+                seen.get("board_name"),
+                sprint.get("project_key"),
+                sprint.get("board_name"),
+                seen.get("project_key"),
+                "resolved" if seen.get("project_from_origin_board") else "unresolved",
+            )
 
         return list(by_id.values()), duplicates
 
@@ -181,33 +201,54 @@ class SprintMigration(BaseMigration):
                 )
         return demoted
 
+    def _board_project_key(self, board: dict[str, Any]) -> str | None:
+        """Resolve a board's Jira project key.
+
+        ``location`` is Cloud-only — absent on this Jira Server/DC — so fall
+        back to the dedicated board/project endpoint, the same resolution
+        order ``AgileBoardMigration`` uses.
+        """
+        location = board.get("location") or {}
+        project_key = location.get("key") or location.get("projectKey") or board.get("locationProjectKey")
+        if project_key:
+            return str(project_key)
+
+        board_id = board.get("id")
+        try:
+            board_projects = self.jira_client.get_board_projects(board_id)
+        except Exception:
+            return None
+        if board_projects:
+            key = board_projects[0].get("key")
+            return str(key) if key else None
+        return None
+
     def _fetch_sprints(self) -> list[dict[str, Any]]:
-        """Fetch every sprint reachable from every Jira board."""
+        """Fetch every sprint reachable from every Jira board.
+
+        A sprint's project comes from its **origin board** (``originBoardId``),
+        not from whichever board happened to surface it first. A board's
+        sprint listing includes any sprint its filter reaches, so a sprint can
+        be reported by boards belonging to different projects — five sprints
+        here are visible from both an ES board and an EF board, and those are
+        two different OpenProject projects. Taking the first board would file
+        them under whichever one the iteration happened to hit.
+        """
         try:
             boards = self.jira_client.get_boards()
         except Exception as exc:
             self.logger.exception("Failed to fetch Jira boards: %s", exc)
             return []
 
-        sprint_payloads: list[dict[str, Any]] = []
+        project_key_by_board: dict[int, str | None] = {}
+        raw: list[dict[str, Any]] = []
 
         for board in boards:
             board_id = board.get("id")
             if board_id is None:
                 continue
 
-            # ``location`` is Cloud-only — absent on this Jira Server/DC —
-            # so fall back to the dedicated board/project endpoint, the
-            # same resolution order ``AgileBoardMigration`` uses.
-            location = board.get("location") or {}
-            project_key = location.get("key") or location.get("projectKey") or board.get("locationProjectKey")
-            if not project_key:
-                try:
-                    board_projects = self.jira_client.get_board_projects(board_id)
-                except Exception:
-                    board_projects = []
-                if board_projects:
-                    project_key = board_projects[0].get("key")
+            project_key_by_board[int(board_id)] = self._board_project_key(board)
 
             try:
                 board_sprints = self.jira_client.get_board_sprints(board_id)
@@ -215,11 +256,11 @@ class SprintMigration(BaseMigration):
                 board_sprints = []
 
             for sprint in board_sprints:
-                sprint_payloads.append(
+                raw.append(
                     {
-                        "board_id": board_id,
+                        "board_id": int(board_id),
                         "board_name": board.get("name"),
-                        "project_key": project_key,
+                        "origin_board_id": sprint.get("originBoardId"),
                         "id": sprint.get("id"),
                         "name": sprint.get("name"),
                         "goal": sprint.get("goal"),
@@ -229,7 +270,21 @@ class SprintMigration(BaseMigration):
                     },
                 )
 
-        return sprint_payloads
+        for entry in raw:
+            origin_id = entry.get("origin_board_id")
+            origin_key = project_key_by_board.get(int(origin_id)) if origin_id is not None else None
+            if origin_key:
+                entry["project_key"] = origin_key
+                entry["project_from_origin_board"] = True
+            else:
+                # Either Jira did not report an origin board, or it points at
+                # a board outside this instance's visible set. Fall back to
+                # the reporting board and let ``_dedupe_sprints`` flag any
+                # cross-project disagreement.
+                entry["project_key"] = project_key_by_board.get(entry["board_id"])
+                entry["project_from_origin_board"] = False
+
+        return raw
 
     # ------------------------------------------------------------------ #
     # ETL                                                                #
@@ -347,6 +402,21 @@ class SprintMigration(BaseMigration):
             )
 
         support = self.op_client.detect_native_sprint_support()
+
+        # Say out loud which instance and which schema this is about to write
+        # to. Two runs failed against an instance whose ``sprints`` table had
+        # no ``finish_date`` while the logs said nothing about either the
+        # version or the columns, so diagnosing it meant digging through
+        # archived tmux captures for a Rails backtrace.
+        self.logger.info(
+            "OpenProject %s | native sprints: %s | sprint columns: %s | sprint_goals: %s | work_packages.sprint_id: %s",
+            support.get("op_version") or "unknown",
+            support.get("supported"),
+            ", ".join(support.get("columns") or []) or "none",
+            support.get("goals"),
+            support.get("wp_fk"),
+        )
+
         if not support.get("supported"):
             # Not an error: a pre-17.3 target legitimately has no Sprint
             # model, and ``agile_boards`` still creates the Versions.
@@ -356,7 +426,38 @@ class SprintMigration(BaseMigration):
             return ComponentResult(
                 success=True,
                 message="Native sprints unsupported on this instance; Version path retained",
-                details={"strategy": strategy, "native_supported": False},
+                details={
+                    "strategy": strategy,
+                    "native_supported": False,
+                    "op_version": support.get("op_version"),
+                },
+            )
+
+        # Check the schema once, before touching 259 sprints. The Sprint model
+        # is not stable across OpenProject releases — 17.4.0 has the model but
+        # no ``finish_date`` — and finding that out one row at a time costs a
+        # Rails round-trip each. The observed column list goes into the error
+        # so the message itself is the schema report for that release.
+        missing = list(support.get("missing_required") or [])
+        if missing:
+            message = (
+                f"OpenProject {support.get('op_version') or 'unknown'} has a Sprint model but is missing "
+                f"required column(s): {', '.join(missing)}. Columns present: "
+                f"{', '.join(support.get('columns') or []) or 'none'}. "
+                f"Set J2O_SPRINT_STRATEGY=version to migrate sprints as Versions on this instance."
+            )
+            self.logger.error(message)
+            return ComponentResult(
+                success=False,
+                message="Native sprint schema is incompatible with this OpenProject release",
+                error=message,
+                details={
+                    "strategy": strategy,
+                    "native_supported": True,
+                    "op_version": support.get("op_version"),
+                    "missing_required": missing,
+                    "columns": support.get("columns"),
+                },
             )
 
         sprints: list[dict[str, Any]] = mapped.data.get("sprints", [])
@@ -367,8 +468,11 @@ class SprintMigration(BaseMigration):
         goals_skipped = 0
         blocked: list[dict[str, Any]] = []
         mapping_updates: dict[str, Any] = {}
+        consecutive_failures = 0
+        aborted_after: int | None = None
+        dropped_columns: set[str] = set()
 
-        for payload in sprints:
+        for index, payload in enumerate(sprints):
             jira_sprint_id = payload.get("jira_sprint_id")
             try:
                 result = self.op_client.ensure_project_sprint(
@@ -381,25 +485,48 @@ class SprintMigration(BaseMigration):
                 )
             except Exception as exc:
                 errors += 1
+                consecutive_failures += 1
                 self.logger.exception("Failed to create sprint %s: %s", payload.get("name"), exc)
-                continue
-
-            if not result.get("success"):
-                errors += 1
-                if result.get("blocking_active"):
-                    blocked.append(
-                        {
-                            "sprint": payload.get("name"),
-                            "project_id": payload["project_id"],
-                            "blocking_active": result.get("blocking_active"),
-                        },
+                result = {"success": False, "error": str(exc)}
+            else:
+                if result.get("success"):
+                    consecutive_failures = 0
+                else:
+                    errors += 1
+                    consecutive_failures += 1
+                    if result.get("blocking_active"):
+                        blocked.append(
+                            {
+                                "sprint": payload.get("name"),
+                                "project_id": payload["project_id"],
+                                "blocking_active": result.get("blocking_active"),
+                            },
+                        )
+                    self.logger.error(
+                        "Sprint '%s' rejected by OpenProject: %s",
+                        payload.get("name"),
+                        result.get("error"),
                     )
+
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                # Repeating failures are systemic, not per-sprint. Stop rather
+                # than pay a Rails round-trip apiece to confirm it 250 more
+                # times.
+                aborted_after = index + 1
                 self.logger.error(
-                    "Sprint '%s' rejected by OpenProject: %s",
-                    payload.get("name"),
+                    "Stopping after %s consecutive failures at sprint %s/%s; last error: %s",
+                    consecutive_failures,
+                    aborted_after,
+                    len(sprints),
                     result.get("error"),
                 )
+                break
+
+            if not result.get("success"):
                 continue
+
+            for column in result.get("dropped_columns") or []:
+                dropped_columns.add(str(column))
 
             if result.get("created"):
                 created += 1
@@ -440,18 +567,36 @@ class SprintMigration(BaseMigration):
                 goals_skipped,
             )
 
+        if dropped_columns:
+            self.logger.warning(
+                "Column(s) not present on this instance's Sprint model, left unset: %s",
+                ", ".join(sorted(dropped_columns)),
+            )
+
+        message = "Native sprints migrated"
+        if aborted_after is not None:
+            message = (
+                f"Native sprint migration stopped after {MAX_CONSECUTIVE_FAILURES} consecutive failures "
+                f"({aborted_after} of {len(sprints)} sprints attempted)"
+            )
+
         return ComponentResult(
             success=errors == 0,
-            message="Native sprints migrated",
+            message=message,
             success_count=created,
             failed_count=errors,
             details={
                 "strategy": strategy,
                 "native_supported": True,
+                "op_version": support.get("op_version"),
                 "sprints_created": created,
                 "sprints_existing": existing,
+                "sprints_attempted": aborted_after if aborted_after is not None else len(sprints),
+                "sprints_total": len(sprints),
+                "aborted_after_consecutive_failures": aborted_after,
                 "goals_written": goals_written,
                 "goals_skipped": goals_skipped,
+                "dropped_columns": sorted(dropped_columns),
                 "errors": errors,
                 "blocked_by_active_conflict": blocked,
                 "skipped": len(mapped.data.get("skipped", [])),

@@ -375,6 +375,23 @@ sprints(id, name, status:string, start_date:date, finish_date:date,
 sprint_goals(id, sprint_id, project_id, text, created_at, updated_at)
 ```
 
+> **The `Sprint` schema is not stable across OpenProject releases.** 17.4.0 has
+> the model but **no `finish_date`** column; 17.6.0 has it. `sprints`
+> (`SprintMigration`) therefore probes the live schema once at startup, logs the
+> OpenProject version and the columns it found, and stops immediately — naming
+> the version and the missing column — rather than discovering the mismatch one
+> row at a time. The Ruby additionally assigns only columns that exist, so a
+> future rename degrades instead of raising. On an incompatible release, set
+> `J2O_SPRINT_STRATEGY=version` to fall back to the Version mapping below.
+
+Which project a sprint lands in comes from its **origin board**
+(`originBoardId`), not from whichever board first reported it. A board's sprint
+listing includes every sprint its filter reaches, so boards in different Jira
+projects can both report the same sprint — five sprints here are visible from
+both an `ES` and an `EF` board, and those map to different OpenProject projects.
+When Jira reports no usable origin board, the reporting board is used and the
+disagreement is logged.
+
 Two mismatches with Jira are resolved by `sprints` (`SprintMigration`) before
 anything reaches Rails, and both are reported in the run summary:
 

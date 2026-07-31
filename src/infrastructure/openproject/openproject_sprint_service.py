@@ -59,6 +59,25 @@ JIRA_STATE_TO_OP_STATUS: dict[str, str] = {
     "closed": STATUS_COMPLETED,
 }
 
+#: Columns this service writes and cannot meaningfully do without.
+#:
+#: The ``Sprint`` schema is **not stable across OpenProject releases**: 17.4.0
+#: has the model but no ``finish_date``, while 17.6.0 has it. Rather than guess
+#: at alternative names for a version nobody has probed, callers check this set
+#: against the live schema up front and stop with the observed column list in
+#: hand — that message is the diagnostic for whatever release comes next.
+REQUIRED_SPRINT_COLUMNS: tuple[str, ...] = (
+    "name",
+    "project_id",
+    "status",
+    "start_date",
+    "finish_date",
+)
+
+#: Columns assigned only when the live schema actually has them, keyed by the
+#: field name used in this service's payloads.
+OPTIONAL_SPRINT_COLUMNS: tuple[str, ...] = ("start_date", "finish_date", "status")
+
 
 def map_jira_state(state: str | None) -> str:
     """Translate a Jira sprint state into a valid OpenProject sprint status.
@@ -93,25 +112,43 @@ class OpenProjectSprintService:
     # ── capability detection ─────────────────────────────────────────────
 
     def detect_native_sprint_support(self) -> dict[str, Any]:
-        """Report whether this instance has native sprints, cached per client.
+        """Report what this instance's sprint model actually offers, cached per client.
 
-        Returns a dict with ``supported`` (bool), ``columns`` (list) and
-        ``wp_fk`` (bool — whether ``work_packages.sprint_id`` exists). A
-        failed probe degrades to ``supported: False`` rather than raising,
+        Returns ``supported``, ``op_version``, ``columns``, ``wp_fk``
+        (whether ``work_packages.sprint_id`` exists), ``goals`` (whether the
+        ``sprint_goals`` table exists) and ``missing_required`` — the subset
+        of :data:`REQUIRED_SPRINT_COLUMNS` this instance lacks.
+
+        ``missing_required`` is the part that matters. Reporting only "does
+        the model exist?" is what let a run proceed against an instance whose
+        ``sprints`` table had no ``finish_date``, then fail one row at a time.
+
+        A failed probe degrades to ``supported: False`` rather than raising,
         so a pre-17.3 target falls back to the Version path instead of
         aborting the run.
         """
         if self._support is not None:
             return self._support
 
-        script = """
-        if defined?(Sprint)
-          { supported: true,
-            columns: Sprint.column_names,
-            wp_fk: WorkPackage.column_names.include?('sprint_id'),
-            goals: ActiveRecord::Base.connection.table_exists?('sprint_goals') }
-        else
-          { supported: false, columns: [], wp_fk: false, goals: false }
+        required_json = json.dumps(list(REQUIRED_SPRINT_COLUMNS))
+        script = f"""
+        begin
+          if defined?(Sprint)
+            cols = Sprint.column_names
+            required = {required_json}
+            {{ supported: true,
+               op_version: (defined?(OpenProject::VERSION) ? OpenProject::VERSION.to_s : nil),
+               columns: cols,
+               missing_required: (required - cols),
+               wp_fk: WorkPackage.column_names.include?('sprint_id'),
+               goals: (defined?(SprintGoal) && ActiveRecord::Base.connection.table_exists?('sprint_goals')) }}
+          else
+            {{ supported: false, op_version: (defined?(OpenProject::VERSION) ? OpenProject::VERSION.to_s : nil),
+               columns: [], missing_required: {required_json}, wp_fk: false, goals: false }}
+          end
+        rescue => e
+          {{ supported: false, error: "#{{e.class}}: #{{e.message}}",
+             columns: [], missing_required: {required_json}, wp_fk: false, goals: false }}
         end
         """
         try:
@@ -147,6 +184,16 @@ class OpenProjectSprintService:
         the expected way this fails, and naming the blocker is more useful
         than the validator's message alone. Nothing is demoted to make room
         — reassigning somebody else's active sprint is the operator's call.
+
+        The Ruby body is wrapped in a ``rescue`` that returns the error as
+        data. That is not defensive habit, it is the difference between a
+        failure and a hang: an exception escaping the script aborts it before
+        it writes its result file, and the Python side then blocks for the
+        full poll timeout with nothing to report. One mistyped column name
+        cost 215 seconds per sprint that way.
+
+        Optional columns are assigned only if the live schema has them, so a
+        release that renames or drops one degrades instead of raising.
         """
         try:
             payload = {
@@ -164,57 +211,71 @@ class OpenProjectSprintService:
             # sees data, never code. No trailing .to_json — the runner already
             # wraps the tail expression in .as_json.
             payload_json = json.dumps(payload, ensure_ascii=False)
+            optional_json = json.dumps(list(OPTIONAL_SPRINT_COLUMNS))
             script = f"""
             require 'json'
             input = JSON.parse(<<'JSON_DATA')
 {payload_json}
 JSON_DATA
 
-            if !defined?(Sprint)
-              {{ success: false, error: 'native sprints unsupported on this instance' }}
-            else
-              project = Project.find_by(id: input['project_id'].to_i)
-              if project.nil?
-                {{ success: false, error: 'project not found' }}
+            begin
+              if !defined?(Sprint)
+                {{ success: false, error: 'native sprints unsupported on this instance' }}
               else
-                sprint = Sprint.where(project_id: project.id, name: input['name']).first_or_initialize
-                was_new = sprint.new_record?
+                project = Project.find_by(id: input['project_id'].to_i)
+                if project.nil?
+                  {{ success: false, error: 'project not found' }}
+                else
+                  cols = Sprint.column_names
+                  sprint = Sprint.where(project_id: project.id, name: input['name']).first_or_initialize
+                  was_new = sprint.new_record?
 
-                attrs = {{ name: input['name'], project_id: project.id }}
-                attrs[:start_date]  = input['start_date']  if input['start_date']
-                attrs[:finish_date] = input['finish_date'] if input['finish_date']
-                attrs[:status]      = input['status']      if input['status']
-                sprint.assign_attributes(attrs)
-                changed = sprint.changed?
-
-                if sprint.valid?
-                  sprint.save! if changed || was_new
-
-                  goal_id = nil
-                  goal_skipped = false
-                  if input['goal'] && !input['goal'].to_s.strip.empty?
-                    if defined?(SprintGoal)
-                      g = SprintGoal.where(sprint_id: sprint.id).first_or_initialize
-                      g.project_id = sprint.project_id
-                      g.text = input['goal']
-                      g.save!
-                      goal_id = g.id
+                  attrs = {{ name: input['name'], project_id: project.id }}
+                  dropped = []
+                  {optional_json}.each do |field|
+                    next unless input[field]
+                    if cols.include?(field)
+                      attrs[field.to_sym] = input[field]
                     else
-                      goal_skipped = true
+                      dropped << field
                     end
                   end
+                  sprint.assign_attributes(attrs)
+                  changed = sprint.changed?
 
-                  {{ success: true, id: sprint.id, created: was_new, updated: changed,
-                     goal_id: goal_id, goal_skipped: goal_skipped }}
-                else
-                  blocking = Sprint.where(project_id: project.id, status: 'active')
-                                   .where.not(id: sprint.id).pluck(:id, :name)
-                  {{ success: false,
-                     error: sprint.errors.full_messages.join('; '),
-                     blocking_active: blocking,
-                     attempted: attrs }}
+                  if sprint.valid?
+                    sprint.save! if changed || was_new
+
+                    goal_id = nil
+                    goal_skipped = false
+                    if input['goal'] && !input['goal'].to_s.strip.empty?
+                      if defined?(SprintGoal)
+                        g = SprintGoal.where(sprint_id: sprint.id).first_or_initialize
+                        g.project_id = sprint.project_id
+                        g.text = input['goal']
+                        g.save!
+                        goal_id = g.id
+                      else
+                        goal_skipped = true
+                      end
+                    end
+
+                    {{ success: true, id: sprint.id, created: was_new, updated: changed,
+                       goal_id: goal_id, goal_skipped: goal_skipped, dropped_columns: dropped }}
+                  else
+                    blocking = Sprint.where(project_id: project.id, status: 'active')
+                                     .where.not(id: sprint.id).pluck(:id, :name)
+                    {{ success: false,
+                       error: sprint.errors.full_messages.join('; '),
+                       blocking_active: blocking,
+                       attempted: attrs }}
+                  end
                 end
               end
+            rescue => e
+              {{ success: false,
+                 error: "#{{e.class}}: #{{e.message}}",
+                 backtrace: (e.backtrace || [])[0, 5] }}
             end
             """
 
@@ -242,12 +303,21 @@ JSON_DATA
         as updated. Verifying the assignment therefore needs a real count,
         not the batch's own tally.
         """
+        script = """
+        begin
+          { count: WorkPackage.where.not(sprint_id: nil).count }
+        rescue => e
+          { count: 0, error: "#{e.class}: #{e.message}" }
+        end
+        """
         try:
-            result = self._client.execute_query_to_json_file(
-                "{ count: WorkPackage.where.not(sprint_id: nil).count }",
-                timeout=60,
-            )
+            result = self._client.execute_query_to_json_file(script, timeout=60)
             if isinstance(result, dict):
+                if result.get("error"):
+                    self._logger.warning(
+                        "Could not count sprint-assigned work packages: %s",
+                        result["error"],
+                    )
                 return int(result.get("count", 0) or 0)
         except Exception as exc:
             self._logger.warning("Failed to count sprint-assigned work packages: %s", exc)

@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import pytest
 
-from src.application.components.sprint_migration import SprintMigration
+from src.application.components.sprint_migration import (
+    MAX_CONSECUTIVE_FAILURES,
+    SprintMigration,
+)
 from src.infrastructure.openproject.openproject_sprint_service import (
     JIRA_STATE_TO_OP_STATUS,
+    REQUIRED_SPRINT_COLUMNS,
     VALID_SPRINT_STATUSES,
     map_jira_state,
     to_date,
 )
+
+ALL_COLUMNS = ["id", "name", "status", "start_date", "finish_date", "project_id"]
 
 
 class DummyJira:
@@ -40,17 +46,37 @@ class DummyJira:
 
 
 class DummyOp:
-    def __init__(self, *, supported: bool = True, report_as_created: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        supported: bool = True,
+        report_as_created: bool = True,
+        columns: list[str] | None = None,
+        op_version: str = "17.6.0",
+        fail_with: str | None = None,
+    ) -> None:
         self.created_sprints: list[dict] = []
         self._supported = supported
         self._report_as_created = report_as_created
+        self._columns = ALL_COLUMNS if columns is None else columns
+        self._op_version = op_version
+        self._fail_with = fail_with
 
     def detect_native_sprint_support(self):
-        return {"supported": self._supported, "columns": [], "wp_fk": True}
+        return {
+            "supported": self._supported,
+            "op_version": self._op_version,
+            "columns": self._columns,
+            "missing_required": [c for c in REQUIRED_SPRINT_COLUMNS if c not in self._columns],
+            "wp_fk": True,
+            "goals": True,
+        }
 
     def ensure_project_sprint(self, project_id, **payload):
         record = {"project_id": project_id, **payload}
         self.created_sprints.append(record)
+        if self._fail_with:
+            return {"success": False, "error": self._fail_with}
         return {
             "success": True,
             "created": self._report_as_created,
@@ -209,6 +235,112 @@ def test_sprint_mapping_keeps_the_legacy_version_id_alongside_the_native_id(
     assert entry["openproject_sprint_id"] == 901
     assert entry["openproject_id"] == 800
     assert op.created_sprints[0]["status"] == "completed"
+
+
+def test_missing_schema_column_aborts_before_touching_any_sprint(
+    _mock_mappings,
+) -> None:
+    """A release whose Sprint model lacks a required column must stop up front.
+
+    OpenProject 17.4.0 has the Sprint model but no ``finish_date``. Finding
+    that out one row at a time cost a Rails round-trip per sprint, and each
+    failed round-trip blocked for the full poll timeout — 215 seconds for the
+    first sprint alone, against 259 of them.
+    """
+    boards = [{"id": 1, "name": "Board", "location": {"projectKey": "PROJ"}}]
+    sprints = {1: [{"id": 42, "name": "Sprint 1", "state": "active", "endDate": "2026-01-01"}]}
+    op = DummyOp(columns=[c for c in ALL_COLUMNS if c != "finish_date"], op_version="17.4.0")
+    mig = SprintMigration(
+        jira_client=DummyJira(boards=boards, sprints_by_board=sprints),
+        op_client=op,
+    )  # type: ignore[arg-type]
+
+    result = mig._load(mig._map(mig._extract()))
+
+    assert result.success is False
+    assert result.details["missing_required"] == ["finish_date"]
+    assert result.details["op_version"] == "17.4.0"
+    # The error names the version and the columns actually present, so the
+    # message itself is the schema report for that release.
+    assert "17.4.0" in (result.error or "")
+    assert "finish_date" in (result.error or "")
+    # Nothing was attempted.
+    assert op.created_sprints == []
+
+
+def test_repeated_failures_stop_the_loop_instead_of_grinding_through_every_sprint(
+    _mock_mappings,
+) -> None:
+    """Consecutive failures are systemic; stop rather than confirm them 259 times."""
+    boards = [{"id": 1, "name": "Board", "location": {"projectKey": "PROJ"}}]
+    many = [{"id": i, "name": f"Sprint {i}", "state": "future"} for i in range(1, 21)]
+    op = DummyOp(fail_with="ActiveModel::UnknownAttributeError: unknown attribute 'finish_date'")
+    mig = SprintMigration(
+        jira_client=DummyJira(boards=boards, sprints_by_board={1: many}),
+        op_client=op,
+    )  # type: ignore[arg-type]
+
+    result = mig._load(mig._map(mig._extract()))
+
+    assert result.success is False
+    assert len(op.created_sprints) == MAX_CONSECUTIVE_FAILURES
+    assert result.details["aborted_after_consecutive_failures"] == MAX_CONSECUTIVE_FAILURES
+    assert result.details["sprints_total"] == 20
+    assert "consecutive failures" in result.message
+
+
+def test_sprint_project_comes_from_its_origin_board(
+    _mock_mappings,
+) -> None:
+    """A sprint belongs to its origin board's project, not the first board that lists it.
+
+    A board's sprint listing includes every sprint its filter reaches, so
+    boards in different projects can both report one sprint — observed live
+    for five sprints visible from both an ES board and an EF board, which map
+    to different OpenProject projects. Iteration order must not decide which.
+    """
+    boards = [
+        # Iterated first, but only *sees* the sprint.
+        {"id": 1, "name": "EF Board", "location": {"projectKey": "OTHER"}},
+        # The sprint's origin.
+        {"id": 2, "name": "ES Board", "location": {"projectKey": "PROJ"}},
+    ]
+    shared = {"id": 4, "name": "Sprint 4", "state": "future", "originBoardId": 2}
+    op = DummyOp()
+    mig = SprintMigration(
+        jira_client=DummyJira(boards=boards, sprints_by_board={1: [shared], 2: [shared]}),
+        op_client=op,
+    )  # type: ignore[arg-type]
+
+    extracted = mig._extract()
+    mapped = mig._map(extracted)
+    result = mig._load(mapped)
+
+    assert extracted.details["duplicates_collapsed"] == 1
+    assert result.success is True
+    assert len(op.created_sprints) == 1
+    # PROJ -> 11 in the fixture; OTHER is unmapped and would have been skipped.
+    assert op.created_sprints[0]["project_id"] == 11
+    assert mapped.details["skipped"] == 0
+
+
+def test_unknown_origin_board_falls_back_to_the_reporting_board(
+    _mock_mappings,
+) -> None:
+    """No usable originBoardId → keep the old behaviour rather than drop the sprint."""
+    boards = [{"id": 1, "name": "Board", "location": {"projectKey": "PROJ"}}]
+    # originBoardId points at a board this instance cannot see.
+    sprints = {1: [{"id": 7, "name": "Sprint 7", "state": "future", "originBoardId": 999}]}
+    op = DummyOp()
+    mig = SprintMigration(
+        jira_client=DummyJira(boards=boards, sprints_by_board=sprints),
+        op_client=op,
+    )  # type: ignore[arg-type]
+
+    result = mig._load(mig._map(mig._extract()))
+
+    assert result.success is True
+    assert op.created_sprints[0]["project_id"] == 11
 
 
 def test_unsupported_instance_falls_back_instead_of_failing(

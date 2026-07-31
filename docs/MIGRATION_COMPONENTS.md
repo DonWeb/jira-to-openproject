@@ -510,10 +510,20 @@ the entity type `native_sprints`.
   in the `sprint` mapping as `openproject_sprint_id`
 - Sprint goal → `sprint_goals.text` (a separate table; `sprints` has no goal column)
 - Deduplicates a sprint reported by several boards, keyed on the Jira sprint id
+- Resolves each sprint's project from its **origin board** (`originBoardId`), not
+  from the first board that lists it — boards in different projects can report
+  the same sprint
 - Enforces OpenProject's one-active-sprint-per-project rule: the most recently
   started active sprint keeps `active`, the rest are demoted to `in_planning`
   and listed in `details.demoted_active`
 - Degrades to the Version path by itself when the target has no `Sprint` model
+
+**Version tolerance**: the `Sprint` schema differs between OpenProject releases
+(17.4.0 has no `finish_date`; 17.6.0 does). The component probes the live schema
+once, logs `OpenProject <version> | sprint columns: ...` before writing anything,
+and stops with the version and missing column named if the schema is
+incompatible. It also stops after `MAX_CONSECUTIVE_FAILURES` (5) consecutive
+errors, since a repeating failure is systemic rather than per-sprint.
 
 **Configuration**: `J2O_SPRINT_STRATEGY` = `native` (default) | `version` | `both`
 
