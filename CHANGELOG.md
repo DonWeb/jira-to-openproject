@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded `AGENTS.md` with Overview, Setup, Development, Architecture, Testing, and Critical-constraints sections.
 
 ### Fixed
+- Rails console no longer wedges on the first command of a run. Commands are
+  stripped before reaching `send-keys`: the script templates are indented
+  triple-quoted literals, so every command ended with a newline plus indentation
+  and tmux submitted a whitespace-only line *while the block it had just closed
+  was still evaluating*. Reline 0.6.3 / IRB 1.18.0 corrupts its line buffer on
+  input-during-eval and parks the prompt in continuation for good; IRB 1.17.0
+  tolerated it, so identical bytes worked until the container was upgraded.
+- Console readiness reads the marker off the IRB prompt instead of searching the
+  line for `>`. A continuation line such as `open-project(prod):357*  rescue => e`
+  used to report ready, so the next command was typed into the open buffer —
+  which is how one stuck block survived across three consecutive runs.
+- `_stabilize_console` sends `Ctrl+C` first (twice) and clears afterwards. It
+  previously sent space+Enter first, appending another continuation line to the
+  buffer it was meant to clear, and cleared the pane before the evidence could
+  be read.
+- Console readiness recovery (`reset_on_stall`) is enabled on the paths that
+  send commands, and a console that cannot be made ready now fails immediately
+  with the pane tail attached instead of blocking for the full poll timeout.
 - `sprints` no longer stalls on an OpenProject release whose `Sprint` model lacks
   a column it writes. The schema is probed once up front and the component stops
   with the version and missing column named, instead of failing one row at a time;
