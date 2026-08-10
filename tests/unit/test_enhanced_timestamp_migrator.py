@@ -403,7 +403,14 @@ class TestEnhancedTimestampMigrator:
         assert "start_date" not in timestamps
 
     def test_generate_timestamp_preservation_script(self, migrator_with_mocks) -> None:
-        """Rails script generation should validate keys and escape payload safely."""
+        """Rails script generation should validate keys and escape payload safely.
+
+        The literal must be **single**-quoted. This test previously pinned
+        ``jira_key: "PROJ-1"`` — a double-quoted Ruby string, which Ruby runs
+        ``#{...}`` inside. Since the key comes from Jira, that was the exact
+        shape ``openproject_issue_priority_service`` had already been hardened
+        against.
+        """
         migrator_with_mocks._rails_operations_cache = [
             {
                 "jira_key": "PROJ-1",
@@ -418,8 +425,54 @@ class TestEnhancedTimestampMigrator:
         script = migrator_with_mocks._generate_timestamp_preservation_script(mapping)
 
         assert "WorkPackage.find(77)" in script
-        assert 'jira_key: "PROJ-1"' in script
+        assert "jira_key: 'PROJ-1'" in script
+        assert 'jira_key: "PROJ-1"' not in script
         assert "created_at" in script
+
+    def test_generated_script_does_not_interpolate_a_crafted_jira_key(
+        self,
+        migrator_with_mocks,
+    ) -> None:
+        """A key carrying ``#{...}`` must not become executable Ruby.
+
+        ``_validate_jira_key`` is the first line of defence, so this asserts
+        the second: whatever reaches the generator is quoted such that Ruby
+        cannot evaluate it. Escaping for JSON does not do that — JSON has no
+        ``#{}`` and passes it straight through.
+        """
+        payload = "PROJ-1"
+        migrator_with_mocks._rails_operations_cache = [
+            {"jira_key": payload, "type": "set_created_at", "timestamp": "2024-01-01T00:00:00Z"},
+        ]
+        mapping = {"1": {"jira_key": payload, "openproject_id": 77}}
+
+        script = migrator_with_mocks._generate_timestamp_preservation_script(mapping)
+
+        # Single-quoted Ruby literals never interpolate, so no key can escape.
+        assert '"' not in script.split("operations << ")[1].split("\n")[0]
+
+    def test_unknown_column_is_refused_rather_than_interpolated(
+        self,
+        migrator_with_mocks,
+    ) -> None:
+        """The updated column is a bare Ruby method name — allowlist or nothing.
+
+        ``update_columns(<name>: …)`` cannot be escaped: the value *is* code.
+        An operation type outside the known set must be dropped, not emitted.
+        """
+        migrator_with_mocks._rails_operations_cache = [
+            {
+                "jira_key": "PROJ-1",
+                "type": "set_id); system('rm -rf /'); wp.update_columns(created_at",
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
+        ]
+        mapping = {"1": {"jira_key": "PROJ-1", "openproject_id": 77}}
+
+        script = migrator_with_mocks._generate_timestamp_preservation_script(mapping)
+
+        assert "system(" not in script
+        assert "WorkPackage.find(77)" not in script
 
     def test_generate_timestamp_preservation_script_rejects_bad_key(self, migrator_with_mocks) -> None:
         """Invalid Jira keys should raise an exception to prevent injection."""

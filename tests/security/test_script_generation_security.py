@@ -1,12 +1,12 @@
 """Security tests for script generation to prevent injection attacks."""
 
-import json
 import re
 from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
 
+from src.infrastructure.openproject.openproject_client import escape_ruby_single_quoted
 from src.utils.enhanced_timestamp_migrator import EnhancedTimestampMigrator
 from src.utils.enhanced_user_association_migrator import EnhancedUserAssociationMigrator
 
@@ -24,11 +24,17 @@ def _create_work_package_mapping(jira_key="SAFE-1", wp_id=42):
 
 
 def _verify_script_safety(script, original_jira_key) -> None:
-    """Verify that a script properly escapes the jira_key and contains no dangerous patterns."""
-    import json
+    """Verify that a script properly escapes the jira_key and contains no dangerous patterns.
 
+    The key must appear only inside a **single-quoted** Ruby literal. This
+    helper used to require the ``json.dumps`` form instead, which pinned the
+    very shape that turned out to be unsafe: ``json.dumps`` yields a
+    *double*-quoted Ruby string, and Ruby evaluates ``#{...}`` inside those.
+    JSON has no such construct, so escaping for JSON leaves an interpolation
+    intact — and these keys come from Jira.
+    """
     script_content = script if isinstance(script, str) else str(script)
-    escaped_key = json.dumps(original_jira_key)
+    escaped_key = f"'{escape_ruby_single_quoted(original_jira_key)}'"
 
     # Original key should not appear unescaped in the script
     # (except possibly in comments which are safe)
@@ -38,7 +44,12 @@ def _verify_script_safety(script, original_jira_key) -> None:
     assert original_jira_key not in script_without_escaped, f"Unescaped jira_key '{original_jira_key}' found in script"
 
     # Escaped key should be present in the script
-    assert escaped_key in script_content, f"Escaped jira_key '{escaped_key}' not found in script"
+    assert escaped_key in script_content, f"Escaped jira_key {escaped_key} not found in script"
+
+    # And never inside a double-quoted literal, where Ruby would interpolate it.
+    assert f'"{original_jira_key}"' not in script_content, (
+        "jira_key sits in a double-quoted Ruby literal; Ruby runs #{...} inside those"
+    )
 
     # Common injection patterns should not be present
     dangerous_patterns = [
@@ -324,13 +335,17 @@ def test_timestamp_script_field_name_also_escaped(ts_migrator, clean_cache) -> N
 
     script = ts_migrator._generate_timestamp_preservation_script(wp_map)
 
-    # Verify all field names are JSON-escaped
+    # Field names appear as single-quoted Ruby literals in the result hashes.
+    # They used to be json.dumps'd, i.e. double-quoted, where Ruby interpolates.
     for op_type in field_operations:
         field_name = op_type.replace("set_", "")
-        escaped_field = json.dumps(field_name)
+        escaped_field = f"'{escape_ruby_single_quoted(field_name)}'"
         assert escaped_field in script, f"Field {field_name} not properly escaped"
+        assert f'"{field_name}"' not in script
 
-        # Also verify the field is used correctly in wp update_columns call
+        # Also verify the field is used correctly in wp update_columns call.
+        # There the name is a bare Ruby method name, so it is gated by the
+        # _WRITABLE_TIMESTAMP_COLUMNS allowlist rather than by escaping.
         assert f"wp.update_columns({field_name}: DateTime.parse" in script
 
 

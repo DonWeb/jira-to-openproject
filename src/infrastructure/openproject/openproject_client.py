@@ -1642,4 +1642,14 @@ class OpenProjectClient:
                 msg,
             )
 
-        return f"{safe_model}.where({field}: {values_json}).map(&:as_json)"
+        # The value list crosses into Ruby through a heredoc and ``JSON.parse``
+        # rather than as interpolated source. Inlining the JSON reads as valid
+        # Ruby right up until a ``None`` appears: JSON writes it as ``null``,
+        # which Ruby has no such thing as, and the script dies with
+        # ``NameError: undefined local variable or method 'null'`` — the same
+        # failure that killed a work-package batch in the 2026-08-06 run.
+        return (
+            "require 'json'\n"
+            f"j2o_values = JSON.parse(<<'J2O_VALUES')\n{values_json}\nJ2O_VALUES\n"
+            f"{safe_model}.where({field}: j2o_values).map(&:as_json)"
+        )

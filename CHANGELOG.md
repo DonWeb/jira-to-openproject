@@ -20,7 +20,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-stage Dockerfile with `HEALTHCHECK`, OCI labels, and a slimmer runtime image.
 - Expanded `AGENTS.md` with Overview, Setup, Development, Architecture, Testing, and Critical-constraints sections.
 
+### Security
+- Values reaching the Rails console are embedded as **single-quoted** Ruby
+  literals via `escape_ruby_single_quoted`, not via `json.dumps`. The latter
+  yields a *double*-quoted Ruby string, and Ruby evaluates `#{...}` inside
+  those; JSON has no such construct, so escaping for JSON left an interpolation
+  intact. Since these values (custom-field names, Jira keys) originate in Jira,
+  a crafted one could run arbitrary code in the Rails console.
+  `openproject_issue_priority_service` had already been hardened against this —
+  the same fix now covers `openproject_custom_field_service.remove_custom_field`,
+  `enhanced_timestamp_migrator` and `enhanced_user_association_migrator`.
+- `enhanced_timestamp_migrator` restricts the column it writes through
+  `update_columns` to an allowlist. The name is interpolated as a bare Ruby
+  method name, where escaping does not apply and only an allowlist works.
+
 ### Fixed
+- `batch_update_work_packages` and `_build_safe_batch_query` pass their payloads
+  through a heredoc and `JSON.parse` instead of inlining `json.dumps` output as
+  Ruby source. That shape reads as valid Ruby — JSON objects are hash literals,
+  `true`/`false` match — until a `None` appears: JSON writes it as `null`, which
+  Ruby has no such thing as, and the script dies with `NameError` before writing
+  its result file. A checklist-type custom field carrying `"status": null` killed
+  a 543 KB batch of 137 work packages that way and cost a run ten minutes of
+  blind polling. Note `JSON.parse` yields string keys, so the Ruby now reads
+  `update['id']`.
+- `batch_update_work_packages` reports attributes it could not apply
+  (`unapplied`) instead of silently dropping them while still counting the row
+  as updated.
 - Rails console no longer wedges on the first command of a run. Commands are
   stripped before reaching `send-keys`: the script templates are indented
   triple-quoted literals, so every command ended with a newline plus indentation

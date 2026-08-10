@@ -23,7 +23,10 @@ import requests
 
 from src import config
 from src.infrastructure.jira.jira_client import JiraApiError, JiraClient
-from src.infrastructure.openproject.openproject_client import OpenProjectClient
+from src.infrastructure.openproject.openproject_client import (
+    OpenProjectClient,
+    escape_ruby_single_quoted,
+)
 from src.utils.validators import validate_jira_key
 
 # =============================================================================
@@ -2741,16 +2744,19 @@ class EnhancedUserAssociationMigrator:
                     break
 
             if wp_id:
-                # SECURITY: Escape jira_key to prevent injection in Ruby hash literals
-                # json.dumps() ensures quotes, newlines, and special chars are properly escaped
-                # Example: "TEST'; DROP TABLE users;" becomes "\"TEST'; DROP TABLE users;\""
-                escaped_jira_key = json.dumps(jira_key)
+                # SECURITY: single-quoted Ruby literal. ``json.dumps`` emits a
+                # *double*-quoted one, and Ruby runs ``#{...}`` inside those.
+                # jira_key comes from Jira, so escaping it for JSON — which has
+                # no ``#{}`` and passes it through untouched — would leave a
+                # path to arbitrary code in the Rails console. Same fix and
+                # reasoning as ``openproject_issue_priority_service``.
+                escaped_jira_key = f"'{escape_ruby_single_quoted(jira_key)}'"
                 script_lines.extend(
                     [
-                        f"# Update author for work package {wp_id} (Jira: {jira_key})",
+                        f"# Update author for work package {wp_id}",
                         "begin",
                         f"  wp = WorkPackage.find({wp_id})",
-                        f"  wp.author_id = {author_id}",
+                        f"  wp.author_id = {int(author_id)}",
                         "  wp.save(validate: false)  # Skip validations for metadata updates",
                         f"  operations << {{jira_key: {escaped_jira_key}, wp_id: {wp_id}, status: 'success'}}",
                         "rescue => e",
