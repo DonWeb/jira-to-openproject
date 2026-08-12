@@ -47,7 +47,7 @@ The j2o migration tool consists of 40+ specialized migration components, each ha
 | RelationMigration | `relations` | Stable | Yes | Issue links |
 | WatcherMigration | `watchers` | Stable | Yes | Notifications |
 | **Agile** |
-| SprintMigration | `sprints` | Stable | Yes | Native OpenProject sprints (17.3+) |
+| SprintMigration | `sprints` | Stable | Yes | Native OpenProject sprints (**17.6+**) |
 | SprintEpicMigration | `sprint_epic` | Stable | Yes | Sprint/Epic links on WPs |
 | AgileBoardMigration | `agile_boards` | Stable | Yes | Board saved-queries |
 | VersionsMigration | `versions` | Stable | Yes | Release tracking |
@@ -501,7 +501,7 @@ Migrates Jira issue link types to OpenProject relation types.
 
 **Location**: `src/application/components/sprint_migration.py`
 
-Creates OpenProject's **native** sprints (17.3+) from Jira sprints. Creation
+Creates OpenProject's **native** sprints (requires OpenProject **17.6+**) from Jira sprints. Creation
 only — attaching them to work packages is `SprintEpicMigration`'s job. Handles
 the entity type `native_sprints`.
 
@@ -518,12 +518,26 @@ the entity type `native_sprints`.
   and listed in `details.demoted_active`
 - Degrades to the Version path by itself when the target has no `Sprint` model
 
-**Version tolerance**: the `Sprint` schema differs between OpenProject releases
-(17.4.0 has no `finish_date`; 17.6.0 does). The component probes the live schema
-once, logs `OpenProject <version> | sprint columns: ...` before writing anything,
-and stops with the version and missing column named if the schema is
-incompatible. It also stops after `MAX_CONSECUTIVE_FAILURES` (5) consecutive
-errors, since a repeating failure is systemic rather than per-sprint.
+**Version tolerance**: the toolset supports OpenProject 17.3+, but native
+sprints need **17.6+**. 17.3 made sprints independent objects and the schema
+kept moving after that — 17.4.0 has the `Sprint` model with no `finish_date`
+column, 17.6.0 has it. The component probes the live schema once, logs
+`OpenProject <version> | sprint columns: ...` before writing anything, and picks
+the representation that release can hold:
+
+| Target | Sprints become | Built by |
+|--------|----------------|----------|
+| 17.6+ | native `Sprint` | `SprintMigration` |
+| 17.5 and earlier | `Version` | `AgileBoardMigration` |
+
+No configuration required. `J2O_SPRINT_STRATEGY` overrides the choice but cannot
+conjure a missing column, so `native` on an older target still resolves to
+Versions. Both components read the decision from the same helper
+(`effective_sprint_strategy`) so they cannot disagree about which one owns the
+sprints.
+
+It also stops after `MAX_CONSECUTIVE_FAILURES` (5) consecutive errors, since a
+repeating failure is systemic rather than per-sprint.
 
 **Configuration**: `J2O_SPRINT_STRATEGY` = `native` (default) | `version` | `both`
 

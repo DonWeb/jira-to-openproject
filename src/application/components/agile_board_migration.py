@@ -21,7 +21,7 @@ from src import config
 from src.application.components.base_migration import BaseMigration, register_entity_types
 from src.application.components.sprint_migration import (
     SPRINT_STRATEGY_NATIVE,
-    sprint_strategy,
+    effective_sprint_strategy,
 )
 from src.infrastructure.jira.jira_client import JiraClient
 from src.infrastructure.openproject.openproject_client import OpenProjectClient
@@ -261,12 +261,18 @@ class AgileBoardMigration(BaseMigration):
                 },
             )
 
-        # Under the default ``native`` strategy the ``sprints`` component
-        # owns sprint creation and has already run, so building Versions
-        # here would duplicate every sprint into a second representation.
-        # ``version``/``both`` keep the legacy behaviour for pre-17.3
-        # targets and for side-by-side comparison.
-        strategy = sprint_strategy()
+        # Resolved against the live instance, not just the config flag: below
+        # OpenProject 17.6 sprints migrate as Versions and this component
+        # builds them. Reading the raw flag here while ``SprintMigration``
+        # resolved it against the instance meant that on a target without
+        # native sprints, that component stepped aside expecting the Version
+        # path to take over and this one skipped it — no sprints migrated and
+        # both reported success.
+        #
+        # On 17.6+ the ``sprints`` component owns sprint creation and has
+        # already run, so building Versions too would give every sprint a
+        # second, competing representation.
+        strategy = effective_sprint_strategy(self.op_client)
         sprint_source = [] if strategy == SPRINT_STRATEGY_NATIVE else sprints
 
         for sprint in sprint_source:

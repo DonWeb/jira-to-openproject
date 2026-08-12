@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method name, where escaping does not apply and only an allowlist works.
 
 ### Fixed
+- Sprints migrate as Versions on OpenProject 17.5 and earlier, and as native
+  `Sprint` objects on 17.6+, chosen automatically from the live schema. Both
+  `sprints` and `agile_boards` now read that decision from one helper: they
+  previously consulted the raw `J2O_SPRINT_STRATEGY` flag independently, so on
+  an instance without native sprints `SprintMigration` stepped aside expecting
+  the Version path to take over while `AgileBoardMigration` still saw `native`
+  and skipped building Versions — no sprints migrated and both reported success.
 - Waiting for a Rails result file now ends when the script does. The poll loop
   checks whether the console has settled; a console back at its prompt with no
   file means the script died and no further polling can help. One run spent 595

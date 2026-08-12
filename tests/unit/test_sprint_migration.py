@@ -12,6 +12,7 @@ import pytest
 from src.application.components.sprint_migration import (
     MAX_CONSECUTIVE_FAILURES,
     SprintMigration,
+    effective_sprint_strategy,
 )
 from src.infrastructure.openproject.openproject_sprint_service import (
     JIRA_STATE_TO_OP_STATUS,
@@ -237,15 +238,16 @@ def test_sprint_mapping_keeps_the_legacy_version_id_alongside_the_native_id(
     assert op.created_sprints[0]["status"] == "completed"
 
 
-def test_missing_schema_column_aborts_before_touching_any_sprint(
+def test_release_without_the_native_schema_migrates_sprints_as_versions(
     _mock_mappings,
 ) -> None:
-    """A release whose Sprint model lacks a required column must stop up front.
+    """OpenProject 17.4.0 has the Sprint model but no ``finish_date``.
 
-    OpenProject 17.4.0 has the Sprint model but no ``finish_date``. Finding
-    that out one row at a time cost a Rails round-trip per sprint, and each
-    failed round-trip blocked for the full poll timeout — 215 seconds for the
-    first sprint alone, against 259 of them.
+    Native sprints need 17.6+. Anything below that is ordinary supported
+    behaviour, not a failure: the sprints migrate as Versions, which
+    ``AgileBoardMigration`` builds. Asking "is there a Sprint model?" is the
+    wrong question — 17.4 answers yes and still cannot hold a sprint's end
+    date.
     """
     boards = [{"id": 1, "name": "Board", "location": {"projectKey": "PROJ"}}]
     sprints = {1: [{"id": 42, "name": "Sprint 1", "state": "active", "endDate": "2026-01-01"}]}
@@ -257,15 +259,38 @@ def test_missing_schema_column_aborts_before_touching_any_sprint(
 
     result = mig._load(mig._map(mig._extract()))
 
-    assert result.success is False
-    assert result.details["missing_required"] == ["finish_date"]
-    assert result.details["op_version"] == "17.4.0"
-    # The error names the version and the columns actually present, so the
-    # message itself is the schema report for that release.
-    assert "17.4.0" in (result.error or "")
-    assert "finish_date" in (result.error or "")
-    # Nothing was attempted.
+    assert result.success is True
+    assert result.details["strategy"] == "version"
+    # No half-written native sprints.
     assert op.created_sprints == []
+
+
+def test_effective_strategy_is_resolved_against_the_instance(_mock_mappings) -> None:
+    """Both components must reach the same answer, or sprints fall through the gap.
+
+    They used to read the raw config flag independently: on an instance
+    without native sprints ``SprintMigration`` stepped aside expecting the
+    Version path to take over, while ``AgileBoardMigration`` still saw
+    ``native`` and skipped building Versions. Nothing migrated and both
+    reported success.
+    """
+    assert effective_sprint_strategy(DummyOp()) == "native"
+    assert effective_sprint_strategy(DummyOp(supported=False)) == "version"
+    assert (
+        effective_sprint_strategy(DummyOp(columns=[c for c in ALL_COLUMNS if c != "finish_date"]))
+        == "version"
+    )
+
+
+def test_effective_strategy_falls_back_when_the_probe_fails(_mock_mappings) -> None:
+    """An unreachable probe must not block the migration: Versions work everywhere."""
+
+    class Unreachable:
+        def detect_native_sprint_support(self):
+            msg = "console down"
+            raise RuntimeError(msg)
+
+    assert effective_sprint_strategy(Unreachable()) == "version"  # type: ignore[arg-type]
 
 
 def test_repeated_failures_stop_the_loop_instead_of_grinding_through_every_sprint(
@@ -358,7 +383,7 @@ def test_unsupported_instance_falls_back_instead_of_failing(
     result = mig._load(mig._map(mig._extract()))
 
     assert result.success is True
-    assert result.details["native_supported"] is False
+    assert result.details["strategy"] == "version"
     assert op.created_sprints == []
 
 

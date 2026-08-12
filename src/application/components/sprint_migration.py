@@ -66,6 +66,52 @@ def sprint_strategy() -> str:
     return SPRINT_STRATEGY_NATIVE
 
 
+def effective_sprint_strategy(op_client: OpenProjectClient | None) -> str:
+    """Resolve the configured strategy against what the instance can actually do.
+
+    Native sprints need OpenProject 17.6+. 17.3 made sprints independent
+    objects but the schema kept moving afterwards — 17.4.0 has the ``Sprint``
+    model without the ``finish_date`` column 17.6.0 has — so "is there a Sprint
+    model?" is the wrong question and "does it have the columns we write?" is
+    the right one. Anything below 17.6 maps sprints to ``Version``, which is
+    ordinary supported behaviour rather than a degradation.
+
+    **Both** ``sprints`` and ``agile_boards`` must resolve the strategy the same
+    way, which is why this lives in one place. They previously read the raw
+    config flag independently: on an instance without native sprints,
+    ``SprintMigration`` correctly stepped aside expecting the Version path to
+    take over, while ``AgileBoardMigration`` still saw ``native`` and skipped
+    building Versions. Nothing migrated and both reported success.
+
+    Costs one Rails round-trip per run: the components share an
+    ``OpenProjectClient`` and ``detect_native_sprint_support`` caches, and
+    ``sprints`` runs first so the answer is already warm by the time
+    ``agile_boards`` asks.
+    """
+    configured = sprint_strategy()
+    if configured == SPRINT_STRATEGY_VERSION or op_client is None:
+        return configured if op_client is not None else SPRINT_STRATEGY_VERSION
+
+    try:
+        support = op_client.detect_native_sprint_support()
+    except Exception:
+        # Unreachable probe: the Version path works on every release, so it is
+        # the safe answer.
+        config.logger.warning("Could not probe native sprint support; migrating sprints as Versions")
+        return SPRINT_STRATEGY_VERSION
+
+    if not support.get("supported") or support.get("missing_required"):
+        config.logger.info(
+            "OpenProject %s does not provide the native sprint schema (missing: %s); "
+            "migrating sprints as Versions",
+            support.get("op_version") or "unknown",
+            ", ".join(support.get("missing_required") or []) or "Sprint model",
+        )
+        return SPRINT_STRATEGY_VERSION
+
+    return configured
+
+
 @register_entity_types("native_sprints")
 class SprintMigration(BaseMigration):
     """Create OpenProject native sprints from Jira sprints."""
@@ -393,11 +439,13 @@ class SprintMigration(BaseMigration):
                 error=mapped.message or "map phase returned no data",
             )
 
-        strategy = sprint_strategy()
+        # Resolved once here so ``agile_boards`` sees the same answer: below
+        # 17.6 sprints are Versions and that component builds them.
+        strategy = effective_sprint_strategy(self.op_client)
         if strategy == SPRINT_STRATEGY_VERSION:
             return ComponentResult(
                 success=True,
-                message=f"Native sprint creation skipped (J2O_SPRINT_STRATEGY={strategy})",
+                message="Sprints migrate as Versions on this OpenProject release",
                 details={"strategy": strategy, "skipped_by_strategy": True},
             )
 
@@ -416,49 +464,6 @@ class SprintMigration(BaseMigration):
             support.get("goals"),
             support.get("wp_fk"),
         )
-
-        if not support.get("supported"):
-            # Not an error: a pre-17.3 target legitimately has no Sprint
-            # model, and ``agile_boards`` still creates the Versions.
-            self.logger.warning(
-                "This OpenProject instance has no native Sprint model; leaving sprints to the Version path",
-            )
-            return ComponentResult(
-                success=True,
-                message="Native sprints unsupported on this instance; Version path retained",
-                details={
-                    "strategy": strategy,
-                    "native_supported": False,
-                    "op_version": support.get("op_version"),
-                },
-            )
-
-        # Check the schema once, before touching 259 sprints. The Sprint model
-        # is not stable across OpenProject releases — 17.4.0 has the model but
-        # no ``finish_date`` — and finding that out one row at a time costs a
-        # Rails round-trip each. The observed column list goes into the error
-        # so the message itself is the schema report for that release.
-        missing = list(support.get("missing_required") or [])
-        if missing:
-            message = (
-                f"OpenProject {support.get('op_version') or 'unknown'} has a Sprint model but is missing "
-                f"required column(s): {', '.join(missing)}. Columns present: "
-                f"{', '.join(support.get('columns') or []) or 'none'}. "
-                f"Set J2O_SPRINT_STRATEGY=version to migrate sprints as Versions on this instance."
-            )
-            self.logger.error(message)
-            return ComponentResult(
-                success=False,
-                message="Native sprint schema is incompatible with this OpenProject release",
-                error=message,
-                details={
-                    "strategy": strategy,
-                    "native_supported": True,
-                    "op_version": support.get("op_version"),
-                    "missing_required": missing,
-                    "columns": support.get("columns"),
-                },
-            )
 
         sprints: list[dict[str, Any]] = mapped.data.get("sprints", [])
         created = 0

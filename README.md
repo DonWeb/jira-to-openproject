@@ -20,7 +20,7 @@ A robust, modular migration toolset for transferring project management data fro
 - **Attachment Migration:** Issue attachments → Work package files
 - **Time Log Migration:** Tempo worklogs → OpenProject time entries
 - **Workflow Automation:** Jira workflow transitions → OpenProject workflow entries per type/role
-- **Agile Boards & Sprints:** Jira sprints → OpenProject's native sprints (17.3+; `J2O_SPRINT_STRATEGY=version` keeps the legacy Version mapping for older targets), Jira boards → OpenProject saved queries (not native boards — see [Entity Mapping §11](docs/ENTITY_MAPPING.md#11-agile-migration))
+- **Agile Boards & Sprints:** Jira sprints → OpenProject's native sprints on **17.6+**, or Versions on 17.5 and earlier (chosen automatically); Jira boards → OpenProject saved queries (not native boards — see [Entity Mapping §11](docs/ENTITY_MAPPING.md#11-agile-migration))
 - **Admin Schemes:** Jira role memberships → OpenProject project memberships
 - **Reporting Artefacts:** Jira saved filters & dashboards → OpenProject queries and wiki summaries
 
@@ -42,6 +42,30 @@ A robust, modular migration toolset for transferring project management data fro
 - OpenProject 17.3+ (currently tested against 17.6)
 
 Earlier or later releases may work, but they are not part of the supported/tested matrix.
+
+#### Sprints by OpenProject version
+
+The whole toolset runs on 17.3+, but how Jira sprints land depends on the target:
+
+| Target | Sprints become |
+|--------|----------------|
+| **17.6+** | Native `Sprint` objects |
+| **17.5 and earlier** | `Version` records (the legacy mapping) |
+
+No configuration required: the migration reads the live schema at startup and
+picks the representation that release can hold.
+
+17.3 introduced sprints as independent objects, but the schema kept changing
+afterwards — 17.4.0 has the `Sprint` model **without** the `finish_date` column
+17.6.0 has — so "does a Sprint model exist?" is the wrong question and "does it
+have the columns we write?" is the right one. Below 17.6, sprints migrate as
+Versions exactly as they did before native sprints existed; nothing is lost but
+the native object type.
+
+`J2O_SPRINT_STRATEGY` overrides the choice (`native` / `version` / `both`) — it
+cannot make a release hold a column it does not have, so `native` on an older
+target still resolves to Versions. See
+[Entity Mapping §11](docs/ENTITY_MAPPING.md#11-agile-migration).
 
 ### Installation
 

@@ -23,7 +23,7 @@ This document provides a comprehensive mapping of how Jira entities are transfor
 | **Resolution** | Custom Field Value | `resolutions` | On "Resolution" CF |
 | **Component** | Custom Field Value | `components` | On "Component" CF |
 | **Version** | Version | `versions` | Release tracking |
-| **Sprint** | Sprint (native, 17.3+) | `sprints` + `sprint_epic` | Version mapping kept for older targets — see [§11](#11-agile-migration) |
+| **Sprint** | Sprint (native, **17.6+**) | `sprints` + `sprint_epic` | 17.3 – 17.5 migrate as Version — see [§11](#11-agile-migration) |
 | **Epic** | Work Package (Epic type) | `sprint_epic` | Hierarchy parent |
 | **Label** | Tag | `labels` / `native_tags` | Categorization |
 | **Attachment** | Attachment | `attachments` | File transfer |
@@ -375,14 +375,34 @@ sprints(id, name, status:string, start_date:date, finish_date:date,
 sprint_goals(id, sprint_id, project_id, text, created_at, updated_at)
 ```
 
-> **The `Sprint` schema is not stable across OpenProject releases.** 17.4.0 has
-> the model but **no `finish_date`** column; 17.6.0 has it. `sprints`
-> (`SprintMigration`) therefore probes the live schema once at startup, logs the
-> OpenProject version and the columns it found, and stops immediately — naming
-> the version and the missing column — rather than discovering the mismatch one
-> row at a time. The Ruby additionally assigns only columns that exist, so a
-> future rename degrades instead of raising. On an incompatible release, set
-> `J2O_SPRINT_STRATEGY=version` to fall back to the Version mapping below.
+> **Native sprints require OpenProject 17.6+**, even though the toolset as a
+> whole supports 17.3+.
+>
+> 17.3 made sprints independent objects, but the schema kept moving afterwards:
+> **17.4.0 has the `Sprint` model without a `finish_date` column**, which 17.6.0
+> has. So "does a `Sprint` model exist?" is the wrong question and "does it
+> have the columns we write?" is the right one. `sprints` (`SprintMigration`)
+> reads the live schema once at startup and picks the representation that
+> release can hold. The Ruby additionally assigns only columns that exist, so a
+> future rename degrades instead of raising.
+>
+> | Target | Sprints become | Built by |
+> |--------|----------------|----------|
+> | 17.6+ | native `Sprint` | `sprints` |
+> | 17.5 and earlier | `Version` | `agile_boards` |
+>
+> No configuration required. `J2O_SPRINT_STRATEGY` overrides the choice, but it
+> cannot make a release hold a column it does not have: `native` against an
+> older target still resolves to Versions.
+>
+> Both components resolve this through one shared helper
+> (`effective_sprint_strategy`) precisely so they cannot disagree about which
+> owns the sprints. Reading the config flag independently once left a gap where
+> each assumed the other was handling it, and nothing migrated.
+>
+> Below 17.6 the Version mapping applies and nothing is lost but the native
+> object type: names, dates, states and work-package attachment all migrate
+> exactly as they did before native sprints existed.
 
 Which project a sprint lands in comes from its **origin board**
 (`originBoardId`), not from whichever board first reported it. A board's sprint
@@ -417,8 +437,9 @@ part of this mapping, not a stopgap awaiting native support.
 
 #### Jira Sprint → OpenProject Version (legacy)
 
-Reachable with `J2O_SPRINT_STRATEGY=version` (or `both`), for targets older
-than OpenProject 17.3:
+The mapping for every target below 17.6. Selected with
+`J2O_SPRINT_STRATEGY=version` (or `both`); automatic on releases with no
+`Sprint` model at all:
 
 ```
 name: "Sprint 1"             ──→  name: "Sprint 1"
@@ -531,7 +552,7 @@ on every cold run.
    └── versions       # Depends on: projects
    └── components     # Depends on: projects
    └── labels         # Depends on: work_packages
-   └── sprints        # Depends on: projects — creates the native sprints (17.3+)
+   └── sprints        # Depends on: projects — creates the native sprints (OpenProject 17.6+)
    └── agile_boards   # Depends on: projects — creates the board saved-queries
    └── sprint_epic    # Depends on: sprints (sprint mapping), work_packages — runs after work_packages_content
 

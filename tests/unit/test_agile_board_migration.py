@@ -38,10 +38,26 @@ class DummyJira:
 
 
 class DummyOp:
-    def __init__(self, *, report_as_created: bool = True) -> None:
+    def __init__(self, *, report_as_created: bool = True, native_sprints: bool = True) -> None:
         self.created_queries: list[dict] = []
         self.created_versions: list[dict] = []
         self._report_as_created = report_as_created
+        self._native_sprints = native_sprints
+
+    def detect_native_sprint_support(self):
+        """Whether this instance can hold native sprints (OpenProject 17.6+).
+
+        This component asks the same question ``SprintMigration`` does, so the
+        two cannot disagree about who creates the sprints.
+        """
+        return {
+            "supported": self._native_sprints,
+            "op_version": "17.6.0" if self._native_sprints else "17.4.0",
+            "columns": ["id", "name", "status", "start_date", "finish_date", "project_id"],
+            "missing_required": [] if self._native_sprints else ["finish_date"],
+            "wp_fk": True,
+            "goals": True,
+        }
 
     def create_or_update_query(self, **payload):
         self.created_queries.append(payload)
@@ -205,6 +221,39 @@ def test_agile_board_migration_creates_no_versions_under_native_strategy(
     assert mapped.details["versions"] == 0
     assert mapped.details["sprint_strategy"] == "native"
     assert op.created_versions == []
+
+
+def test_agile_board_migration_creates_versions_when_the_instance_lacks_native_sprints(
+    _mock_mappings: None,
+) -> None:
+    """Below OpenProject 17.6 this component owns the sprints, as Versions.
+
+    Regression for a gap that lost sprints silently: both components used to
+    read the raw ``J2O_SPRINT_STRATEGY`` flag independently. On an instance
+    without native sprints ``SprintMigration`` stepped aside expecting the
+    Version path to take over, while this component still saw ``native`` and
+    skipped building Versions — nothing migrated and both reported success.
+    They now resolve the strategy against the instance, so they cannot
+    disagree.
+    """
+    boards = [
+        {"id": 1, "name": "Sprint Board", "type": "scrum", "location": {"projectKey": "PROJ"}},
+    ]
+    configs = {1: {"columnConfig": {"columns": []}, "filter": {}}}
+    sprints = {1: [{"id": 42, "name": "Sprint 1", "state": "active"}]}
+    op = DummyOp(native_sprints=False)
+    mig = AgileBoardMigration(
+        jira_client=DummyJira(boards=boards, sprints_by_board=sprints, configurations_by_board=configs),
+        op_client=op,
+    )  # type: ignore[arg-type]
+
+    mapped = mig._map(mig._extract())
+    result = mig._load(mapped)
+
+    assert result.success is True
+    assert mapped.details["sprint_strategy"] == "version"
+    assert mapped.details["versions"] == 1
+    assert result.details["versions_created"] == 1
 
 
 def test_agile_board_migration_resolves_project_via_board_projects_endpoint_when_location_missing(
