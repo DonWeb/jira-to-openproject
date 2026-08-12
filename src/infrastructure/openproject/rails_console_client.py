@@ -297,15 +297,55 @@ class RailsConsoleClient:
         """Detect fatal IRB/Reline/console errors in tmux output."""
         if not output:
             return False
+        # These mean the console itself is broken: the terminal layer failed,
+        # or the interpreter blew its stack.
+        #
+        # ``IRB::Irb#run`` used to be on this list and had to come off. It is
+        # a frame in the backtrace of *every* Ruby error raised inside an IRB
+        # session, so an ordinary ``NameError`` in a generated script was
+        # reported as a crashed console. That misdirection sent several
+        # rounds of debugging at the terminal layer while the real defect was
+        # a bad script — and it is precisely the errors we most want to read
+        # that get mislabelled, since a healthy console is what lets Ruby
+        # report them at all.
         fatal_terms = [
             "ungetbyte failed (IOError)",
             "Reline::ANSI#cursor_pos",
             "Reline::Core#readmultiline",
-            "IRB::Irb#run",
             "SystemStackError",
             "stack level too deep",
         ]
         return any(term in output for term in fatal_terms)
+
+    def is_executing(self) -> bool:
+        """Whether the console is mid-evaluation rather than waiting for input.
+
+        ``False`` means the console has settled — either at a ready prompt or
+        parked on a continuation prompt. Callers waiting on a side effect of a
+        script (a result file, say) use this to tell "still working" from
+        "finished, and never going to produce it".
+        """
+        try:
+            state = self._get_console_state(self.capture_pane_tail(lines=10))
+        except Exception:
+            # Unknown beats a wrong answer: keep the caller waiting.
+            return True
+        return state["state"] not in {"ready", "awaiting_input"}
+
+    def last_ruby_error(self) -> str | None:
+        """Return the most recent ``Ruby error:`` line in the pane, if any.
+
+        The marker wrapper prints this when a script raises, so it is the
+        readable cause behind a result file that never appeared.
+        """
+        try:
+            pane = self.capture_pane_tail(lines=40)
+        except Exception:
+            return None
+        for line in reversed(pane.split("\n")):
+            if line.strip().startswith("Ruby error:"):
+                return line.strip()
+        return None
 
     def _clear_pane(self) -> None:
         """Clear the tmux pane to prepare for command output.

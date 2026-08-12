@@ -880,6 +880,46 @@ class OpenProjectRailsRunnerService:
 
     # ── large-result-set queries via container file ──────────────────────
 
+    @staticmethod
+    def _console_has_settled(client: Any) -> bool:
+        """Whether the Rails console has stopped evaluating.
+
+        Conservative by design: anything it cannot determine counts as "still
+        working", so an unavailable or stubbed console never cuts a legitimate
+        wait short.
+        """
+        rails_client = getattr(client, "rails_client", None)
+        is_executing = getattr(rails_client, "is_executing", None)
+        if not callable(is_executing):
+            return False
+        try:
+            return not bool(is_executing())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _describe_missing_result(client: Any, container_file: str, waited: float) -> str:
+        """Explain a result file that will never arrive, with the Ruby cause if present.
+
+        ``cat: …: No such file or directory`` on its own says nothing about
+        *why*, which is what turned a one-line script bug into an
+        investigation. The console usually still holds the real error.
+        """
+        detail = ""
+        rails_client = getattr(client, "rails_client", None)
+        last_ruby_error = getattr(rails_client, "last_ruby_error", None)
+        if callable(last_ruby_error):
+            try:
+                detail = last_ruby_error() or ""
+            except Exception:
+                detail = ""
+
+        message = (
+            f"Rails console finished without writing {container_file} "
+            f"(waited {waited:.1f}s); the script did not complete"
+        )
+        return f"{message}. {detail}" if detail else message
+
     def execute_large_query_to_json_file(
         self,
         query: str,
@@ -1034,7 +1074,7 @@ class OpenProjectRailsRunnerService:
                     # ``is not None`` so a caller-supplied ``timeout=0`` is
                     # respected literally rather than treated as "default".
                     runner_cmd = f"(cd /app || cd /opt/openproject) && bundle exec rails runner {runner_script_path}"
-                    stdout, stderr, rc = client.docker_client.execute_command(
+                    _stdout, stderr, rc = client.docker_client.execute_command(
                         runner_cmd,
                         timeout=timeout if timeout is not None else 300,
                     )
@@ -1043,7 +1083,7 @@ class OpenProjectRailsRunnerService:
                         raise QueryExecutionError(q_msg) from e
             else:
                 runner_cmd = f"(cd /app || cd /opt/openproject) && bundle exec rails runner {runner_script_path}"
-                stdout, stderr, rc = client.docker_client.execute_command(
+                _stdout, stderr, rc = client.docker_client.execute_command(
                     runner_cmd,
                     timeout=timeout or 300,  # Increased from 120 for large projects
                 )
@@ -1083,7 +1123,7 @@ class OpenProjectRailsRunnerService:
                     # cold — 300s matches the explicit-runner branch. Use
                     # ``is not None`` so a caller-supplied ``timeout=0`` is
                     # respected literally rather than treated as "default".
-                    stdout, stderr, rc = client.docker_client.execute_command(
+                    _stdout, stderr, rc = client.docker_client.execute_command(
                         runner_cmd,
                         timeout=timeout if timeout is not None else 300,
                     )
@@ -1093,10 +1133,26 @@ class OpenProjectRailsRunnerService:
                 else:
                     raise
 
-        # Read file back from container via SSH (avoids tmux buffer limits)
+        return self._read_result_file(container_file)
+
+    def _read_result_file(self, container_file: str) -> dict[str, Any]:
+        """Read the JSON a Rails script wrote inside the container.
+
+        Polls over SSH, because the write can complete slightly after the
+        console call returns. The loop ends early once the console has settled
+        without producing the file: at that point the script is over and no
+        further polling can help. Waiting out the full window instead cost one
+        run 595 seconds — 38% of its total — on a script that had failed
+        7 seconds in.
+
+        Raises:
+            QueryExecutionError: If the file never arrives or the read fails.
+            JsonParseError: If the file is not valid JSON.
+
+        """
+        client = self._client
         ssh_command = f"docker exec {shlex.quote(client.container_name)} cat {shlex.quote(container_file)}"
 
-        # Retry loop to handle race where file write completes slightly after command returns
         wait_env = os.environ.get("J2O_QUERY_RESULT_WAIT_SECONDS")
         try:
             max_wait_seconds = int(wait_env) if wait_env else 600
@@ -1108,6 +1164,12 @@ class OpenProjectRailsRunnerService:
             max_wait_seconds = 600
         poll_interval = 0.5
         attempts = max(1, int(max_wait_seconds / poll_interval))
+
+        # Several consecutive idle observations, not one, so the check cannot
+        # pre-empt a write that lands a beat after the prompt returns.
+        heartbeat_every = max(1, int(5 / poll_interval))
+        idle_checks_before_giving_up = 3
+        consecutive_idle = 0
 
         stdout = ""
         stderr = ""
@@ -1135,12 +1197,22 @@ class OpenProjectRailsRunnerService:
             # otherwise escalate after the loop.
             if "No such file or directory" in (stderr or ""):
                 # Emit a lightweight heartbeat every ~5 seconds so runs don't look hung
-                if attempt and (attempt % max(1, int(5 / poll_interval)) == 0):
+                if attempt and (attempt % heartbeat_every == 0):
                     self._logger.info(
                         "Waiting for query result file %s (waited %.1fs)",
                         container_file,
                         attempt * poll_interval,
                     )
+
+                    if self._console_has_settled(client):
+                        consecutive_idle += 1
+                        if consecutive_idle >= idle_checks_before_giving_up:
+                            raise QueryExecutionError(
+                                self._describe_missing_result(client, container_file, attempt * poll_interval),
+                            )
+                    else:
+                        consecutive_idle = 0
+
                 time.sleep(poll_interval)
                 continue
 

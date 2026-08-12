@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method name, where escaping does not apply and only an allowlist works.
 
 ### Fixed
+- Waiting for a Rails result file now ends when the script does. The poll loop
+  checks whether the console has settled; a console back at its prompt with no
+  file means the script died and no further polling can help. One run spent 595
+  seconds — 38% of its total — re-asking for a file whose script had failed
+  7 seconds earlier. The error now names the Ruby cause pulled from the console
+  instead of only `cat: …: No such file or directory`.
+- `IRB::Irb#run` is no longer treated as a fatal console error. It appears in
+  the backtrace of *every* Ruby error raised inside IRB, so ordinary script bugs
+  were reported as a crashed console — sending several rounds of debugging at
+  the terminal layer while the real defect was in the generated script.
 - `batch_update_work_packages` and `_build_safe_batch_query` pass their payloads
   through a heredoc and `JSON.parse` instead of inlining `json.dumps` output as
   Ruby source. That shape reads as valid Ruby — JSON objects are hash literals,

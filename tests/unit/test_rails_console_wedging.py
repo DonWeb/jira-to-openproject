@@ -152,6 +152,77 @@ def test_unrecognised_output_is_not_reported_ready(client: RailsConsoleClient) -
     assert client._get_console_state("")["ready"] is False
 
 
+# ── telling a broken console from a broken script ────────────────────────────
+
+
+def test_an_ordinary_ruby_error_is_not_a_fatal_console_error(
+    client: RailsConsoleClient,
+) -> None:
+    """A NameError from a generated script must not read as a crashed console.
+
+    Every Ruby error raised inside IRB carries ``IRB::Irb#run`` in its
+    backtrace, so keeping that term on the fatal list flagged script bugs as
+    terminal failures. Verbatim from the 2026-08-06 run, where the real defect
+    was a JSON ``null`` reaching Ruby source.
+    """
+    pane = (
+        "Ruby error: NameError: undefined local variable or method 'null' for main\n"
+        "/tmp/j2o_runner_3b958054.rb:5:in '<top (required)>'\n"
+        "/app/vendor/bundle/ruby/4.0.0/gems/irb-1.18.0/lib/irb.rb:193:in 'block in IRB::Irb#run'\n"
+        "/app/vendor/bundle/ruby/4.0.0/gems/irb-1.18.0/lib/irb.rb:192:in 'IRB::Irb#run'\n"
+    )
+
+    assert client._has_fatal_console_error(pane) is False
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "ungetbyte failed (IOError)",
+        "Reline::ANSI#cursor_pos",
+        "Reline::Core#readmultiline",
+        "SystemStackError",
+        "stack level too deep",
+    ],
+)
+def test_genuine_console_failures_are_still_fatal(client: RailsConsoleClient, pane: str) -> None:
+    """Removing the noisy term must not blunt the real signals."""
+    assert client._has_fatal_console_error(pane) is True
+
+
+def test_is_executing_distinguishes_working_from_settled(client: RailsConsoleClient) -> None:
+    """A settled console — ready or wedged — is not going to produce anything."""
+    with patch.object(client, "capture_pane_tail", return_value="open-project(prod):040>"):
+        assert client.is_executing() is False
+    with patch.object(client, "capture_pane_tail", return_value="open-project(prod):053*"):
+        assert client.is_executing() is False
+    # Mid-evaluation: output with no prompt yet.
+    with patch.object(client, "capture_pane_tail", return_value="--EXEC_START--abc123"):
+        assert client.is_executing() is True
+
+
+def test_is_executing_assumes_working_when_it_cannot_tell(client: RailsConsoleClient) -> None:
+    """An unreadable pane must never cut a legitimate wait short."""
+    with patch.object(client, "capture_pane_tail", side_effect=OSError("no tmux")):
+        assert client.is_executing() is True
+
+
+def test_last_ruby_error_surfaces_the_script_failure(client: RailsConsoleClient) -> None:
+    """The console holds the cause behind a result file that never appeared."""
+    pane = (
+        "--EXEC_START--abc\n"
+        "Ruby error: NameError: undefined local variable or method 'null' for main\n"
+        "/tmp/j2o_runner_3b958054.rb:5:in '<top (required)>'\n"
+    )
+    with patch.object(client, "capture_pane_tail", return_value=pane):
+        assert client.last_ruby_error() == (
+            "Ruby error: NameError: undefined local variable or method 'null' for main"
+        )
+
+    with patch.object(client, "capture_pane_tail", return_value="open-project(prod):040>"):
+        assert client.last_ruby_error() is None
+
+
 # ── recovery ─────────────────────────────────────────────────────────────────
 
 
