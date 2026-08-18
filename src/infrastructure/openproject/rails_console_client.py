@@ -256,7 +256,46 @@ class RailsConsoleClient:
             msg = f"Failed to configure IRB settings: {e}"
             raise TmuxSessionError(msg) from e
 
+        self._set_journal_user()
         self._log_console_environment()
+
+    def _set_journal_user(self) -> None:
+        """Attribute this session's journals to a real user, not Anonymous.
+
+        ``User.current`` is unset in a fresh console, and OpenProject answers
+        that state with ``User.anonymous`` rather than ``nil`` — so every
+        ``wp.save!`` the migration performs records its journal as "Anonymous".
+        One assignment per session fixes every later command: ``User.current``
+        lives in a thread-local that nothing clears outside a web request.
+
+        Sent as a single line deliberately; unterminated multi-line input is
+        what this console is fragile about. Never fatal — attribution is a
+        quality-of-data concern, not a precondition for migrating.
+        """
+        # Imported here, not at module scope: ``openproject_client`` imports
+        # this module, so a top-level import would close a cycle.
+        from src.utils.rails_journal_user import console_command
+
+        try:
+            target = self._get_target()
+            subprocess.run(
+                [self._tmux_path, "send-keys", "-t", target, console_command(), "Enter"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            time.sleep(0.5)
+            for line in reversed(self.capture_pane_tail(lines=15).split("\n")):
+                if "J2O journal user" in line:
+                    logger.info("Rails console %s", line.strip())
+                    return
+            logger.debug("Journal user assignment produced no recognisable output")
+        except Exception as exc:
+            logger.warning(
+                "Could not set the console journal user (%s); journals this run "
+                "will be attributed to Anonymous",
+                exc,
+            )
 
     def _log_console_environment(self) -> None:
         """Record the console's Ruby/IRB/Reline versions, best effort.

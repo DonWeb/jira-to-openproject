@@ -31,6 +31,16 @@ if input_data && input_data.respond_to?(:each)
   priority_cache = {}
   IssuePriority.all.each { |p| priority_cache[p.name.downcase] = p.id }
 
+  # Journal author fallback, resolved once for the whole batch.
+  #
+  # This used to be the literal ``2``, which is NOT a safe default: on this
+  # instance id 2 is ``DeletedUser`` ("Deleted user"), and builtin ids are not
+  # stable across installs (here: 1 SystemUser, 2 DeletedUser, 3
+  # AnonymousUser). A real Jira author's journal silently became the
+  # deleted-user placeholder. Prefer a real admin, then a builtin, and never a
+  # hardcoded id. Per-WP the work package's own author still wins over this.
+  j2o_fallback_user_id = User.find_by(admin: true)&.id || User.anonymous.id
+
   valid_journal_attributes = [
     :type_id, :project_id, :subject, :description, :due_date, :category_id,
     :status_id, :assigned_to_id, :priority_id, :version_id, :author_id,
@@ -154,7 +164,7 @@ if input_data && input_data.respond_to?(:each)
 
         # Use pre-computed user_id from Python
         raw_user_id = (op['user_id'] || op[:user_id]).to_i
-        fallback_user_id = rec.author_id && rec.author_id > 0 ? rec.author_id : 2
+        fallback_user_id = rec.author_id && rec.author_id > 0 ? rec.author_id : j2o_fallback_user_id
         user_id = raw_user_id > 0 ? raw_user_id : fallback_user_id
 
         # Use pre-computed timestamps from Python

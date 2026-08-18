@@ -319,6 +319,15 @@ class ConfigLoader:
                     self.config["migration"]["sprint_strategy"] = strategy
                     config_logger.debug("Applied sprint strategy: %s", strategy)
 
+                case ["J2O", "MIGRATION", "JOURNAL", "USER"]:
+                    # Login or numeric id of the OpenProject user every journal
+                    # the migration creates should be attributed to. Left empty
+                    # the migration falls back to ``User.system`` ("System")
+                    # instead of ``User.anonymous``, which is what an
+                    # unconfigured Rails console session would otherwise use.
+                    self.config["migration"]["journal_user"] = str(env_value).strip()
+                    config_logger.debug("Applied migration journal user: %s", env_value)
+
                 case ["J2O", "STOP", "ON", "ERROR"]:
                     stop_on_error = self._convert_value(env_value) is True
                     self.config["migration"]["stop_on_error"] = stop_on_error

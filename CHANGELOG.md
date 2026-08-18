@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `wp_journal_history` component (`WpJournalHistoryMigration`) rebuilding each work
+  package's activity from its Jira changelog **and** comments as one chronological
+  chain. The reconstruction logic existed but was unreachable: the journal templates
+  in `src/ruby` are injected only by `bulk_create_records`, which for work packages
+  is called only from `WorkPackageMigration` — registered under the entity type
+  `work_packages`, absent from both `DEFAULT_COMPONENT_SEQUENCE` and the `full`
+  profile. Migrated work packages therefore carried no Jira history at all: on the
+  2026-08-06 run, 0 of 1773 journals held a changelog change.
+- `wp_timestamp_restore` component (`WpTimestampRestoreMigration`) restoring Jira's
+  `created_at`/`updated_at` on work package rows via `update_columns` as the final
+  step of the sequence. The migration already wrote those timestamps, but in phases
+  1–3; the thirteen components that write work packages afterwards each bumped
+  `updated_at` to the migration time. Measured: 520 of 520 work packages drifted, a
+  median of ~132 days.
+- `J2O_MIGRATION_JOURNAL_USER` setting naming the OpenProject user (login or id)
+  every migration-created journal is attributed to. Unset it falls back to
+  `User.system` ("System").
+- `scripts/cleanup_anonymous_journals.py` removing the note-less v2+ journals an
+  earlier migration attributed to Anonymous and recomposing the affected
+  `validity_period` chains. Dry run by default; `--apply` to delete.
 - `sprints` component (`SprintMigration`) migrating Jira sprints to OpenProject's
   **native** Sprint objects (17.3+) instead of Versions, including sprint goals via
   `sprint_goals`. Selectable with `J2O_SPRINT_STRATEGY` (`native` | `version` | `both`),
@@ -35,6 +55,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method name, where escaping does not apply and only an allowlist works.
 
 ### Fixed
+- Journals the migration creates are attributed to a real user instead of Anonymous.
+  A Rails console session — and a `rails runner` process — starts with nothing
+  having set `User.current`, and OpenProject answers that state with
+  `User.anonymous` rather than `nil`, so every `wp.save!` recorded its journal
+  against Anonymous. Measured before the fix: 1173 of 1773 journals on migrated work
+  packages (66%) were anonymous, including all 520 creation snapshots. The
+  assignment is made once per console session and prepended to script files handed
+  to `rails runner`, which is a separate process the session assignment cannot
+  reach.
+- `User.current || User.find_by(admin: true)` in the comment-creation scripts never
+  reached the admin branch, because `User.current` is never `nil` in OpenProject.
+  Comments whose Jira author did not resolve through the user mapping silently
+  became Anonymous instead of the intended admin fallback. The operands are now
+  ordered so the documented intent holds.
+- The journal templates no longer fall back to the hardcoded user id `2`. Builtin
+  ids are not stable across installs, and on the target instance id 2 is
+  `DeletedUser` — so a real Jira author's journal became the deleted-user
+  placeholder. The fallback is now resolved from the database (work package author,
+  then a real admin) and memoised outside the per-operation loop rather than
+  re-queried for each one.
+- Comments recreated while rebuilding a journal chain keep the
+  `<!-- j2o:jira-comment-id:... -->` provenance marker, so a later
+  `work_packages_content` run still recognises them as migrated and does not append
+  duplicates.
 - Sprints migrate as Versions on OpenProject 17.5 and earlier, and as native
   `Sprint` objects on 17.6+, chosen automatically from the live schema. Both
   `sprints` and `agile_boards` now read that decision from one helper: they

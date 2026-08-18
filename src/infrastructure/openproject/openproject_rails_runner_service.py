@@ -49,6 +49,7 @@ from src.infrastructure.openproject.rails_console_client import (
     ConsoleNotReadyError,
     RubyError,
 )
+from src.utils.rails_journal_user import prepend_to_script
 
 # Tunables for batched/paged Rails queries. Co-located with the service that
 # uses them so the batched-query implementation has no back-reference to
@@ -618,7 +619,10 @@ class OpenProjectRailsRunnerService:
         # Compose Ruby script with a small header that loads JSON into `input_data`
         container_data_path = Path("/tmp") / local_data_path.name
         header = f"require 'json'\ninput_data = JSON.parse(File.read('{container_data_path.as_posix()}'))\n"
-        full_script = header + script_content
+        # Journal-user assignment ahead of the header: this script has a
+        # ``rails runner`` fallback (separate process), so it cannot rely on the
+        # console session's assignment.
+        full_script = prepend_to_script(header + script_content)
 
         local_script_path: Path | None = None
         container_script_path: Path | None = None
@@ -1047,7 +1051,13 @@ class OpenProjectRailsRunnerService:
             local_tmp = Path(client.file_manager.data_dir) / "temp_scripts" / Path(runner_script_path).name
             local_tmp.parent.mkdir(parents=True, exist_ok=True)
             with local_tmp.open("w", encoding="utf-8") as f:
-                f.write(ruby_script)
+                # Attribute journals to the configured user. This file is either
+                # ``load``ed inside the console (already covered by the
+                # session-level assignment, where the preamble is a harmless
+                # re-assignment) or handed to ``bundle exec rails runner``,
+                # which is a separate process the session assignment never
+                # reaches.
+                f.write(prepend_to_script(ruby_script))
             client.docker_client.transfer_file_to_container(local_tmp, Path(runner_script_path))
 
             # Decide load mode: default to console `load` to avoid tmux pastes but keep low startup cost
@@ -1114,7 +1124,9 @@ class OpenProjectRailsRunnerService:
                     local_tmp = Path(client.file_manager.data_dir) / "temp_scripts" / Path(runner_script_path).name
                     local_tmp.parent.mkdir(parents=True, exist_ok=True)
                     with local_tmp.open("w", encoding="utf-8") as f:
-                        f.write(ruby_script)
+                        # Separate ``rails runner`` process: needs its own
+                        # journal-user assignment (see the primary path above).
+                        f.write(prepend_to_script(ruby_script))
                     client.docker_client.transfer_file_to_container(local_tmp, Path(runner_script_path))
                     runner_cmd = f"(cd /app || cd /opt/openproject) && bundle exec rails runner {runner_script_path}"
                     # Same explicit timeout as the other runner paths. This

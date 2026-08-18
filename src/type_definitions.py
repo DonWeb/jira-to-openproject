@@ -120,6 +120,11 @@ class MigrationConfig(TypedDict):
     reset_wp_checkpoints: NotRequired[bool]
     # "native" (default) | "version" | "both" — see SprintMigration.
     sprint_strategy: NotRequired[str]
+    # Login or numeric id of the OpenProject user every migration-created
+    # journal is attributed to. Empty/unset falls back to ``User.system``
+    # ("System"); without this the Rails console runs as ``User.anonymous``
+    # and every journal it writes shows up as "Anonymous".
+    journal_user: NotRequired[str]
 
 
 class DatabaseConfig(TypedDict, total=False):
@@ -184,6 +189,8 @@ type ComponentName = Literal[
     "inline_refs",
     "native_tags",
     "wp_metadata_backfill",
+    "wp_journal_history",
+    "wp_timestamp_restore",
     "time_entries",
     "admin_schemes",
     "reporting",

@@ -39,6 +39,9 @@ from src.display import ProgressTracker
 from src.domain.enums import JournalEntryType
 from src.infrastructure.jira.jira_client import JiraClient
 from src.infrastructure.openproject.openproject_client import OpenProjectClient
+from src.infrastructure.openproject.openproject_work_package_content_service import (
+    _build_comment_with_marker,
+)
 from src.models import ComponentResult, WorkPackageMappingEntry
 from src.utils import data_handler
 from src.utils.enhanced_audit_trail_migrator import EnhancedAuditTrailMigrator
@@ -1354,7 +1357,13 @@ class WorkPackageMigration(BaseMigration):
                 author_info = entry_data.get("author") or {}
                 author_name = author_info.get("name")
                 user_dict = self.user_mapping.get(author_name) if author_name else None
-                user_id = user_dict.get("openproject_id") if user_dict else 1
+                # Emit 0 (not a hardcoded builtin id) when the Jira author does
+                # not resolve. ``1`` used to be sent here, which is
+                # ``SystemUser`` on this instance and not stable across
+                # installs. 0 makes the Ruby side's ``raw_user_id > 0`` check
+                # fall through to its own chain: the work package's author
+                # first, then a real admin resolved from the DB.
+                user_id = (user_dict.get("openproject_id") if user_dict else None) or 0
 
                 # Build field_changes for changelog entries (mapped to OP field names)
                 field_changes: dict[str, Any] = {}
@@ -1363,7 +1372,12 @@ class WorkPackageMigration(BaseMigration):
                 if entry_type == JournalEntryType.COMMENT:
                     # Comments have no field changes, just notes
                     raw_body = entry_data.get("body", "")
-                    # Convert Jira markup to markdown if converter available
+                    # Convert Jira markup to markdown if converter available.
+                    # Attachment references (``!image.png!``) only resolve to
+                    # ``/api/v3/attachments/{id}/content`` when the converter was
+                    # built with an attachment mapping — see
+                    # ``_update_markdown_converter_mappings``, which callers must
+                    # invoke before using this builder.
                     if hasattr(self, "markdown_converter") and self.markdown_converter:
                         try:
                             notes = self.markdown_converter.convert(raw_body)
@@ -1371,6 +1385,13 @@ class WorkPackageMigration(BaseMigration):
                             notes = raw_body
                     else:
                         notes = raw_body
+                    # Carry the same provenance marker
+                    # ``work_packages_content`` stamps on comments it creates.
+                    # Whoever rebuilds a work package's journal chain replaces
+                    # those journals, and without the marker the next
+                    # ``work_packages_content`` run finds no evidence the comment
+                    # was migrated and appends a duplicate.
+                    notes = _build_comment_with_marker(notes, entry_data.get("id"))
                 else:
                     # Changelog: extract field changes and build notes
                     items = entry_data.get("items", [])

@@ -73,7 +73,9 @@ from src.application.components.work_package_content_migration import WorkPackag
 from src.application.components.work_package_migration import WorkPackageMigration
 from src.application.components.work_package_skeleton_migration import WorkPackageSkeletonMigration
 from src.application.components.workflow_migration import WorkflowMigration
+from src.application.components.wp_journal_history_migration import WpJournalHistoryMigration
 from src.application.components.wp_metadata_backfill_migration import WpMetadataBackfillMigration
+from src.application.components.wp_timestamp_restore_migration import WpTimestampRestoreMigration
 from src.infrastructure.health_check_client import HealthCheckClient
 from src.infrastructure.jira.jira_client import JiraClient
 from src.infrastructure.openproject.docker_client import DockerClient
@@ -523,6 +525,8 @@ def _build_component_factories(
         "attachment_provenance": lambda: AttachmentProvenanceMigration(jira_client=jira_client, op_client=op_client),
         "attachment_recovery": lambda: AttachmentRecoveryMigration(jira_client=jira_client, op_client=op_client),
         "wp_metadata_backfill": lambda: WpMetadataBackfillMigration(jira_client=jira_client, op_client=op_client),
+        "wp_journal_history": lambda: WpJournalHistoryMigration(jira_client=jira_client, op_client=op_client),
+        "wp_timestamp_restore": lambda: WpTimestampRestoreMigration(jira_client=jira_client, op_client=op_client),
         "inline_refs": lambda: InlineRefsMigration(jira_client=jira_client, op_client=op_client),
         "native_tags": lambda: NativeTagsMigration(jira_client=jira_client, op_client=op_client),
         "accounts": lambda: AccountMigration(jira_client=jira_client, op_client=op_client),

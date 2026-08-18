@@ -176,6 +176,10 @@ if rails_ops && rails_ops.respond_to?(:each)
     v1_validity = nil
     v1_cf_snapshot = nil
 
+    # Declared out here on purpose: ``||=`` inside the block below would create
+    # a fresh block-local on every iteration and re-run the User query per op.
+    j2o_fallback_user_id = nil
+
     ops.each_with_index do |op, op_idx|
       op_type = op['type'] || op[:type]
 
@@ -192,9 +196,18 @@ if rails_ops && rails_ops.respond_to?(:each)
       is_empty = (notes.nil? || notes.to_s.strip.empty?) && (field_changes.nil? || field_changes.empty?)
       next if is_empty && op_idx != 0
 
-      # User ID with fallback
+      # User ID with fallback.
+      #
+      # The literal ``2`` this used to fall back to is NOT a safe default: on
+      # this instance id 2 is ``DeletedUser`` ("Deleted user"), and builtin ids
+      # are not stable across installs anyway (here: 1 SystemUser, 2
+      # DeletedUser, 3 AnonymousUser). Attributing a real Jira author's journal
+      # to the deleted-user placeholder loses the information silently.
+      # Prefer the work package's own author, then a real admin, and only then
+      # fall back to a builtin — resolved from the DB, never hardcoded.
       raw_user_id = (op['user_id'] || op[:user_id]).to_i
-      fallback_user_id = rec.author_id && rec.author_id > 0 ? rec.author_id : 2
+      j2o_fallback_user_id ||= (User.find_by(admin: true)&.id || User.anonymous.id)
+      fallback_user_id = rec.author_id && rec.author_id > 0 ? rec.author_id : j2o_fallback_user_id
       user_id = raw_user_id > 0 ? raw_user_id : fallback_user_id
 
       created_at_str = op['created_at'] || op[:created_at] || op['timestamp'] || op[:timestamp]

@@ -272,6 +272,40 @@ updated: "2024-..."          ──→  updated_at
 
 **Component**: Part of `work_packages_content` (`WorkPackageContentMigration`)
 
+#### Changelog → Journal
+
+A Jira comment is only half the activity. Changelog entries — status
+transitions, reassignments, priority changes — map onto journals too, each
+carrying a snapshot of the work package's state at that moment:
+
+```
+Jira Changelog Entry              OpenProject Journal
+──────────────────────────────    ──────────────────────────────
+created: "2024-..."          ──→  created_at + validity_period lower bound
+author: {...}                ──→  user_id
+items[].field "status"       ──→  work_package_journals.status_id
+items[].field "assignee"     ──→  work_package_journals.assigned_to_id
+items[].field "priority"     ──→  work_package_journals.priority_id
+(unmapped fields)            ──→  notes, as "**Field**: old → new"
+```
+
+**Component**: `wp_journal_history` (`WpJournalHistoryMigration`), which merges
+comments and changelog entries into a single chronological chain and owns a work
+package's entire v2+ journal set. It reattributes the v1 creation journal to the
+real Jira author as part of the rebuild.
+
+**Journal authorship**: journals whose Jira author resolves through the user
+mapping get that user. Everything else — the migration's own bookkeeping writes —
+is attributed to `J2O_MIGRATION_JOURNAL_USER`, or to `User.system` when unset. It
+is never `User.anonymous`: a Rails console session starts with `User.current`
+unset, and OpenProject answers that with the anonymous user rather than `nil`, so
+"leave it alone" is the broken default rather than the neutral one.
+
+**Work package timestamps**: `created_at`/`updated_at` on the work package row
+itself are written at create time and restored at the end of the sequence by
+`wp_timestamp_restore`, because every component that calls `wp.save!` in between
+bumps `updated_at` to the current time.
+
 ---
 
 ### 8. Attachment Migration

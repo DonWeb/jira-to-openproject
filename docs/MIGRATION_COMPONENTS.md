@@ -309,6 +309,67 @@ uv run python -m src.main migrate --components work_packages --no-confirm
 - Incremental re-runs (Phase 2 can be re-run without Phase 1)
 - Minimal API overhead (2 calls per WP vs 4+ for finer granularity)
 
+#### WpJournalHistoryMigration (Activity)
+
+**Location**: `src/application/components/wp_journal_history_migration.py`
+
+Rebuilds each work package's activity tab from its Jira changelog **and** its
+comments, as one chronological chain.
+
+Neither phase above migrates the changelog. Phase 2 creates the comments; the
+changelog reconstruction lives in `src/ruby/create_work_package_journals*.rb`,
+which is injected only by `bulk_create_records` — reachable only through the
+legacy `work_packages` component, which is not in the default sequence. Without
+this component a migrated work package's activity shows the creation entry and
+its comments, and nothing else: no status transitions, no reassignments, no
+priority changes.
+
+**Owns the whole v2+ journal chain.** The Ruby template deletes the existing v2+
+journals and rewrites them, comments included, in chronological order. That is
+deliberate, not destructive: row order then matches time order, the
+`validity_period` chain stays contiguous, and exactly the newest journal is left
+open. Appending changelog entries alongside already-created comments would give a
+chain whose row order and time order disagree — and OpenProject's journal writer
+closes the *highest-id* journal when creating the next one, so a lower-id row
+would be left open too and the next native save would trip
+`non_overlapping_journals_validity_periods`.
+
+Rebuilding also reattributes the v1 creation journal to the real Jira author.
+
+**Ordering**: must run after `work_packages_content` (whose comments it folds in)
+and after every component that writes work packages — a later `wp.save!` appends
+an out-of-order journal onto the finished chain.
+
+**Requires**: `work_package_mapping.json`; `attachment_mapping.json` for inline
+attachment references in comments to resolve (missing mapping is a warning).
+
+```bash
+uv run python3.14 -m src.main migrate --components wp_journal_history --no-confirm
+```
+
+#### WpTimestampRestoreMigration (Final)
+
+**Location**: `src/application/components/wp_timestamp_restore_migration.py`
+
+Restores Jira's `created_at`/`updated_at` onto the work package rows.
+
+Phase 1 and Phase 2 both write those timestamps already, but thirteen components
+run afterwards and each calls `wp.save!`, which bumps `updated_at` to the current
+time. Measured on the 2026-08-06 run: 520 of 520 work packages ended with
+`updated_at` in the migration window instead of Jira, a median drift of ~132 days.
+
+Writes with `update_columns`, which skips validations, callbacks and journal
+creation — so restoring a timestamp cannot itself produce another activity entry.
+Work packages already carrying the correct values are counted as `unchanged`
+rather than rewritten, so a rerun reports honestly.
+
+**Ordering**: must be the last component in the sequence. Anything that writes a
+work package after it re-introduces the drift.
+
+```bash
+uv run python3.14 -m src.main migrate --components wp_timestamp_restore --no-confirm
+```
+
 ---
 
 ## Configuration Migrations

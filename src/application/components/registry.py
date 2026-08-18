@@ -159,6 +159,17 @@ DEFAULT_COMPONENT_SEQUENCE: list[ComponentName] = [
     "category_defaults",
     "admin_schemes",
     "reporting",
+    # Rebuilds each work package's activity from the Jira changelog *and* its
+    # comments, as one chronological chain. It owns the whole v2+ journal chain
+    # for a WP, so it has to run after ``work_packages_content`` has created the
+    # comments it folds in — and after every component that writes work
+    # packages, because a later ``wp.save!`` would append an out-of-order
+    # journal onto the chain it just built.
+    "wp_journal_history",
+    # Must be dead last: it puts Jira's created_at/updated_at back on the work
+    # package rows, and any component writing a WP after it re-introduces the
+    # drift it exists to remove. See WpTimestampRestoreMigration's docstring.
+    "wp_timestamp_restore",
 ]
 
 PREDEFINED_PROFILES: dict[str, list[ComponentName]] = {
