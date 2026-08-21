@@ -50,6 +50,58 @@ from src.utils.enhanced_user_association_migrator import EnhancedUserAssociation
 from src.utils.markdown_converter import MarkdownConverter
 
 
+def _parse_jira_instant(value: Any) -> datetime | None:
+    """Parse a Jira timestamp into a timezone-aware UTC ``datetime``.
+
+    Everything that orders, compares or de-collides journal timestamps must work
+    on these objects rather than on the strings Jira hands back. This instance
+    emits offsets like ``2018-07-25T12:00:24.000-0300``, and on such strings a
+    lexicographic sort or a ``<=`` compares wall-clock text instead of points in
+    time. Worse, re-formatting a shifted value with ``strftime`` drops the
+    ``tzinfo`` and emits the *local* clock fields; labelling that ``+0000`` moved
+    the instant three hours backwards, which is what handed Postgres a
+    ``tstzrange`` whose lower bound came after its upper bound and failed 211 of
+    435 work packages on the 2026-08-20 run.
+
+    Returns ``None`` when the value is absent or unparseable, so callers can
+    decide what to do rather than silently receiving a wrong instant.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            # Python 3.11+ ``fromisoformat`` covers every shape this pipeline
+            # sees: the compact ``-0300``/``+0000`` offsets Jira Server/DC emits,
+            # a ``Z`` suffix, and the naive ``YYYY-MM-DD HH:MM:SS[.ffffff]`` the
+            # database returns.
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        # Naive input: the only defensible reading is the target timezone, which
+        # this pipeline normalises to UTC everywhere else.
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _normalize_instant_iso(value: Any) -> str | None:
+    """Return *value* as an ISO-8601 UTC string, or ``None`` if unparseable.
+
+    The single formatting path for anything that becomes a journal timestamp or a
+    ``validity_period`` bound. ``isoformat`` on the UTC-converted value carries a
+    real ``+00:00`` offset, so nothing downstream has to guess — unlike the
+    ``strftime`` ladders this replaces, which appended a fixed ``"Z"`` or
+    ``"+0000"`` to whatever wall clock the parse happened to produce.
+    """
+    instant = _parse_jira_instant(value)
+    return instant.isoformat() if instant else None
+
+
 @register_entity_types("work_packages", "issues")
 class WorkPackageMigration(BaseMigration):
     """Handles the migration of issues from Jira to work packages in OpenProject.
@@ -973,8 +1025,12 @@ class WorkPackageMigration(BaseMigration):
                             dt = datetime.fromisoformat(current_timestamp)
                             # Add 1 SECOND to separate colliding entries (OpenProject uses second-precision timestamps)
                             dt = dt + timedelta(seconds=1)
-                            # Convert back to ISO8601 format
-                            all_journal_entries[i]["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+0000"
+                            # Convert back to ISO8601 — via the UTC-aware helper,
+                            # never ``strftime`` + a hardcoded offset. The latter
+                            # drops the tzinfo and emits the local clock fields,
+                            # so a -0300 instant relabelled "+0000" moved three
+                            # hours backwards and inverted the range bounds.
+                            all_journal_entries[i]["timestamp"] = _normalize_instant_iso(dt) or current_timestamp
                             self.logger.info(
                                 f"Resolved timestamp collision for {jira_key}: {previous_timestamp} → {all_journal_entries[i]['timestamp']}",
                             )
@@ -1065,23 +1121,21 @@ class WorkPackageMigration(BaseMigration):
                 # - For last comment: open-ended range
                 if is_last_comment:
                     # Last comment: OPEN-ENDED range (most recent journal version has no end)
-                    if comment_created and "T" in comment_created:
-                        validity_start_iso = comment_created
-                    elif comment_created:
-                        try:
-                            # Try parsing with milliseconds first
-                            dt = datetime.strptime(comment_created, "%Y-%m-%d %H:%M:%S.%f")
-                            validity_start_iso = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                        except ValueError:
-                            try:
-                                # Try parsing without milliseconds
-                                dt = datetime.strptime(comment_created, "%Y-%m-%d %H:%M:%S")
-                                validity_start_iso = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                            except ValueError as e:
-                                self.logger.warning(f"Failed to parse timestamp '{comment_created}': {e}, using as-is")
-                                validity_start_iso = comment_created
-                    else:
-                        validity_start_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    # One normalisation path for every shape Jira and the
+                    # database hand back (offset-carrying ISO, naive
+                    # "YYYY-MM-DD HH:MM:SS[.ffffff]"), instead of a ladder of
+                    # ``strptime`` attempts each re-labelling its result.
+                    validity_start_iso = _normalize_instant_iso(comment_created)
+                    if validity_start_iso is None:
+                        if comment_created:
+                            self.logger.warning(
+                                "Failed to parse timestamp %r for %s, using as-is",
+                                comment_created,
+                                jira_key,
+                            )
+                            validity_start_iso = comment_created
+                        else:
+                            validity_start_iso = datetime.now(UTC).isoformat()
 
                     # Bug #15 fix Attempt #2: Open-ended range for most recent journal version
                     # Mark this as open-ended by setting validity_end_iso to None
@@ -1092,47 +1146,27 @@ class WorkPackageMigration(BaseMigration):
                     next_created = next_journal_entry["timestamp"]
 
                     # Convert both timestamps to ISO8601 - ALWAYS format to preserve milliseconds
-                    if comment_created:
-                        try:
-                            # First try parsing ISO8601 format with timezone (from collision detection)
-                            dt = datetime.strptime(comment_created, "%Y-%m-%dT%H:%M:%S.%f%z")
-                            validity_start_iso = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                        except ValueError:
-                            try:
-                                # Try parsing with milliseconds (database format)
-                                dt = datetime.strptime(comment_created, "%Y-%m-%d %H:%M:%S.%f")
-                                validity_start_iso = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                            except ValueError:
-                                try:
-                                    # Try parsing without milliseconds
-                                    dt = datetime.strptime(comment_created, "%Y-%m-%d %H:%M:%S")
-                                    validity_start_iso = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                                except ValueError as e:
-                                    self.logger.warning(
-                                        f"Failed to parse timestamp '{comment_created}': {e}, using as-is",
-                                    )
-                                    validity_start_iso = comment_created
-                    else:
-                        validity_start_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    validity_start_iso = _normalize_instant_iso(comment_created)
+                    if validity_start_iso is None:
+                        if comment_created:
+                            self.logger.warning(
+                                "Failed to parse timestamp %r for %s, using as-is",
+                                comment_created,
+                                jira_key,
+                            )
+                            validity_start_iso = comment_created
+                        else:
+                            validity_start_iso = datetime.now(UTC).isoformat()
 
                     if next_created:
-                        try:
-                            # First try parsing ISO8601 format with timezone (from collision detection)
-                            dt = datetime.strptime(next_created, "%Y-%m-%dT%H:%M:%S.%f%z")
-                            validity_end_iso = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                        except ValueError:
-                            try:
-                                # Try parsing with milliseconds (database format)
-                                dt = datetime.strptime(next_created, "%Y-%m-%d %H:%M:%S.%f")
-                                validity_end_iso = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                            except ValueError:
-                                try:
-                                    # Try parsing without milliseconds
-                                    dt = datetime.strptime(next_created, "%Y-%m-%d %H:%M:%S")
-                                    validity_end_iso = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                                except ValueError as e:
-                                    self.logger.warning(f"Failed to parse timestamp '{next_created}': {e}, using as-is")
-                                    validity_end_iso = next_created
+                        validity_end_iso = _normalize_instant_iso(next_created)
+                        if validity_end_iso is None:
+                            self.logger.warning(
+                                "Failed to parse timestamp %r for %s, using as-is",
+                                next_created,
+                                jira_key,
+                            )
+                            validity_end_iso = next_created
                     # else: Leave validity_end_iso as None for open-ended range (last comment)
 
                     # Only set validity_period string if validity_end_iso is not None
@@ -1289,37 +1323,51 @@ class WorkPackageMigration(BaseMigration):
             if not all_entries:
                 return rails_ops
 
-            # Sort chronologically
-            all_entries.sort(key=lambda x: x.get("timestamp", ""))
+            # Order, de-collide and re-emit on real instants — never on the
+            # timestamp strings. See ``_parse_jira_instant`` for why the string
+            # form is unusable for any of the three.
+            for entry in all_entries:
+                entry["instant"] = _parse_jira_instant(entry.get("timestamp"))
 
-            # Resolve timestamp collisions (add 1 second offset) and track all timestamps
-            resolved_timestamps: list[str] = []
-            for i, entry in enumerate(all_entries):
-                curr_ts = entry.get("timestamp", "")
-                if i > 0 and curr_ts:
-                    prev_ts = resolved_timestamps[i - 1] if resolved_timestamps else ""
-                    if prev_ts and curr_ts <= prev_ts:
-                        # Collision: add 1 second to previous
-                        try:
-                            if "T" in prev_ts:
-                                dt = datetime.fromisoformat(prev_ts.replace("Z", "+00:00").replace("+0000", "+00:00"))
-                            else:
-                                dt = datetime.fromisoformat(prev_ts)
-                            dt = dt + timedelta(seconds=1)
-                            curr_ts = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+0000"
-                            entry["timestamp"] = curr_ts
-                        except Exception:
-                            pass
-                resolved_timestamps.append(curr_ts)
+            # Unparseable entries sort last so they can never anchor the head of
+            # the chain; ``sort`` is stable, so their relative order is kept.
+            all_entries.sort(
+                key=lambda e: (
+                    e["instant"] is None,
+                    e["instant"] or datetime.min.replace(tzinfo=UTC),
+                ),
+            )
 
-            # Pre-compute validity_period ranges
-            # Each entry's validity starts at its timestamp and ends at next entry's timestamp
+            # Walk the chain and force it strictly increasing. Two Jira events in
+            # the same second are common (a comment plus the field change that
+            # accompanied it, or a bulk edit), and a journal chain whose bounds
+            # are equal violates ``journals_validity_period_not_empty`` just as
+            # surely as an inverted one violates the range check.
+            last_instant: datetime | None = None
+            for entry in all_entries:
+                instant = entry["instant"]
+                if instant is None:
+                    # Keep the entry rather than dropping its content: park it a
+                    # second after its predecessor. With no predecessor there is
+                    # nothing to anchor to, so leave it blank and let the Ruby
+                    # side fall back to the work package's own ``created_at``.
+                    instant = last_instant + timedelta(seconds=1) if last_instant else None
+                elif last_instant is not None and instant <= last_instant:
+                    instant = last_instant + timedelta(seconds=1)
+                entry["instant"] = instant
+                # ``isoformat`` keeps the real offset (``+00:00``) and any
+                # sub-second precision; ``Time.parse`` reads it as-is.
+                entry["timestamp"] = instant.isoformat() if instant else ""
+                if instant is not None:
+                    last_instant = instant
+
+            # Pre-compute validity_period ranges: each entry is valid until the
+            # next one begins, and the last stays open-ended.
             validity_periods: list[tuple[str, str | None]] = []
             for i, entry in enumerate(all_entries):
-                start_ts = entry.get("timestamp", "")
+                start_ts = entry["timestamp"]
                 if i < len(all_entries) - 1:
-                    # Not last: ends at next entry's start
-                    end_ts = all_entries[i + 1].get("timestamp", "")
+                    end_ts = all_entries[i + 1]["timestamp"] or None
                 else:
                     # Last entry: open-ended (None)
                     end_ts = None

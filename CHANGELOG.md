@@ -55,6 +55,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method name, where escaping does not apply and only an allowlist works.
 
 ### Fixed
+- Journal timestamps are ordered, de-collided and re-emitted as timezone-aware
+  instants instead of as strings. This Jira instance returns every timestamp with
+  a `-0300` offset, and the collision resolver formatted its result with
+  `strftime` — which drops the `tzinfo` and emits the *local* clock fields — then
+  appended a literal `"+0000"`. A resolved collision therefore landed three hours
+  *before* the entry it was meant to follow, handing Postgres a `tstzrange` whose
+  lower bound was above its upper bound. It failed 211 of 435 work packages on
+  the 2026-08-20 run with `PG::DataException`. The same relabel existed at nine
+  further sites in `_update_existing_work_package`, all now routed through one
+  `_parse_jira_instant`/`_normalize_instant_iso` pair; the lexicographic sort and
+  the string `<=` comparison that shared the defect are gone with it.
+- `create_work_package_journals_batch.rb` wraps each work package in a
+  transaction. Without one, the delete of the existing v2+ journals committed on
+  its own, so a failure in the INSERTs that followed left the work package
+  stripped of the journals it had with nothing rebuilt — ~559 journals across 211
+  work packages, comments included, on the 2026-08-20 run.
+- The same template now derives every `validity_period` from one monotonically
+  normalised timeline rather than from the per-operation bounds it is handed, so
+  an inverted or duplicated pair degrades into correct data instead of failing
+  the work package. Guarding a single pair would not do: the upper bound of
+  journal N is the lower bound of journal N+1, so a local nudge converts an
+  inverted range into an overlap. The exclusion constraint is deferred for the
+  duration, since a chain rewrite is transiently inconsistent by construction.
 - Journals the migration creates are attributed to a real user instead of Anonymous.
   A Rails console session — and a `rails runner` process — starts with nothing
   having set `User.current`, and OpenProject answers that state with
