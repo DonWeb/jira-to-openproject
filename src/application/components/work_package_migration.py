@@ -1292,6 +1292,14 @@ class WorkPackageMigration(BaseMigration):
         - Bulk INSERT
 
         Returns list of operations ready for Ruby bulk processing.
+
+        Raises:
+            Exception: whatever went wrong building the list. Deliberately not
+                swallowed: the Ruby template deletes a work package's whole v2+
+                journal chain before rebuilding it from what this returns, so
+                handing back a partial list would replace a complete history
+                with half of one. Callers skip and report the work package.
+
         """
         rails_ops: list[dict[str, Any]] = []
         jira_key = getattr(jira_issue, "key", "unknown")
@@ -1351,6 +1359,17 @@ class WorkPackageMigration(BaseMigration):
                     # second after its predecessor. With no predecessor there is
                     # nothing to anchor to, so leave it blank and let the Ruby
                     # side fall back to the work package's own ``created_at``.
+                    #
+                    # Logged because the position is synthetic: the entry ends up
+                    # in the activity tab at a time Jira never recorded, and
+                    # without a line here there is nothing to trace that back to.
+                    self.logger.warning(
+                        "Unparseable timestamp %r on a %s entry for %s; placing it"
+                        " after the previous entry instead",
+                        entry.get("data", {}).get("created") if isinstance(entry.get("data"), dict) else None,
+                        entry.get("type"),
+                        jira_key,
+                    )
                     instant = last_instant + timedelta(seconds=1) if last_instant else None
                 elif last_instant is not None and instant <= last_instant:
                     instant = last_instant + timedelta(seconds=1)
@@ -1575,11 +1594,18 @@ class WorkPackageMigration(BaseMigration):
 
                 rails_ops.append(op)
 
-        except Exception as e:
-            self.logger.warning(f"Failed to build rails_ops for {jira_key}: {e}")
-            import traceback
-
-            self.logger.debug(traceback.format_exc())
+        except Exception:
+            # Propagate rather than returning what was built so far.
+            #
+            # A partial operation list is worse than none: the Ruby template
+            # deletes a work package's whole v2+ chain before rebuilding it from
+            # whatever it was handed, so half a history silently replaces a
+            # complete one. Both callers already treat a raise as "skip this work
+            # package and report it" — ``WpJournalHistoryMigration`` counts it
+            # under ``ops_build_failed``, which was unreachable while this
+            # swallowed — so the work package keeps what it has.
+            self.logger.exception("Failed to build rails_ops for %s", jira_key)
+            raise
 
         return rails_ops
 

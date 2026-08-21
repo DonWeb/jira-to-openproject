@@ -230,10 +230,22 @@ if input_data && input_data.respond_to?(:each)
             v1_cf_snapshot = resolved_cf_snapshot
             v1_journal = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage', version: 1).first
             if v1_journal
+              # Remember the payload row this journal currently points at.
+              # Assigning a fresh ``data`` object inserts a new
+              # work_package_journals row and repoints ``data_id`` at it; the old
+              # row is left behind, referenced by nothing. That is one orphan per
+              # rebuilt work package on every run — 391 of the 4299 swept on
+              # 2026-08-20 came from exactly here.
+              stale_data_id = v1_journal.data_id
+
               v1_journal.user_id = user_id
               v1_journal.notes = notes
               v1_journal.data = Journal::WorkPackageJournal.new(sanitized_state)
               v1_journal.save(validate: false)
+
+              if stale_data_id && stale_data_id != v1_journal.data_id
+                Journal::WorkPackageJournal.where(id: stale_data_id).delete_all
+              end
 
               # The validity_period is deliberately NOT written here. It depends on
               # where this journal sits in the normalised timeline built below,

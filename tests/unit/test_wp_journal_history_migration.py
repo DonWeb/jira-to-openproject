@@ -137,18 +137,24 @@ def test_payload_uses_the_key_names_the_template_reads(
     assert result.details["wp_rebuilt"] == 1
 
 
-def test_work_packages_without_jira_history_are_skipped_not_sent(
+def test_work_packages_without_jira_history_are_not_rebuilt(
     component: WpJournalHistoryMigration,
 ) -> None:
     """An issue with no comments and no changelog needs no rebuild.
 
-    Its creation journal is the whole history and is already correct; sending an
-    empty operation list would make the template delete v2+ for nothing.
+    Sending an empty operation list would make the template delete v2+ for
+    nothing. It does still get the v1 reattribution pass — the creation journal
+    is the whole history, but its author is only correct once something fixes it,
+    and the rebuild these work packages skip is what does that for the rest.
     """
     builder = MagicMock()
     builder._build_rails_ops_for_issue.return_value = []
     component._get_builder = MagicMock(return_value=builder)  # type: ignore[method-assign]
     component._merge_batch_issues = MagicMock(return_value={"EF-38": MagicMock()})  # type: ignore[method-assign]
+    component.op_client.execute_script_with_data.return_value = {
+        "status": "success",
+        "data": {"reattributed": 1},
+    }
 
     with (
         patch("src.application.components.wp_journal_history_migration.config") as cfg,
@@ -159,8 +165,13 @@ def test_work_packages_without_jira_history_are_skipped_not_sent(
         }
         result = component.run()
 
-    component.op_client.execute_script_with_data.assert_not_called()
+    # Exactly one Rails call, and it is the reattribution pass — never the
+    # rebuild template, whose payload key is ``rails_ops``.
+    component.op_client.execute_script_with_data.assert_called_once()
+    payload = component.op_client.execute_script_with_data.call_args[0][1]
+    assert payload == [{"work_package_id": 1574}]
     assert result.details["skipped"] == {"no_jira_history": 1}
+    assert result.details["v1_reattributed"] == 1
 
 
 def test_per_work_package_errors_are_surfaced_not_swallowed(

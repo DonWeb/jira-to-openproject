@@ -156,6 +156,97 @@ class WpJournalHistoryMigration(BaseMigration):
         path = Path(__file__).resolve().parent.parent.parent / "ruby" / _JOURNAL_TEMPLATE
         return path.read_text(encoding="utf-8")
 
+    @staticmethod
+    def _v1_reattribution_script() -> str:
+        """Rails script attributing a lone creation journal to the WP's author.
+
+        A Jira issue with no comments and no changelog produces no operations, so
+        the rebuild skips it — and its v1 journal keeps whatever
+        ``User.current`` was when ``work_packages_skeleton`` created the work
+        package, which on an unconfigured console is the anonymous user. The
+        rebuild reattributes v1 for every *other* work package as a side effect,
+        so without this pass these are the only ones left showing "Anonymous"
+        as their creator.
+
+        Only builtin authors are overwritten — anonymous, system, deleted — never
+        a real user, which also makes the pass idempotent. Builtin ids are
+        resolved by type rather than hardcoded: they are not stable across
+        installs (on this instance 1 is SystemUser, 2 DeletedUser, 3
+        AnonymousUser).
+
+        ``update_columns`` keeps this from journaling itself or touching the work
+        package's ``updated_at``.
+        """
+        return (
+            "require 'json'\n"
+            "start_marker = defined?($j2o_start_marker) && $j2o_start_marker ? $j2o_start_marker : 'JSON_OUTPUT_START'\n"
+            "end_marker = defined?($j2o_end_marker) && $j2o_end_marker ? $j2o_end_marker : 'JSON_OUTPUT_END'\n"
+            "recs = input_data\n"
+            "stats = {'reattributed' => 0, 'already_real' => 0, 'no_author' => 0,"
+            " 'wp_missing' => 0, 'v1_missing' => 0, 'failed' => 0}\n"
+            "builtin_ids = Principal.where(type: %w[AnonymousUser SystemUser DeletedUser]).pluck(:id)\n"
+            "recs.each do |r|\n"
+            "  begin\n"
+            "    wp = WorkPackage.find_by(id: r['work_package_id'])\n"
+            "    unless wp\n"
+            "      stats['wp_missing'] += 1\n"
+            "      next\n"
+            "    end\n"
+            "    j = Journal.where(journable_id: wp.id, journable_type: 'WorkPackage', version: 1).first\n"
+            "    unless j\n"
+            "      stats['v1_missing'] += 1\n"
+            "      next\n"
+            "    end\n"
+            "    unless builtin_ids.include?(j.user_id)\n"
+            "      stats['already_real'] += 1\n"
+            "      next\n"
+            "    end\n"
+            "    if wp.author_id.nil? || wp.author_id <= 0\n"
+            "      stats['no_author'] += 1\n"
+            "      next\n"
+            "    end\n"
+            "    j.update_columns(user_id: wp.author_id)\n"
+            "    stats['reattributed'] += 1\n"
+            "  rescue => e\n"
+            "    stats['failed'] += 1\n"
+            "  end\n"
+            "end\n"
+            "puts start_marker\n"
+            "puts stats.to_json\n"
+            "puts end_marker\n"
+        )
+
+    def _reattribute_lone_creation_journals(
+        self,
+        wp_ids: list[int],
+        totals: Counter[str],
+    ) -> None:
+        """Run the v1 reattribution pass over work packages with no history."""
+        if not wp_ids:
+            return
+
+        script = self._v1_reattribution_script()
+        for i in range(0, len(wp_ids), self.BATCH_SIZE):
+            batch = wp_ids[i : i + self.BATCH_SIZE]
+            payload = [{"work_package_id": wp_id} for wp_id in batch]
+            try:
+                envelope = self.op_client.execute_script_with_data(script, payload)
+            except Exception:
+                self.logger.exception(
+                    "v1 reattribution failed for %d work packages without history",
+                    len(batch),
+                )
+                totals["v1_reattribution_failed"] += len(batch)
+                continue
+            if not isinstance(envelope, dict) or envelope.get("status") != "success":
+                totals["v1_reattribution_failed"] += len(batch)
+                continue
+            data = envelope.get("data") or {}
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    if isinstance(value, int):
+                        totals[f"v1_{key}"] += value
+
     def run(self) -> ComponentResult:  # type: ignore[override]
         self.logger.info("Rebuilding work package activity from Jira changelog + comments")
 
@@ -210,6 +301,7 @@ class WpJournalHistoryMigration(BaseMigration):
         totals: Counter[str] = Counter()
         skip_reasons: Counter[str] = Counter()
         wp_errors: list[str] = []
+        no_history: list[int] = []
 
         for i in range(0, len(records), self.BATCH_SIZE):
             batch = records[i : i + self.BATCH_SIZE]
@@ -241,8 +333,12 @@ class WpJournalHistoryMigration(BaseMigration):
                     continue
                 if not rails_ops:
                     # No comments and no changelog: the creation journal is the
-                    # entire history, and it is already correct.
+                    # entire history. Nothing to rebuild — but its author still
+                    # needs fixing, since the rebuild is what reattributes v1 and
+                    # these work packages never reach it. Collected for the pass
+                    # after the loop.
                     skip_reasons["no_jira_history"] += 1
+                    no_history.append(wp_id)
                     continue
                 payload.append({"wp_id": wp_id, "jira_key": jira_key, "rails_ops": rails_ops})
 
@@ -293,11 +389,16 @@ class WpJournalHistoryMigration(BaseMigration):
                     totals["journals_created"] += created
                 totals["wp_rebuilt"] += 1
 
+        # Work packages with no Jira history never reached the template, so their
+        # creation journal is still attributed to whoever the console ran as.
+        self._reattribute_lone_creation_journals(no_history, totals)
+
         wp_failed = totals.get("wp_failed", 0)
         details: dict[str, Any] = {
             "wp_rebuilt": totals.get("wp_rebuilt", 0),
             "journals_created": totals.get("journals_created", 0),
             "wp_failed": wp_failed,
+            "v1_reattributed": totals.get("v1_reattributed", 0),
             "wp_mapping_rows": len(records),
         }
         if skip_reasons:
@@ -305,11 +406,21 @@ class WpJournalHistoryMigration(BaseMigration):
         if wp_errors:
             details["wp_errors"] = wp_errors
 
+        # Surface the rest of the reattribution counters only when they carry
+        # information, so a clean run's details stay readable.
+        for key in ("v1_already_real", "v1_no_author", "v1_v1_missing", "v1_wp_missing", "v1_failed"):
+            value = totals.get(key, 0)
+            if value:
+                details[key] = value
+        if totals.get("v1_reattribution_failed"):
+            details["v1_reattribution_failed"] = totals["v1_reattribution_failed"]
+
         self.logger.info(
-            "Journal history: wp_rebuilt=%d journals_created=%d wp_failed=%d",
+            "Journal history: wp_rebuilt=%d journals_created=%d wp_failed=%d v1_reattributed=%d",
             details["wp_rebuilt"],
             details["journals_created"],
             wp_failed,
+            details["v1_reattributed"],
         )
 
         return ComponentResult(

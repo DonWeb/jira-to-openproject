@@ -57,6 +57,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method name, where escaping does not apply and only an allowlist works.
 
 ### Fixed
+- Rebuilding a work package's journal chain no longer strands v1's previous
+  payload row. Assigning a fresh `data` object inserts a new
+  `work_package_journals` row and repoints `data_id`, leaving the old one
+  referenced by nothing — one orphan per rebuilt work package on every run. It
+  is why the 2026-08-20 orphan sweep removed 4299 rows where 3908 had been
+  measured beforehand: the difference is exactly the 391 work packages the
+  preceding rebuild touched.
+- `_build_rails_ops_for_issue` propagates a build failure instead of returning
+  the operations it managed to assemble. The Ruby template deletes a work
+  package's whole v2+ chain before rebuilding from what it is handed, so a
+  partial list replaced a complete history with half of one. Both callers
+  already skip and report on a raise; `WpJournalHistoryMigration`'s
+  `ops_build_failed` counter was unreachable until now.
+- An entry whose Jira timestamp cannot be parsed is logged. It is still kept and
+  placed after its predecessor rather than dropped, but that position is
+  synthetic and previously left no trace.
+- The creation journal of an issue with no comments and no changelog is
+  attributed to the work package's author. Those issues produce no operations,
+  so the rebuild skips them — and the rebuild is what reattributes v1 for
+  everything else, leaving these as the only work packages still crediting
+  "Anonymous" with their creation. Only builtin authors are overwritten, which
+  also makes the pass idempotent, and the builtin ids are resolved by type rather
+  than hardcoded.
 - `cleanup_anonymous_comment_duplicates.py` deletes a journal's dependent rows
   along with the journal. `delete_all` issues a single DELETE and skips callbacks
   and `dependent:` associations, so removing duplicate comment journals stranded
