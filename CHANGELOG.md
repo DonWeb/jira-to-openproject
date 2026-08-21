@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/cleanup_anonymous_journals.py` removing the note-less v2+ journals an
   earlier migration attributed to Anonymous and recomposing the affected
   `validity_period` chains. Dry run by default; `--apply` to delete.
+- `scripts/cleanup_orphan_journal_data.py` removing `work_package_journals` and
+  `customizable_journals` rows no journal references any more. Dry run by default.
 - `sprints` component (`SprintMigration`) migrating Jira sprints to OpenProject's
   **native** Sprint objects (17.3+) instead of Versions, including sprint goals via
   `sprint_goals`. Selectable with `J2O_SPRINT_STRATEGY` (`native` | `version` | `both`),
@@ -55,6 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method name, where escaping does not apply and only an allowlist works.
 
 ### Fixed
+- `cleanup_anonymous_comment_duplicates.py` deletes a journal's dependent rows
+  along with the journal. `delete_all` issues a single DELETE and skips callbacks
+  and `dependent:` associations, so removing duplicate comment journals stranded
+  every one's `work_package_journals` payload row and its `customizable_journals`
+  rows. That had accumulated to 3908 orphaned `work_package_journals` rows on the
+  target instance. The `data_id` values are now read before the journals go, and
+  the counts are reported separately instead of folded into one number.
 - Journal timestamps are ordered, de-collided and re-emitted as timezone-aware
   instants instead of as strings. This Jira instance returns every timestamp with
   a `-0300` offset, and the collision resolver formatted its result with
