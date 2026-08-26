@@ -152,7 +152,9 @@ def test_prepare_work_package_collects_watcher_counters(monkeypatch):
     instance.issue_type_id_mapping = {}
     instance.status_mapping = {"5": {"openproject_id": 22}}
     instance.data_dir = Path(".")
-    instance.markdown_converter = SimpleNamespace(convert=lambda text: text)
+    # ``convert`` takes ``jira_key`` — it is what scopes attachment resolution,
+    # and every call site in the migration now supplies it.
+    instance.markdown_converter = SimpleNamespace(convert=lambda text, jira_key=None: text)
     instance.start_date_fields = []
     instance._j2o_wp_cf_ids_full = {}
     instance.op_client = SimpleNamespace(ensure_custom_field=lambda *args, **kwargs: {"id": 1})

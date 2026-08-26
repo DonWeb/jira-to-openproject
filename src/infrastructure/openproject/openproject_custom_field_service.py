@@ -38,7 +38,6 @@ keeps thin delegators for the same method names so existing call sites
 
 from __future__ import annotations
 
-import json
 import time
 from typing import Any
 
@@ -355,12 +354,24 @@ class OpenProjectCustomFieldService:
             raise QueryExecutionError(msg) from e
 
     def remove_custom_field(self, name: str, *, cf_type: str | None = None) -> dict[str, int]:
-        """Remove CustomField records matching the provided name/type."""
-        # Use ensure_ascii=False to output UTF-8 directly, avoiding \uXXXX escapes
-        name_literal = json.dumps(name, ensure_ascii=False)
+        """Remove CustomField records matching the provided name/type.
+
+        SECURITY: the name is embedded as a **single-quoted** Ruby literal.
+        ``json.dumps`` produces a double-quoted one, and Ruby interpolates
+        ``#{...}`` inside those — a custom-field name reaching this method
+        comes from Jira, so a crafted name would run arbitrary code in the
+        Rails console. ``openproject_issue_priority_service`` fixed exactly
+        this and recorded why; the same reasoning applies here.
+
+        Escaping for JSON is not escaping for Ruby. JSON has no concept of
+        ``#{}``, so ``json.dumps`` leaves it untouched.
+        """
+        from src.infrastructure.openproject.openproject_client import escape_ruby_single_quoted
+
+        name_literal = f"'{escape_ruby_single_quoted(name)}'"
         type_filter = ""
         if cf_type:
-            type_literal = json.dumps(cf_type, ensure_ascii=False)
+            type_literal = f"'{escape_ruby_single_quoted(cf_type)}'"
             type_filter = f"scope = scope.where(type: {type_literal})\n"
 
         ruby = (

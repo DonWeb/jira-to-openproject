@@ -341,7 +341,11 @@ J2O_DATA
         script = f"""
         begin
           wp = WorkPackage.find({wp_id})
-          default_user = User.current || User.find_by(admin: true)
+          # Admin first: ``User.current`` is never nil in OpenProject (it
+          # returns ``User.anonymous``), so the original
+          # ``User.current || User.find_by(admin: true)`` never reached the
+          # admin branch. See the batch variant below for the full reasoning.
+          default_user = User.find_by(admin: true) || User.current
           user_id = {ruby_user_id}
           user = user_id ? (User.find_by(id: user_id) || default_user) : default_user
           {ruby_idempotency_open}
@@ -493,7 +497,14 @@ J2O_DATA
 )
 
           results = {{ created: 0, skipped: 0, failed: 0, errors: [], date_not_backdated: 0 }}
-          default_user = User.current || User.find_by(admin: true)
+          # ``User.current`` is NEVER nil in OpenProject — it returns
+          # ``User.anonymous`` when nothing set it. Written as
+          # ``User.current || User.find_by(admin: true)`` the admin branch was
+          # therefore unreachable, and every comment whose Jira author did not
+          # resolve through the mapping landed on Anonymous instead of the
+          # intended admin fallback. Ask for the admin first and keep
+          # ``User.current`` as the last resort so the documented intent holds.
+          default_user = User.find_by(admin: true) || User.current
 
           # Pre-fetch all referenced WPs and Users to avoid N+1 queries
           wp_ids = data.map {{ |d| d['work_package_id'] }}.compact.uniq

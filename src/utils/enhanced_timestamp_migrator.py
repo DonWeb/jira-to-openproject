@@ -20,8 +20,21 @@ from zoneinfo import ZoneInfo
 
 from src import config
 from src.infrastructure.jira.jira_client import JiraClient
-from src.infrastructure.openproject.openproject_client import OpenProjectClient
+from src.infrastructure.openproject.openproject_client import (
+    OpenProjectClient,
+    escape_ruby_single_quoted,
+)
 from src.utils.validators import validate_jira_key
+
+#: Columns this migrator may write through ``update_columns``.
+#:
+#: The column name is interpolated into Ruby as a bare method name, which no
+#: amount of escaping can make safe — an allowlist is the only control. These
+#: are the WorkPackage date/timestamp columns the ``set_*`` operation types map
+#: onto; anything else is refused rather than emitted.
+_WRITABLE_TIMESTAMP_COLUMNS: frozenset[str] = frozenset(
+    {"created_at", "updated_at", "closed_at", "start_date", "due_date"},
+)
 
 
 class TimestampMapping(TypedDict):
@@ -772,10 +785,18 @@ class EnhancedTimestampMigrator:
 
         Security Measures Implemented:
         1. Validates all jira_key values via _validate_jira_key() before use
-        2. Uses json.dumps() to escape jira_key AND field_name for safe Ruby hash literals
-        3. Wraps each operation in begin/rescue blocks for error isolation
-        4. Uses parameterized database queries (WorkPackage.find(id))
-        5. Timestamp values are pre-validated and passed as string literals
+        2. Embeds jira_key, field name and timestamp as **single-quoted** Ruby
+           literals via ``escape_ruby_single_quoted``. This used to use
+           ``json.dumps``, which is escaping for the wrong language: it yields
+           a *double*-quoted Ruby string, and Ruby runs ``#{...}`` inside
+           those. JSON has no such construct, so ``json.dumps`` passes an
+           interpolation through untouched and a Jira-sourced value could
+           execute arbitrary code in the Rails console.
+        3. Restricts the updated column to ``_WRITABLE_TIMESTAMP_COLUMNS`` —
+           it is interpolated as a bare Ruby method name, where escaping does
+           not apply and only an allowlist works.
+        4. Wraps each operation in begin/rescue blocks for error isolation
+        5. Uses parameterized database queries (WorkPackage.find(id))
 
         Generated Script Structure:
         - Ruby requires json library for safe data handling
@@ -826,21 +847,39 @@ class EnhancedTimestampMigrator:
 
             if wp_id:
                 field_name = op_type.replace("set_", "")
-                # SECURITY: Escape jira_key and field_name to prevent injection in Ruby hash literals
-                # json.dumps() ensures quotes, newlines, and special chars are properly escaped
-                # Example: "TEST'; DROP TABLE users;" becomes "\"TEST'; DROP TABLE users;\""
-                escaped_jira_key = json.dumps(jira_key)
+
+                # SECURITY: ``field_name`` is interpolated as a bare Ruby
+                # method name, so nothing about it can be escaped — it either
+                # comes from a known set or it does not go in at all.
+                if field_name not in _WRITABLE_TIMESTAMP_COLUMNS:
+                    self.logger.warning(
+                        "Refusing to build a timestamp update for unknown column %r (jira_key=%s)",
+                        field_name,
+                        jira_key,
+                    )
+                    continue
+
+                # SECURITY: single-quoted Ruby literals. ``json.dumps`` emits
+                # *double*-quoted ones, and Ruby interpolates ``#{...}``
+                # inside those — these values originate in Jira, so a crafted
+                # key would run arbitrary code in the Rails console. Escaping
+                # for JSON is not escaping for Ruby: JSON has no ``#{}``, so
+                # ``json.dumps`` passes it through untouched. Same fix and
+                # same reasoning as ``openproject_issue_priority_service``.
+                escaped_jira_key = f"'{escape_ruby_single_quoted(jira_key)}'"
+                escaped_field = f"'{escape_ruby_single_quoted(field_name)}'"
+                escaped_timestamp = escape_ruby_single_quoted(str(timestamp))
                 script_lines.extend(
                     [
-                        f"# Update {field_name} for work package {wp_id} (Jira: {jira_key})",
+                        f"# Update {field_name} for work package {wp_id}",
                         "begin",
                         f"  wp = WorkPackage.find({wp_id})",
-                        f"  wp.update_columns({field_name}: DateTime.parse('{timestamp}'))",
+                        f"  wp.update_columns({field_name}: DateTime.parse('{escaped_timestamp}'))",
                         f"  operations << {{jira_key: {escaped_jira_key}, wp_id: {wp_id}, ",
-                        f"field: {json.dumps(field_name)}, status: 'success'}}",
+                        f"field: {escaped_field}, status: 'success'}}",
                         "rescue => e",
                         f"  errors << {{jira_key: {escaped_jira_key}, wp_id: {wp_id}, ",
-                        f"field: {json.dumps(field_name)}, error: e.message}}",
+                        f"field: {escaped_field}, error: e.message}}",
                         "end",
                         "",
                     ],

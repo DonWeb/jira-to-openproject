@@ -416,8 +416,11 @@ def test_valid_jira_keys_edge_cases_still_work(ua_migrator) -> None:
         assert "wp.author_id = 1" in script
         assert "WorkPackage.find(42)" in script
 
-        # Key should be properly escaped in output
-        import json
+        # Key should be properly escaped in output, as a *single*-quoted Ruby
+        # literal. This used to assert the json.dumps form, which is a
+        # double-quoted literal — and Ruby evaluates #{...} inside those.
+        from src.infrastructure.openproject.openproject_client import escape_ruby_single_quoted
 
-        escaped_key = json.dumps(jira_key)
+        escaped_key = f"'{escape_ruby_single_quoted(jira_key)}'"
         assert escaped_key in script
+        assert f'"{jira_key}"' not in script

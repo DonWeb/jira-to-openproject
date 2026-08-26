@@ -226,13 +226,35 @@ end
 
 
 def _build_delete_script(journal_ids: list[int]) -> str:
-    """Ruby script to delete a batch of journal IDs."""
+    """Ruby script to delete a batch of journal IDs, dependent rows included.
+
+    ``delete_all`` issues a single DELETE and deliberately skips callbacks and
+    ``dependent:`` associations, so the rows a journal points at survive it. This
+    script used to delete only from ``journals``, which left every removed
+    journal's ``work_package_journals`` row (the ``data_id`` target) and its
+    ``customizable_journals`` rows behind. On this instance that had accumulated
+    to 3908 orphaned ``work_package_journals`` rows across the June-August runs.
+
+    Nothing references an orphan, so it is inert rather than corrupting — but it
+    is dead weight that also makes referential diagnostics unreadable.
+
+    Order matters: read the ``data_id`` values *before* the journals go, and drop
+    ``customizable_journals`` first since those rows point at the journals.
+    """
     ids_json = json.dumps(journal_ids)
     return f"""
 require 'json'
 ids = {ids_json}
+
+data_ids = Journal.where(id: ids, data_type: 'Journal::WorkPackageJournal')
+                  .where.not(data_id: nil)
+                  .pluck(:data_id)
+
+customizable_deleted = Journal::CustomizableJournal.where(journal_id: ids).delete_all
 deleted = Journal.where(id: ids).delete_all
-{{deleted: deleted}}
+data_deleted = data_ids.any? ? Journal::WorkPackageJournal.where(id: data_ids).delete_all : 0
+
+{{deleted: deleted, data_deleted: data_deleted, customizable_deleted: customizable_deleted}}
 """
 
 
@@ -380,6 +402,8 @@ def run(
 
     # Step 3: Delete if --apply
     deleted = 0
+    data_deleted = 0
+    customizable_deleted = 0
     if apply:
         delete_ids = [j["id"] for j in all_to_delete]
         # Delete in batches of 100 to avoid overly large SQL IN clauses
@@ -389,12 +413,28 @@ def run(
             del_script = _build_delete_script(batch)
             try:
                 del_result = op_client.execute_query_to_json_file(del_script)
-                n = del_result.get("deleted", 0) if isinstance(del_result, dict) else 0
+                if not isinstance(del_result, dict):
+                    del_result = {}
+                n = del_result.get("deleted", 0)
                 deleted += n
-                logger.info("Deleted batch %d–%d: %d rows", i + 1, i + len(batch), n)
+                data_deleted += del_result.get("data_deleted", 0)
+                customizable_deleted += del_result.get("customizable_deleted", 0)
+                logger.info(
+                    "Deleted batch %d–%d: %d journals, %d data rows, %d custom-value rows",
+                    i + 1,
+                    i + len(batch),
+                    n,
+                    del_result.get("data_deleted", 0),
+                    del_result.get("customizable_deleted", 0),
+                )
             except Exception as exc:
                 logger.error("Delete batch %d–%d failed: %s", i + 1, i + len(batch), exc)
-        logger.info("DONE: deleted %d duplicate journals", deleted)
+        logger.info(
+            "DONE: deleted %d duplicate journals (%d data rows, %d custom-value rows)",
+            deleted,
+            data_deleted,
+            customizable_deleted,
+        )
     else:
         logger.info("DRY-RUN complete — pass --apply to delete %d journals", total_to_delete)
 
@@ -403,6 +443,8 @@ def run(
         "duplicate_groups": duplicate_group_count,
         "to_delete": total_to_delete,
         "deleted": deleted,
+        "data_deleted": data_deleted,
+        "customizable_deleted": customizable_deleted,
         "kept": total_journals - deleted,
     }
 

@@ -326,11 +326,21 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
             logger.exception("Failed to apply parent links in batch")
             failed += len(parent_links)
 
-        # Assign versions (sprints) when mappings exist. The ``sprint``
-        # mapping uses an unrelated dict-of-dict shape (not the wp_map
+        # Attach each work package to its sprint. The ``sprint`` mapping
+        # uses an unrelated dict-of-dict shape (not the wp_map
         # polymorphism), so it is left as-is.
+        #
+        # ``openproject_sprint_id`` (native Sprint, written by
+        # ``SprintMigration``) wins over ``openproject_id`` (the legacy
+        # Version). Both are scalar foreign keys on the work package, so
+        # an issue that belonged to several Jira sprints still keeps only
+        # the first that resolves — the complete list lives in the
+        # "Sprint" custom field below, and native sprints do not change
+        # that: ``work_packages.sprint_id`` is single-valued too.
         sprint_mapping = config.mappings.get_mapping("sprint") or {}
-        version_updates: list[dict[str, Any]] = []
+        sprint_updates: list[dict[str, Any]] = []
+        native_assignments = 0
+        version_assignments = 0
         for jira_key, text in sprint_text.items():
             entry = entries_by_jira_key.get(jira_key)
             if entry is None:
@@ -338,31 +348,53 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
             sprint_names = [
                 item.strip() for item in str(text or "").split(",") if item and isinstance(item, str) and item.strip()
             ]
-            version_entry = None
+            mapped_entry = None
             for candidate in sprint_names:
-                version_entry = sprint_mapping.get(candidate) or sprint_mapping.get(str(candidate))
-                if version_entry:
+                mapped_entry = sprint_mapping.get(candidate) or sprint_mapping.get(str(candidate))
+                if mapped_entry:
                     break
-            if version_entry and version_entry.get("openproject_id"):
-                version_id = int(version_entry.get("openproject_id", 0) or 0)
-                if version_id <= 0:
-                    continue
-                version_updates.append(
-                    {
-                        "id": int(entry.openproject_id),
-                        "version_id": version_id,
-                    },
-                )
+            if not mapped_entry:
+                continue
 
-        if version_updates:
+            native_id = int(mapped_entry.get("openproject_sprint_id", 0) or 0)
+            if native_id > 0:
+                sprint_updates.append({"id": int(entry.openproject_id), "sprint_id": native_id})
+                native_assignments += 1
+                continue
+
+            version_id = int(mapped_entry.get("openproject_id", 0) or 0)
+            if version_id > 0:
+                sprint_updates.append({"id": int(entry.openproject_id), "version_id": version_id})
+                version_assignments += 1
+
+        if sprint_updates:
             try:
-                res = self.op_client.batch_update_work_packages(version_updates)
+                res = self.op_client.batch_update_work_packages(sprint_updates)
                 if isinstance(res, dict):
                     updated += int(res.get("updated", 0))
                     failed += int(res.get("failed", 0))
             except Exception:
-                logger.exception("Failed to assign versions for sprint mapping")
-                failed += len(version_updates)
+                logger.exception("Failed to assign sprints for sprint mapping")
+                failed += len(sprint_updates)
+
+        # ``batch_update_work_packages`` assigns via
+        # ``wp.send("#{key}=", value) if wp.respond_to?(...)``, so a
+        # ``sprint_id=`` setter that does not exist is skipped in silence
+        # while the row still counts as updated. Confirm against a real
+        # count rather than trusting that tally.
+        if native_assignments:
+            try:
+                assigned = self.op_client.sprints.count_assigned_work_packages()
+                if assigned == 0:
+                    self.logger.warning(
+                        "Reported %s native sprint assignment(s) but no work package carries a sprint; "
+                        "the sprint_id setter was likely skipped",
+                        native_assignments,
+                    )
+                else:
+                    self.logger.info("Work packages currently attached to a sprint: %s", assigned)
+            except Exception:
+                logger.exception("Failed to verify native sprint assignments")
 
         # Ensure Sprint CF and set values via minimal Rails per record
         cf_id = 0
@@ -379,7 +411,8 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
                 failed=failed,
                 details={
                     "sprint_cf_updates": 0,
-                    "version_assignments": len(version_updates),
+                    "sprint_assignments": native_assignments,
+                    "version_assignments": version_assignments,
                     "parent_links": len(parent_links),
                     "cf_available": False,
                 },
@@ -422,7 +455,8 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
             failed=failed,
             details={
                 "sprint_cf_updates": len(sprint_text),
-                "version_assignments": len(version_updates),
+                "sprint_assignments": native_assignments,
+                "version_assignments": version_assignments,
                 "parent_links": len(parent_links),
                 "cf_available": True,
             },

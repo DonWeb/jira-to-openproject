@@ -124,34 +124,61 @@ class OpenProjectWorkPackageService:
         self,
         updates: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Update multiple work packages in batches."""
+        """Update multiple work packages in batches.
+
+        The payload crosses into Ruby through a heredoc and ``JSON.parse``,
+        never as interpolated source. Inlining ``json.dumps`` output as Ruby
+        looks like it works — JSON object syntax happens to be a valid Ruby
+        hash literal, and ``true``/``false`` spell the same — but **JSON
+        ``null`` is not Ruby**. A single ``None`` anywhere in the payload
+        emits a bare ``null`` token and the whole script dies with
+        ``NameError: undefined local variable or method 'null'``, before it
+        can write its result file. One checklist-type custom field carrying
+        ``"status": null`` killed a 543 KB batch of 137 work packages that
+        way and cost a migration run ten minutes of blind polling.
+
+        ``JSON.parse`` also means keys arrive as **strings**, not symbols —
+        hence ``update['id']`` rather than ``update[:id]``.
+        """
         if not updates:
             return {"updated": 0, "failed": 0, "results": []}
 
-        # Build batch update script
-        # Use ensure_ascii=False to output UTF-8 directly, avoiding \uXXXX escapes
-        # that Ruby misinterprets as invalid Unicode escape sequences
-        # NOTE: Ruby parses {"key": value} as symbol keys (:key), so we use :id etc.
+        # ensure_ascii=False emits UTF-8 directly; \uXXXX escapes are misread
+        # by Ruby as invalid Unicode escapes. The single-quoted heredoc tag
+        # stops Ruby interpolating the payload, so JSON.parse sees data and
+        # never code.
         updates_json = json.dumps(updates, ensure_ascii=False)
         script = f"""
-        updates = {updates_json}
+        require 'json'
+        updates = JSON.parse(<<'J2O_UPDATES')
+{updates_json}
+J2O_UPDATES
         updated_count = 0
         failed_count = 0
         results = []
 
         updates.each do |update|
           begin
-            wp = WorkPackage.find(update[:id])
+            wp = WorkPackage.find(update['id'])
+            unapplied = []
             update.each do |key, value|
-              next if key == :id
-              wp.send("#{{key}}=", value) if wp.respond_to?("#{{key}}=")
+              next if key == 'id'
+              if wp.respond_to?("#{{key}}=")
+                wp.send("#{{key}}=", value)
+              else
+                # Report attributes this model does not accept instead of
+                # dropping them silently and still counting the row updated.
+                unapplied << key
+              end
             end
             wp.save!
             updated_count += 1
-            results << {{ id: wp.id, status: 'updated' }}
+            row = {{ id: wp.id, status: 'updated' }}
+            row[:unapplied] = unapplied unless unapplied.empty?
+            results << row
           rescue => e
             failed_count += 1
-            results << {{ id: update[:id], status: 'failed', error: e.message }}
+            results << {{ id: update['id'], status: 'failed', error: e.message }}
           end
         end
 

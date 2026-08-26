@@ -60,6 +60,12 @@ migration:
   batch_size: 1000
   skeleton_batch_size: 100  # Batch size for work package skeleton creation (increased from 50)
 
+  # Journal author for everything the migration writes. Login or numeric id of
+  # an OpenProject user; set via J2O_MIGRATION_JOURNAL_USER. Empty falls back to
+  # User.system ("System") — never User.anonymous, which is what an
+  # unconfigured Rails console session would otherwise record.
+  journal_user: ""
+
   # Behavior settings
   skip_existing: true
   enable_rails_meta_writes: true

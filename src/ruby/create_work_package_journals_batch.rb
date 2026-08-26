@@ -31,6 +31,16 @@ if input_data && input_data.respond_to?(:each)
   priority_cache = {}
   IssuePriority.all.each { |p| priority_cache[p.name.downcase] = p.id }
 
+  # Journal author fallback, resolved once for the whole batch.
+  #
+  # This used to be the literal ``2``, which is NOT a safe default: on this
+  # instance id 2 is ``DeletedUser`` ("Deleted user"), and builtin ids are not
+  # stable across installs (here: 1 SystemUser, 2 DeletedUser, 3
+  # AnonymousUser). A real Jira author's journal silently became the
+  # deleted-user placeholder. Prefer a real admin, then a builtin, and never a
+  # hardcoded id. Per-WP the work package's own author still wins over this.
+  j2o_fallback_user_id = User.find_by(admin: true)&.id || User.anonymous.id
+
   valid_journal_attributes = [
     :type_id, :project_id, :subject, :description, :due_date, :category_id,
     :status_id, :assigned_to_id, :priority_id, :version_id, :author_id,
@@ -106,262 +116,336 @@ if input_data && input_data.respond_to?(:each)
         next
       end
 
-      # Delete v2+ journals for idempotent re-migration
-      v2_plus_journals = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage').where('version > 1')
-      v2_plus_count = v2_plus_journals.count
+      # One transaction for the whole work package.
+      #
+      # Without it the delete below commits on its own, so a failure in the
+      # INSERTs that follow leaves the work package stripped of the journals
+      # it had and with nothing rebuilt. That is exactly what happened on the
+      # 2026-08-20 run: 211 work packages lost ~559 journals, comments
+      # included, because the rescue recorded the error while the delete had
+      # already gone through. All-or-nothing per work package instead: a
+      # failed one keeps what it had and is reported, and re-running rebuilds
+      # it from Jira.
+      ActiveRecord::Base.transaction do
+        # Deferred so the intermediate states of the chain rewrite below are
+        # not checked statement by statement; Postgres validates the
+        # exclusion constraint at COMMIT, once the chain is consistent.
+        conn.execute('SET CONSTRAINTS non_overlapping_journals_validity_periods DEFERRED')
 
-      if v2_plus_count > 0
-        v2_plus_ids = v2_plus_journals.pluck(:id)
-        if v2_plus_ids.any?
-          Journal::CustomizableJournal.where(journal_id: v2_plus_ids).delete_all
-          data_ids = v2_plus_journals.pluck(:data_id).compact
-          v2_plus_journals.delete_all
-          Journal::WorkPackageJournal.where(id: data_ids).delete_all if data_ids.any?
-        end
-      end
+        # Delete v2+ journals for idempotent re-migration
+        v2_plus_journals = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage').where('version > 1')
+        v2_plus_count = v2_plus_journals.count
 
-      # Operations are already sorted by Python, use as-is
-      ops = rails_ops
-
-      # Get base version for this WP
-      base_version = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage').maximum(:version) || 0
-
-      # Initialize state from WP record (Ruby has DB access)
-      current_state = {
-        type_id: rec.type_id, project_id: rec.project_id, subject: rec.subject,
-        description: rec.description, due_date: rec.due_date, category_id: rec.category_id,
-        status_id: rec.status_id, assigned_to_id: rec.assigned_to_id, priority_id: rec.priority_id,
-        version_id: rec.version_id, author_id: rec.author_id, done_ratio: rec.done_ratio,
-        estimated_hours: rec.estimated_hours, start_date: rec.start_date, parent_id: rec.parent_id,
-        schedule_manually: rec.schedule_manually, ignore_non_working_days: rec.ignore_non_working_days
-      }
-
-      # Collect journal data using pre-computed values from Python
-      bulk_journals = []
-      v1_journal = nil
-      v1_cf_snapshot = nil
-
-      ops.each_with_index do |op, op_idx|
-        op_type = op['type'] || op[:type]
-        next if op_type == 'set_journal_user'
-
-        notes = op['notes'] || op[:notes] || ''
-        field_changes = op['field_changes'] || op[:field_changes]
-
-        # Skip empty operations (except first which updates v1)
-        is_empty = (notes.nil? || notes.to_s.strip.empty?) && (field_changes.nil? || field_changes.empty?)
-        next if is_empty && op_idx != 0
-
-        # Use pre-computed user_id from Python
-        raw_user_id = (op['user_id'] || op[:user_id]).to_i
-        fallback_user_id = rec.author_id && rec.author_id > 0 ? rec.author_id : 2
-        user_id = raw_user_id > 0 ? raw_user_id : fallback_user_id
-
-        # Use pre-computed timestamps from Python
-        validity_start_str = op['validity_period_start'] || op[:validity_period_start] || op['created_at'] || op[:created_at]
-        validity_end_str = op['validity_period_end'] || op[:validity_period_end]
-
-        # Parse timestamps
-        target_time = validity_start_str && !validity_start_str.to_s.empty? ? Time.parse(validity_start_str.to_s).utc : (rec.created_at || Time.now).utc
-
-        # Build validity_period from pre-computed values
-        if validity_end_str && !validity_end_str.to_s.empty?
-          period_end = Time.parse(validity_end_str.to_s).utc
-          validity_period = (target_time...period_end)
-        else
-          # Open-ended (last entry)
-          validity_period = (target_time..)
-        end
-
-        # Apply field_changes to build progressive state snapshot
-        if op.is_a?(Hash) && (op.key?("state_snapshot") || op.key?(:state_snapshot))
-          state_snapshot = op["state_snapshot"] || op[:state_snapshot]
-          sanitized_state = ensure_required_fields.call(state_snapshot, rec)
-        else
-          current_state = apply_field_changes_to_state.call(current_state, field_changes, priority_cache, rec)
-          sanitized_state = current_state.dup
-        end
-
-        # Get cf_state_snapshot (pre-computed by Python with field names, resolve to IDs here)
-        cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
-        resolved_cf_snapshot = nil
-        if cf_snapshot.is_a?(Hash)
-          resolved_cf_snapshot = {}
-          if cf_snapshot['workflow'] && workflow_cf_id
-            resolved_cf_snapshot[workflow_cf_id] = cf_snapshot['workflow']
-          end
-          if cf_snapshot['resolution'] && resolution_cf_id
-            resolved_cf_snapshot[resolution_cf_id] = cf_snapshot['resolution']
+        if v2_plus_count > 0
+          v2_plus_ids = v2_plus_journals.pluck(:id)
+          if v2_plus_ids.any?
+            Journal::CustomizableJournal.where(journal_id: v2_plus_ids).delete_all
+            data_ids = v2_plus_journals.pluck(:data_id).compact
+            v2_plus_journals.delete_all
+            Journal::WorkPackageJournal.where(id: data_ids).delete_all if data_ids.any?
           end
         end
 
-        # Use pre-computed version from Python, or calculate if not provided
-        pre_computed_version = op['version'] || op[:version]
+        # Operations are already sorted by Python, use as-is
+        ops = rails_ops
 
-        if op_idx == 0
-          # First operation updates v1 journal
-          v1_cf_snapshot = resolved_cf_snapshot
-          v1_journal = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage', version: 1).first
-          if v1_journal
-            v1_journal.user_id = user_id
-            v1_journal.notes = notes
-            v1_journal.data = Journal::WorkPackageJournal.new(sanitized_state)
-            v1_journal.save(validate: false)
+        # Get base version for this WP
+        base_version = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage').maximum(:version) || 0
 
-            # Update timestamps via raw SQL
-            target_time_str = target_time.strftime('%Y-%m-%d %H:%M:%S.%6N%:z')
-            if validity_period.end
-              period_end_time = validity_period.end.is_a?(Time) ? validity_period.end : Time.parse(validity_period.end.to_s)
-              period_end_str = period_end_time.strftime('%Y-%m-%d %H:%M:%S.%6N%:z')
-              range_sql = "tstzrange('#{target_time_str}', '#{period_end_str}', '[)')"
-            else
-              range_sql = "tstzrange('#{target_time_str}', NULL, '[)')"
-            end
-            conn.execute("UPDATE journals SET created_at = '#{target_time_str}', updated_at = '#{target_time_str}', validity_period = #{range_sql} WHERE id = #{v1_journal.id}")
-          end
-        else
-          # v2+ journals: use pre-computed version or increment
-          version = pre_computed_version || (base_version + bulk_journals.size + 1)
-          bulk_journals << {
-            version: version, user_id: user_id, notes: notes,
-            created_at: target_time, validity_period: validity_period,
-            state: sanitized_state, cf_snapshot: resolved_cf_snapshot
-          }
-        end
-      end
+        # Initialize state from WP record (Ruby has DB access)
+        current_state = {
+          type_id: rec.type_id, project_id: rec.project_id, subject: rec.subject,
+          description: rec.description, due_date: rec.due_date, category_id: rec.category_id,
+          status_id: rec.status_id, assigned_to_id: rec.assigned_to_id, priority_id: rec.priority_id,
+          version_id: rec.version_id, author_id: rec.author_id, done_ratio: rec.done_ratio,
+          estimated_hours: rec.estimated_hours, start_date: rec.start_date, parent_id: rec.parent_id,
+          schedule_manually: rec.schedule_manually, ignore_non_working_days: rec.ignore_non_working_days
+        }
 
-      # Deduplicate by validity_period (in case Python sent duplicates)
-      if bulk_journals.any?
-        seen = {}
-        deduped = []
-        bulk_journals.each do |j|
-          vp = j[:validity_period]
-          if vp
-            vp_key = vp.end ? "#{vp.begin.to_i}_#{vp.end.to_i}" : "#{vp.begin.to_i}_infinity"
-            next if seen[vp_key]
-            seen[vp_key] = true
-          end
-          deduped << j
-        end
+        # Collect journal data using pre-computed values from Python
+        bulk_journals = []
+        v1_journal = nil
+        v1_cf_snapshot = nil
+        v1_target_time = nil
 
-        # Re-number versions if deduplication removed entries
-        if deduped.size < bulk_journals.size
-          deduped.each_with_index { |j, i| j[:version] = base_version + 1 + i }
-        end
-        bulk_journals = deduped
-      end
+        ops.each_with_index do |op, op_idx|
+          op_type = op['type'] || op[:type]
+          next if op_type == 'set_journal_user'
 
-      # Bulk INSERT work_package_journals first (to get data_id)
-      if bulk_journals.any?
-        wp_journal_values = bulk_journals.map do |j|
-          s = j[:state]
-          subject_escaped = conn.quote(s[:subject].to_s)
-          desc_escaped = conn.quote(s[:description].to_s)
-          due_date_sql = s[:due_date] ? "'#{s[:due_date]}'" : "NULL"
-          start_date_sql = s[:start_date] ? "'#{s[:start_date]}'" : "NULL"
+          notes = op['notes'] || op[:notes] || ''
+          field_changes = op['field_changes'] || op[:field_changes]
 
-          "(#{s[:type_id] || 'NULL'}, #{s[:project_id] || 'NULL'}, #{subject_escaped}, #{desc_escaped}, " +
-          "#{due_date_sql}, #{s[:category_id] || 'NULL'}, #{s[:status_id] || 'NULL'}, #{s[:assigned_to_id] || 'NULL'}, " +
-          "#{sanitize_id_field.call(s[:priority_id], priority_cache, rec.priority_id) || 'NULL'}, #{s[:version_id] || 'NULL'}, #{s[:author_id] || 'NULL'}, " +
-          "#{s[:done_ratio] || 0}, #{s[:estimated_hours] || 'NULL'}, #{start_date_sql}, #{s[:parent_id] || 'NULL'}, " +
-          "#{s[:schedule_manually] || false}, #{s[:ignore_non_working_days] || false})"
-        end
+          # Skip empty operations (except first which updates v1)
+          is_empty = (notes.nil? || notes.to_s.strip.empty?) && (field_changes.nil? || field_changes.empty?)
+          next if is_empty && op_idx != 0
 
-        wp_insert_sql = <<~SQL
-          INSERT INTO work_package_journals (type_id, project_id, subject, description,
-            due_date, category_id, status_id, assigned_to_id, priority_id, version_id, author_id,
-            done_ratio, estimated_hours, start_date, parent_id, schedule_manually, ignore_non_working_days)
-          VALUES #{wp_journal_values.join(",\n       ")}
-          RETURNING id
-        SQL
+          # Use pre-computed user_id from Python
+          raw_user_id = (op['user_id'] || op[:user_id]).to_i
+          fallback_user_id = rec.author_id && rec.author_id > 0 ? rec.author_id : j2o_fallback_user_id
+          user_id = raw_user_id > 0 ? raw_user_id : fallback_user_id
 
-        wp_result = conn.execute(wp_insert_sql)
-        wp_journal_ids = []
-        wp_result.each { |row| wp_journal_ids << row['id'] }
+          # Use pre-computed timestamps from Python
+          validity_start_str = op['validity_period_start'] || op[:validity_period_start] || op['created_at'] || op[:created_at]
+          validity_end_str = op['validity_period_end'] || op[:validity_period_end]
 
-        # Bulk INSERT journals with data_type and data_id
-        journal_values = bulk_journals.each_with_index.map do |j, idx|
-          wp_journal_id = wp_journal_ids[idx]
-          next nil unless wp_journal_id
+          # Parse timestamps
+          target_time = validity_start_str && !validity_start_str.to_s.empty? ? Time.parse(validity_start_str.to_s).utc : (rec.created_at || Time.now).utc
 
-          ts_str = j[:created_at].strftime('%Y-%m-%d %H:%M:%S.%6N%:z')
-          notes_escaped = conn.quote(j[:notes].to_s)
-
-          if j[:validity_period].end
-            period_end = j[:validity_period].end.is_a?(Time) ? j[:validity_period].end : Time.parse(j[:validity_period].end.to_s)
-            period_end_str = period_end.strftime('%Y-%m-%d %H:%M:%S.%6N%:z')
-            range_sql = "tstzrange('#{ts_str}', '#{period_end_str}', '[)')"
+          # Build validity_period from pre-computed values
+          if validity_end_str && !validity_end_str.to_s.empty?
+            period_end = Time.parse(validity_end_str.to_s).utc
+            validity_period = (target_time...period_end)
           else
-            range_sql = "tstzrange('#{ts_str}', NULL, '[)')"
+            # Open-ended (last entry)
+            validity_period = (target_time..)
           end
 
-          "(#{rec.id}, 'WorkPackage', #{j[:user_id]}, #{notes_escaped}, #{j[:version]}, '#{ts_str}', '#{ts_str}', " +
-          "'Journal::WorkPackageJournal', #{wp_journal_id}, #{range_sql})"
-        end.compact
+          # Apply field_changes to build progressive state snapshot
+          if op.is_a?(Hash) && (op.key?("state_snapshot") || op.key?(:state_snapshot))
+            state_snapshot = op["state_snapshot"] || op[:state_snapshot]
+            sanitized_state = ensure_required_fields.call(state_snapshot, rec)
+          else
+            current_state = apply_field_changes_to_state.call(current_state, field_changes, priority_cache, rec)
+            sanitized_state = current_state.dup
+          end
 
-        if journal_values.any?
-          insert_sql = <<~SQL
-            INSERT INTO journals (journable_id, journable_type, user_id, notes, version, created_at, updated_at,
-              data_type, data_id, validity_period)
-            VALUES #{journal_values.join(",\n       ")}
-            RETURNING id, version
-          SQL
+          # Get cf_state_snapshot (pre-computed by Python with field names, resolve to IDs here)
+          cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
+          resolved_cf_snapshot = nil
+          if cf_snapshot.is_a?(Hash)
+            resolved_cf_snapshot = {}
+            if cf_snapshot['workflow'] && workflow_cf_id
+              resolved_cf_snapshot[workflow_cf_id] = cf_snapshot['workflow']
+            end
+            if cf_snapshot['resolution'] && resolution_cf_id
+              resolved_cf_snapshot[resolution_cf_id] = cf_snapshot['resolution']
+            end
+          end
 
-          journal_result = conn.execute(insert_sql)
-          version_to_id = {}
-          journal_result.each { |row| version_to_id[row['version']] = row['id'] }
+          # Use pre-computed version from Python, or calculate if not provided
+          pre_computed_version = op['version'] || op[:version]
 
-          # Bulk INSERT customizable_journals for v2+ (J2O custom fields)
-          # NOOP FIX: Only insert entries when CF value actually CHANGED
-          if j2o_cf_ids.any?
-            cf_journal_values = []
-            # Start with v1's CF state as the baseline for comparison
-            prev_cf_snapshot = v1_cf_snapshot.is_a?(Hash) ? v1_cf_snapshot.dup : {}
+          if op_idx == 0
+            # First operation updates v1 journal
+            v1_cf_snapshot = resolved_cf_snapshot
+            v1_journal = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage', version: 1).first
+            if v1_journal
+              # Remember the payload row this journal currently points at.
+              # Assigning a fresh ``data`` object inserts a new
+              # work_package_journals row and repoints ``data_id`` at it; the old
+              # row is left behind, referenced by nothing. That is one orphan per
+              # rebuilt work package on every run — 391 of the 4299 swept on
+              # 2026-08-20 came from exactly here.
+              stale_data_id = v1_journal.data_id
 
-            bulk_journals.each do |j|
-              journal_id = version_to_id[j[:version]]
-              next unless journal_id
+              v1_journal.user_id = user_id
+              v1_journal.notes = notes
+              v1_journal.data = Journal::WorkPackageJournal.new(sanitized_state)
+              v1_journal.save(validate: false)
 
-              curr_cf_snapshot = j[:cf_snapshot].is_a?(Hash) ? j[:cf_snapshot] : {}
-
-              # Only insert entries for CF values that actually CHANGED from previous version
-              curr_cf_snapshot.each do |cf_id, cf_value|
-                next if cf_id.nil? || cf_value.nil?
-                prev_value = prev_cf_snapshot[cf_id]
-
-                # Check if value actually changed (handle nil vs empty string)
-                value_changed = prev_value.to_s != cf_value.to_s
-
-                if value_changed
-                  cf_journal_values << "(#{journal_id}, #{cf_id.to_i}, #{conn.quote(cf_value.to_s)})"
-                end
+              if stale_data_id && stale_data_id != v1_journal.data_id
+                Journal::WorkPackageJournal.where(id: stale_data_id).delete_all
               end
 
-              # Update prev_cf_snapshot for next iteration
-              prev_cf_snapshot = curr_cf_snapshot.dup
+              # The validity_period is deliberately NOT written here. It depends on
+              # where this journal sits in the normalised timeline built below,
+              # which cannot be known until every entry's timestamp is in hand.
+              v1_target_time = target_time
             end
-            if cf_journal_values.any?
-              conn.execute("INSERT INTO customizable_journals (journal_id, custom_field_id, value) VALUES #{cf_journal_values.join(', ')}")
+          else
+            # v2+ journals: use pre-computed version or increment
+            version = pre_computed_version || (base_version + bulk_journals.size + 1)
+            bulk_journals << {
+              version: version, user_id: user_id, notes: notes,
+              created_at: target_time, validity_period: validity_period,
+              state: sanitized_state, cf_snapshot: resolved_cf_snapshot
+            }
+          end
+        end
+
+        # Deduplicate by validity_period (in case Python sent duplicates)
+        if bulk_journals.any?
+          seen = {}
+          deduped = []
+          bulk_journals.each do |j|
+            vp = j[:validity_period]
+            if vp
+              vp_key = vp.end ? "#{vp.begin.to_i}_#{vp.end.to_i}" : "#{vp.begin.to_i}_infinity"
+              next if seen[vp_key]
+              seen[vp_key] = true
+            end
+            deduped << j
+          end
+
+          # Re-number versions if deduplication removed entries
+          if deduped.size < bulk_journals.size
+            deduped.each_with_index { |j, i| j[:version] = base_version + 1 + i }
+          end
+          bulk_journals = deduped
+        end
+
+        # ------------------------------------------------------------------
+        # Normalise the whole chain before writing a single range.
+        #
+        # Defence in depth against whatever Python sent. Postgres rejects a
+        # tstzrange whose lower bound is above its upper bound outright
+        # (PG::DataException — 211 of 435 work packages on the 2026-08-20 run),
+        # and equal bounds violate journals_validity_period_not_empty. Guarding
+        # one pair in isolation is not enough: the upper bound of journal N is the
+        # lower bound of journal N+1, so nudging locally would just move the
+        # violation into an overlap. The chain has to be walked end to end, the
+        # way the comment migration already does it.
+        #
+        # v1 goes first, then the bulk journals in version order — the same order
+        # their rows will have, so row order and time order agree and exactly the
+        # last entry is left open.
+        v1_row = v1_journal || Journal.where(journable_id: rec.id, journable_type: 'WorkPackage', version: 1).first
+        v1_time = v1_target_time || v1_row&.created_at
+
+        timeline = []
+        timeline << v1_time if v1_row && v1_time
+        bulk_journals.each { |j| timeline << j[:created_at] }
+
+        # 1ms is the smallest step that keeps a range non-empty at the microsecond
+        # precision these columns store.
+        (1...timeline.size).each do |i|
+          timeline[i] = timeline[i - 1] + 0.001 if timeline[i] <= timeline[i - 1]
+        end
+
+        chain_offset = (v1_row && v1_time) ? 1 : 0
+        bulk_journals.each_with_index { |j, i| j[:created_at] = timeline[chain_offset + i] }
+
+        # Lambda: [range_sql, timestamp_string] for one position in the timeline.
+        range_for = lambda do |idx|
+          lower_str = timeline[idx].strftime('%Y-%m-%d %H:%M:%S.%6N%:z')
+          if idx < timeline.size - 1
+            upper_str = timeline[idx + 1].strftime('%Y-%m-%d %H:%M:%S.%6N%:z')
+            ["tstzrange('#{lower_str}', '#{upper_str}', '[)')", lower_str]
+          else
+            ["tstzrange('#{lower_str}', NULL, '[)')", lower_str]
+          end
+        end
+
+        # v1's range, deferred out of the ops loop so it could take part in the
+        # normalisation above.
+        if v1_row && v1_time
+          v1_range_sql, v1_ts_str = range_for.call(0)
+          conn.execute(
+            "UPDATE journals SET created_at = '#{v1_ts_str}', updated_at = '#{v1_ts_str}', " \
+            "validity_period = #{v1_range_sql} WHERE id = #{v1_row.id}",
+          )
+        end
+
+        # Bulk INSERT work_package_journals first (to get data_id)
+        if bulk_journals.any?
+          wp_journal_values = bulk_journals.map do |j|
+            s = j[:state]
+            subject_escaped = conn.quote(s[:subject].to_s)
+            desc_escaped = conn.quote(s[:description].to_s)
+            due_date_sql = s[:due_date] ? "'#{s[:due_date]}'" : "NULL"
+            start_date_sql = s[:start_date] ? "'#{s[:start_date]}'" : "NULL"
+
+            "(#{s[:type_id] || 'NULL'}, #{s[:project_id] || 'NULL'}, #{subject_escaped}, #{desc_escaped}, " +
+            "#{due_date_sql}, #{s[:category_id] || 'NULL'}, #{s[:status_id] || 'NULL'}, #{s[:assigned_to_id] || 'NULL'}, " +
+            "#{sanitize_id_field.call(s[:priority_id], priority_cache, rec.priority_id) || 'NULL'}, #{s[:version_id] || 'NULL'}, #{s[:author_id] || 'NULL'}, " +
+            "#{s[:done_ratio] || 0}, #{s[:estimated_hours] || 'NULL'}, #{start_date_sql}, #{s[:parent_id] || 'NULL'}, " +
+            "#{s[:schedule_manually] || false}, #{s[:ignore_non_working_days] || false})"
+          end
+
+          wp_insert_sql = <<~SQL
+            INSERT INTO work_package_journals (type_id, project_id, subject, description,
+              due_date, category_id, status_id, assigned_to_id, priority_id, version_id, author_id,
+              done_ratio, estimated_hours, start_date, parent_id, schedule_manually, ignore_non_working_days)
+            VALUES #{wp_journal_values.join(",\n       ")}
+            RETURNING id
+          SQL
+
+          wp_result = conn.execute(wp_insert_sql)
+          wp_journal_ids = []
+          wp_result.each { |row| wp_journal_ids << row['id'] }
+
+          # Bulk INSERT journals with data_type and data_id
+          journal_values = bulk_journals.each_with_index.map do |j, idx|
+            wp_journal_id = wp_journal_ids[idx]
+            next nil unless wp_journal_id
+
+            notes_escaped = conn.quote(j[:notes].to_s)
+            # Bounds come from the normalised timeline, not from the per-op range
+            # Python computed: only the timeline is guaranteed monotonic.
+            range_sql, ts_str = range_for.call(chain_offset + idx)
+
+            "(#{rec.id}, 'WorkPackage', #{j[:user_id]}, #{notes_escaped}, #{j[:version]}, '#{ts_str}', '#{ts_str}', " +
+            "'Journal::WorkPackageJournal', #{wp_journal_id}, #{range_sql})"
+          end.compact
+
+          if journal_values.any?
+            insert_sql = <<~SQL
+              INSERT INTO journals (journable_id, journable_type, user_id, notes, version, created_at, updated_at,
+                data_type, data_id, validity_period)
+              VALUES #{journal_values.join(",\n       ")}
+              RETURNING id, version
+            SQL
+
+            journal_result = conn.execute(insert_sql)
+            version_to_id = {}
+            journal_result.each { |row| version_to_id[row['version']] = row['id'] }
+
+            # Bulk INSERT customizable_journals for v2+ (J2O custom fields)
+            # NOOP FIX: Only insert entries when CF value actually CHANGED
+            if j2o_cf_ids.any?
+              cf_journal_values = []
+              # Start with v1's CF state as the baseline for comparison
+              prev_cf_snapshot = v1_cf_snapshot.is_a?(Hash) ? v1_cf_snapshot.dup : {}
+
+              bulk_journals.each do |j|
+                journal_id = version_to_id[j[:version]]
+                next unless journal_id
+
+                curr_cf_snapshot = j[:cf_snapshot].is_a?(Hash) ? j[:cf_snapshot] : {}
+
+                # Only insert entries for CF values that actually CHANGED from previous version
+                curr_cf_snapshot.each do |cf_id, cf_value|
+                  next if cf_id.nil? || cf_value.nil?
+                  prev_value = prev_cf_snapshot[cf_id]
+
+                  # Check if value actually changed (handle nil vs empty string)
+                  value_changed = prev_value.to_s != cf_value.to_s
+
+                  if value_changed
+                    cf_journal_values << "(#{journal_id}, #{cf_id.to_i}, #{conn.quote(cf_value.to_s)})"
+                  end
+                end
+
+                # Update prev_cf_snapshot for next iteration
+                prev_cf_snapshot = curr_cf_snapshot.dup
+              end
+              if cf_journal_values.any?
+                conn.execute("INSERT INTO customizable_journals (journal_id, custom_field_id, value) VALUES #{cf_journal_values.join(', ')}")
+              end
             end
           end
         end
-      end
 
-      # Insert customizable_journals for v1
-      if v1_journal && j2o_cf_ids.any?
-        Journal::CustomizableJournal.where(journal_id: v1_journal.id, custom_field_id: j2o_cf_ids).delete_all
-        if v1_cf_snapshot.is_a?(Hash) && v1_cf_snapshot.any?
-          cf_values = v1_cf_snapshot.map do |cf_id, cf_value|
-            next nil if cf_id.nil? || cf_value.nil?
-            "(#{v1_journal.id}, #{cf_id.to_i}, #{conn.quote(cf_value.to_s)})"
-          end.compact
-          conn.execute("INSERT INTO customizable_journals (journal_id, custom_field_id, value) VALUES #{cf_values.join(', ')}") if cf_values.any?
+        # Insert customizable_journals for v1
+        if v1_journal && j2o_cf_ids.any?
+          Journal::CustomizableJournal.where(journal_id: v1_journal.id, custom_field_id: j2o_cf_ids).delete_all
+          if v1_cf_snapshot.is_a?(Hash) && v1_cf_snapshot.any?
+            cf_values = v1_cf_snapshot.map do |cf_id, cf_value|
+              next nil if cf_id.nil? || cf_value.nil?
+              "(#{v1_journal.id}, #{cf_id.to_i}, #{conn.quote(cf_value.to_s)})"
+            end.compact
+            conn.execute("INSERT INTO customizable_journals (journal_id, custom_field_id, value) VALUES #{cf_values.join(', ')}") if cf_values.any?
+          end
         end
-      end
 
-      result['created'] = bulk_journals.length
+        result['created'] = bulk_journals.length
+      end
 
     rescue => e
+      # The transaction rolled back, so nothing was created no matter how far
+      # the block got. Reset the counter rather than reporting the journals this
+      # work package would have had.
+      result['created'] = 0
       result['error'] = "#{e.class}: #{e.message}"
     end
 

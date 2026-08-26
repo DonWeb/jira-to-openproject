@@ -47,8 +47,9 @@ The j2o migration tool consists of 40+ specialized migration components, each ha
 | RelationMigration | `relations` | Stable | Yes | Issue links |
 | WatcherMigration | `watchers` | Stable | Yes | Notifications |
 | **Agile** |
+| SprintMigration | `sprints` | Stable | Yes | Native OpenProject sprints (**17.6+**) |
 | SprintEpicMigration | `sprint_epic` | Stable | Yes | Sprint/Epic links on WPs |
-| AgileBoardMigration | `agile_boards` | Stable | Yes | Board queries + sprint versions |
+| AgileBoardMigration | `agile_boards` | Stable | Yes | Board saved-queries |
 | VersionsMigration | `versions` | Stable | Yes | Release tracking |
 | AffectsVersionsMigration | `affects_versions` | Stable | Yes | Version links |
 | **Labels & Tags** |
@@ -308,6 +309,67 @@ uv run python -m src.main migrate --components work_packages --no-confirm
 - Incremental re-runs (Phase 2 can be re-run without Phase 1)
 - Minimal API overhead (2 calls per WP vs 4+ for finer granularity)
 
+#### WpJournalHistoryMigration (Activity)
+
+**Location**: `src/application/components/wp_journal_history_migration.py`
+
+Rebuilds each work package's activity tab from its Jira changelog **and** its
+comments, as one chronological chain.
+
+Neither phase above migrates the changelog. Phase 2 creates the comments; the
+changelog reconstruction lives in `src/ruby/create_work_package_journals*.rb`,
+which is injected only by `bulk_create_records` — reachable only through the
+legacy `work_packages` component, which is not in the default sequence. Without
+this component a migrated work package's activity shows the creation entry and
+its comments, and nothing else: no status transitions, no reassignments, no
+priority changes.
+
+**Owns the whole v2+ journal chain.** The Ruby template deletes the existing v2+
+journals and rewrites them, comments included, in chronological order. That is
+deliberate, not destructive: row order then matches time order, the
+`validity_period` chain stays contiguous, and exactly the newest journal is left
+open. Appending changelog entries alongside already-created comments would give a
+chain whose row order and time order disagree — and OpenProject's journal writer
+closes the *highest-id* journal when creating the next one, so a lower-id row
+would be left open too and the next native save would trip
+`non_overlapping_journals_validity_periods`.
+
+Rebuilding also reattributes the v1 creation journal to the real Jira author.
+
+**Ordering**: must run after `work_packages_content` (whose comments it folds in)
+and after every component that writes work packages — a later `wp.save!` appends
+an out-of-order journal onto the finished chain.
+
+**Requires**: `work_package_mapping.json`; `attachment_mapping.json` for inline
+attachment references in comments to resolve (missing mapping is a warning).
+
+```bash
+uv run python3.14 -m src.main migrate --components wp_journal_history --no-confirm
+```
+
+#### WpTimestampRestoreMigration (Final)
+
+**Location**: `src/application/components/wp_timestamp_restore_migration.py`
+
+Restores Jira's `created_at`/`updated_at` onto the work package rows.
+
+Phase 1 and Phase 2 both write those timestamps already, but thirteen components
+run afterwards and each calls `wp.save!`, which bumps `updated_at` to the current
+time. Measured on the 2026-08-06 run: 520 of 520 work packages ended with
+`updated_at` in the migration window instead of Jira, a median drift of ~132 days.
+
+Writes with `update_columns`, which skips validations, callbacks and journal
+creation — so restoring a timestamp cannot itself produce another activity entry.
+Work packages already carrying the correct values are counted as `unchanged`
+rather than rewritten, so a rerun reports honestly.
+
+**Ordering**: must be the last component in the sequence. Anything that writes a
+work package after it re-introduces the drift.
+
+```bash
+uv run python3.14 -m src.main migrate --components wp_timestamp_restore --no-confirm
+```
+
 ---
 
 ## Configuration Migrations
@@ -496,23 +558,77 @@ Migrates Jira issue link types to OpenProject relation types.
 
 ## Agile & Sprint Migrations
 
+### SprintMigration
+
+**Location**: `src/application/components/sprint_migration.py`
+
+Creates OpenProject's **native** sprints (requires OpenProject **17.6+**) from Jira sprints. Creation
+only — attaching them to work packages is `SprintEpicMigration`'s job. Handles
+the entity type `native_sprints`.
+
+**Features**:
+- Sprint → `Sprint` row (`name`, `start_date`, `finish_date`, `status`), persisted
+  in the `sprint` mapping as `openproject_sprint_id`
+- Sprint goal → `sprint_goals.text` (a separate table; `sprints` has no goal column)
+- Deduplicates a sprint reported by several boards, keyed on the Jira sprint id
+- Resolves each sprint's project from its **origin board** (`originBoardId`), not
+  from the first board that lists it — boards in different projects can report
+  the same sprint
+- Enforces OpenProject's one-active-sprint-per-project rule: the most recently
+  started active sprint keeps `active`, the rest are demoted to `in_planning`
+  and listed in `details.demoted_active`
+- Degrades to the Version path by itself when the target has no `Sprint` model
+
+**Version tolerance**: the toolset supports OpenProject 17.3+, but native
+sprints need **17.6+**. 17.3 made sprints independent objects and the schema
+kept moving after that — 17.4.0 has the `Sprint` model with no `finish_date`
+column, 17.6.0 has it. The component probes the live schema once, logs
+`OpenProject <version> | sprint columns: ...` before writing anything, and picks
+the representation that release can hold:
+
+| Target | Sprints become | Built by |
+|--------|----------------|----------|
+| 17.6+ | native `Sprint` | `SprintMigration` |
+| 17.5 and earlier | `Version` | `AgileBoardMigration` |
+
+No configuration required. `J2O_SPRINT_STRATEGY` overrides the choice but cannot
+conjure a missing column, so `native` on an older target still resolves to
+Versions. Both components read the decision from the same helper
+(`effective_sprint_strategy`) so they cannot disagree about which one owns the
+sprints.
+
+It also stops after `MAX_CONSECUTIVE_FAILURES` (5) consecutive errors, since a
+repeating failure is systemic rather than per-sprint.
+
+**Configuration**: `J2O_SPRINT_STRATEGY` = `native` (default) | `version` | `both`
+
+**Dependencies**: ProjectMigration
+
+**Related**: SprintEpicMigration, [Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration)
+
+---
+
 ### SprintEpicMigration
 
 **Location**: `src/application/components/sprint_epic_migration.py`
 
 Applies Jira sprint membership and Epic Links to already-migrated work packages.
-The sprint versions themselves are created by `AgileBoardMigration`.
+The sprints themselves are created by `SprintMigration` (or, under the legacy
+strategy, by `AgileBoardMigration`). Sequenced after `work_packages_content`,
+since it can only attach to work packages that already exist.
 
 **Features**:
 - Epic Link → `parent_id` hierarchy on the child work package
-- Sprint → `version_id` on the work package, resolved via the `sprint` mapping
-  (first matching sprint only)
-- Sprint → "Sprint" text custom field, holding all sprint names comma-separated
+- Sprint → `sprint_id` on the work package, falling back to `version_id` when no
+  native sprint is mapped; resolved via the `sprint` mapping (first matching
+  sprint only, as both columns are scalar foreign keys)
+- Sprint → "Sprint" text custom field, holding all sprint names comma-separated —
+  the only place multi-sprint membership survives
 
-**Dependencies**: ProjectMigration, WorkPackageMigration, AgileBoardMigration
+**Dependencies**: ProjectMigration, WorkPackageMigration, SprintMigration
 (provides the `sprint` mapping)
 
-**Related**: AgileBoardMigration, [Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration)
+**Related**: SprintMigration, [Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration)
 
 ---
 
@@ -520,19 +636,20 @@ The sprint versions themselves are created by `AgileBoardMigration`.
 
 **Location**: `src/application/components/agile_board_migration.py`
 
-Creates one OpenProject saved query per Jira board and one OpenProject version
-per Jira sprint. Handles the entity types `agile_boards` and `sprints`.
+Creates one OpenProject saved query per Jira board. Handles the entity types
+`agile_boards` and `sprints`.
 
 **Features**:
 - Board → public saved query named `[Board] <name>`; board type, original JQL and
   column/status list go into the query **description** only — filters and columns
   are left empty
-- Sprint → project version (name, goal → description, start/due date, open/closed
-  status), persisted in the `sprint` mapping for `SprintEpicMigration`
+- Sprint → project version — **only** under `J2O_SPRINT_STRATEGY=version`/`both`.
+  On the default `native` strategy `SprintMigration` owns sprint creation and
+  this component builds no version payloads
 
-**Not** mapped to OpenProject's native boards or (since 17.3) native sprints —
-see [Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration) for the reasoning
-and the planned change.
+**Not** mapped to OpenProject's native boards — see
+[Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration) for the reasoning and
+the remaining planned change.
 
 **Dependencies**: ProjectMigration
 
@@ -972,7 +1089,8 @@ UserMigration (foundation)
     │       ├── WatcherMigration
     │       ├── TimeEntryMigration
     │       ├── SprintEpicMigration
-    │       │   └── AgileBoardMigration
+    │       │   └── SprintMigration
+    │       ├── AgileBoardMigration
     │       ├── VotesMigration
     │       ├── LabelsMigration
     │       ├── InlineRefsMigration

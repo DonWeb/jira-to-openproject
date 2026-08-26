@@ -5,6 +5,7 @@ Uses exception-based error handling for all operations.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -20,6 +21,16 @@ except Exception:
 from src.utils.file_manager import FileManager
 
 logger = configure_logging("INFO", None)
+
+# An IRB prompt: ``open-project(prod):053*`` / ``irb(main):001:0>``. The
+# trailing character is the state — ``>`` buffer complete, ``*`` multi-line
+# expression still open. Captured so callers can read the marker off the
+# prompt instead of scanning the whole line for a ``>``.
+_RE_IRB_PROMPT = re.compile(r"\([^)]*\):[\d:]+([>*])")
+
+# Bare prompts from consoles that render no line number. The leading boundary
+# stops ``#<CustomField … has_comment: false>`` from matching.
+_RE_BARE_PROMPT = re.compile(r"(?:^|\s)(?:>>|irb>|pry>|>)\s*$")
 
 
 # Prefixes that mark a captured tmux line as console noise (sentinels, irb
@@ -237,7 +248,7 @@ class RailsConsoleClient:
 
         try:
             tmux = self._tmux_path
-            send_cmd = [tmux, "send-keys", "-t", target, config_cmd, "Enter"]
+            send_cmd = [tmux, "send-keys", "-t", target, config_cmd.rstrip(), "Enter"]
             subprocess.run(send_cmd, capture_output=True, text=True, check=True)
             logger.debug("IRB configuration commands sent successfully")
         except subprocess.SubprocessError as e:
@@ -245,20 +256,135 @@ class RailsConsoleClient:
             msg = f"Failed to configure IRB settings: {e}"
             raise TmuxSessionError(msg) from e
 
+        self._set_journal_user()
+        self._log_console_environment()
+
+    def _set_journal_user(self) -> None:
+        """Attribute this session's journals to a real user, not Anonymous.
+
+        ``User.current`` is unset in a fresh console, and OpenProject answers
+        that state with ``User.anonymous`` rather than ``nil`` — so every
+        ``wp.save!`` the migration performs records its journal as "Anonymous".
+        One assignment per session fixes every later command: ``User.current``
+        lives in a thread-local that nothing clears outside a web request.
+
+        Sent as a single line deliberately; unterminated multi-line input is
+        what this console is fragile about. Never fatal — attribution is a
+        quality-of-data concern, not a precondition for migrating.
+        """
+        # Imported here, not at module scope: ``openproject_client`` imports
+        # this module, so a top-level import would close a cycle.
+        from src.utils.rails_journal_user import console_command
+
+        try:
+            target = self._get_target()
+            subprocess.run(
+                [self._tmux_path, "send-keys", "-t", target, console_command(), "Enter"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            time.sleep(0.5)
+            for line in reversed(self.capture_pane_tail(lines=15).split("\n")):
+                if "J2O journal user" in line:
+                    logger.info("Rails console %s", line.strip())
+                    return
+            logger.debug("Journal user assignment produced no recognisable output")
+        except Exception as exc:
+            logger.warning(
+                "Could not set the console journal user (%s); journals this run "
+                "will be attributed to Anonymous",
+                exc,
+            )
+
+    def _log_console_environment(self) -> None:
+        """Record the console's Ruby/IRB/Reline versions, best effort.
+
+        The 2026-08-03 outage came down to an IRB minor bump (1.17.0 → 1.18.0,
+        via a container upgrade) changing how input arriving mid-evaluation is
+        handled. Identical bytes worked before and wedged after, and nothing in
+        the logs named the interpreter — so the versions had to be recovered
+        from a stack trace in an archived tmux capture. One line here makes
+        that a first-second fact instead of an investigation.
+
+        Never fatal: this is diagnostics, not a precondition.
+        """
+        probe = (
+            "puts({ruby: RUBY_VERSION, "
+            "irb: (defined?(IRB::VERSION) ? IRB::VERSION : nil), "
+            "reline: (defined?(Reline::VERSION) ? Reline::VERSION : nil)}.to_s)"
+        )
+        try:
+            target = self._get_target()
+            subprocess.run(
+                [self._tmux_path, "send-keys", "-t", target, probe, "Enter"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            time.sleep(1.0)
+            for line in reversed(self.capture_pane_tail(lines=15).split("\n")):
+                if '"ruby"' in line or ":ruby=>" in line or "ruby:" in line:
+                    logger.info("Rails console environment: %s", line.strip())
+                    return
+            logger.debug("Console environment probe returned no recognisable output")
+        except Exception as exc:
+            logger.debug("Console environment probe failed: %s", exc)
+
     @staticmethod
     def _has_fatal_console_error(output: str) -> bool:
         """Detect fatal IRB/Reline/console errors in tmux output."""
         if not output:
             return False
+        # These mean the console itself is broken: the terminal layer failed,
+        # or the interpreter blew its stack.
+        #
+        # ``IRB::Irb#run`` used to be on this list and had to come off. It is
+        # a frame in the backtrace of *every* Ruby error raised inside an IRB
+        # session, so an ordinary ``NameError`` in a generated script was
+        # reported as a crashed console. That misdirection sent several
+        # rounds of debugging at the terminal layer while the real defect was
+        # a bad script — and it is precisely the errors we most want to read
+        # that get mislabelled, since a healthy console is what lets Ruby
+        # report them at all.
         fatal_terms = [
             "ungetbyte failed (IOError)",
             "Reline::ANSI#cursor_pos",
             "Reline::Core#readmultiline",
-            "IRB::Irb#run",
             "SystemStackError",
             "stack level too deep",
         ]
         return any(term in output for term in fatal_terms)
+
+    def is_executing(self) -> bool:
+        """Whether the console is mid-evaluation rather than waiting for input.
+
+        ``False`` means the console has settled — either at a ready prompt or
+        parked on a continuation prompt. Callers waiting on a side effect of a
+        script (a result file, say) use this to tell "still working" from
+        "finished, and never going to produce it".
+        """
+        try:
+            state = self._get_console_state(self.capture_pane_tail(lines=10))
+        except Exception:
+            # Unknown beats a wrong answer: keep the caller waiting.
+            return True
+        return state["state"] not in {"ready", "awaiting_input"}
+
+    def last_ruby_error(self) -> str | None:
+        """Return the most recent ``Ruby error:`` line in the pane, if any.
+
+        The marker wrapper prints this when a script raises, so it is the
+        readable cause behind a result file that never appeared.
+        """
+        try:
+            pane = self.capture_pane_tail(lines=40)
+        except Exception:
+            return None
+        for line in reversed(pane.split("\n")):
+            if line.strip().startswith("Ruby error:"):
+                return line.strip()
+        return None
 
     def _clear_pane(self) -> None:
         """Clear the tmux pane to prepare for command output.
@@ -278,8 +404,36 @@ class RailsConsoleClient:
             msg = f"Failed to clear tmux pane: {e}"
             raise TmuxSessionError(msg) from e
 
+    def capture_pane_tail(self, lines: int = 60) -> str:
+        """Return the tail of the tmux pane, best effort.
+
+        Used to put the console's actual state into error messages. Diagnosing
+        the 2026-08-03 outage meant reading archived tmux captures by hand
+        because "Console not ready after 90s" carried no evidence of what the
+        pane held.
+        """
+        try:
+            capture = subprocess.run(
+                [self._tmux_path, "capture-pane", "-p", "-S", f"-{lines}", "-t", self._get_target()],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.SubprocessError as exc:
+            return f"<pane capture failed: {exc}>"
+        return capture.stdout.strip()
+
     def _stabilize_console(self) -> None:
-        """Send a harmless command to stabilize console state.
+        """Abort whatever the console is holding and return it to a clean prompt.
+
+        ``Ctrl+C`` goes first because it is the only thing here that can close
+        an open multi-line expression: IRB discards the buffer and returns to
+        the line the block started on. Sending a space and Enter first — the
+        previous behaviour — appends *another* continuation line to that
+        buffer, deepening the state it was meant to clear.
+
+        Verified against the live console: one ``Ctrl+C`` took a session stuck
+        at ``open-project(prod):053*`` back to a usable prompt.
 
         Raises:
             ConsoleNotReadyError: If console cannot be stabilized
@@ -287,23 +441,23 @@ class RailsConsoleClient:
         """
         try:
             target = self._get_target()
-
-            # Send a space and Enter to reset terminal state
             tmux = self._tmux_path
-            send_cmd = [tmux, "send-keys", "-t", target, " ", "Enter"]
-            subprocess.run(send_cmd, capture_output=True, text=True, check=True)
-            time.sleep(0.3)
 
-            # Clear the screen
-            tmux = self._tmux_path
-            clear_cmd = [tmux, "send-keys", "-t", target, "C-l"]
-            subprocess.run(clear_cmd, capture_output=True, text=True, check=True)
-            time.sleep(0.2)
+            # Twice: the first discards a multi-line buffer, the second covers
+            # a console that was mid-evaluation when the first arrived.
+            for _ in range(2):
+                subprocess.run(
+                    [tmux, "send-keys", "-t", target, "C-c"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                time.sleep(0.3)
 
-            # Send Ctrl+C to abort any pending operation
-            tmux = self._tmux_path
+            # Clear only after the buffer is discarded — clearing first throws
+            # away the very output needed to tell whether it worked.
             subprocess.run(
-                [tmux, "send-keys", "-t", target, "C-c"],
+                [tmux, "send-keys", "-t", target, "C-l"],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -748,6 +902,19 @@ class RailsConsoleClient:
     def _get_console_state(self, output: str) -> dict[str, Any]:
         """Check if the Rails console is ready for input by looking for the prompt.
 
+        The prompt marker is read from the IRB prompt itself, not by searching
+        the line for a ``>`` anywhere. IRB renders
+        ``open-project(prod):<lineno>>`` when the buffer is complete and
+        ``…:<lineno>*`` while a multi-line expression is still open, and the
+        echoed source follows on the same line — so a continuation line such as
+        ``open-project(prod):357*         rescue => e`` used to satisfy a
+        ``">" in last_line`` test and be reported ready. The client then typed
+        the next command straight into the open buffer, which is how a single
+        stuck block became permanent across whole runs.
+
+        Anything with no recognisable prompt is reported *not* ready. Waiting is
+        cheap; sending into an unknown state is what caused the outage.
+
         Args:
             output: Current tmux pane output
 
@@ -755,10 +922,6 @@ class RailsConsoleClient:
             Dictionary with state information
 
         """
-        ready_patterns = ["irb(main):", ">", ">>", "irb>", "pry>"]
-        awaiting_patterns = ["*"]
-        string_patterns = ['"', "'"]
-
         result: dict[str, Any] = {"ready": False, "state": "unknown", "prompt": None}
 
         lines = [line.strip() for line in output.strip().split("\n")]
@@ -769,20 +932,28 @@ class RailsConsoleClient:
 
         last_line = non_empty_lines[-1]
         logger.debug("Last line: '%s'", last_line)
+        result["prompt"] = last_line
 
-        if any(pattern in last_line for pattern in ready_patterns) or last_line.endswith(">"):
-            result["prompt"] = last_line
+        # Take the *last* prompt on the line: the echoed source can contain
+        # text that looks like a prompt, but the real one always precedes it.
+        prompts = _RE_IRB_PROMPT.findall(last_line)
+        if prompts:
+            if prompts[-1] == "*":
+                result["state"] = "awaiting_input"
+            else:
+                result["state"] = "ready"
+                result["ready"] = True
+            return result
+
+        # Consoles that render a bare prompt (``>>``, ``pry>``). The leading
+        # boundary keeps object inspections like ``#<CustomField … false>``
+        # from passing as a prompt.
+        if _RE_BARE_PROMPT.search(last_line):
             result["state"] = "ready"
             result["ready"] = True
             return result
 
-        if any(pattern in last_line for pattern in awaiting_patterns):
-            result["prompt"] = last_line
-            result["state"] = "awaiting_input"
-            return result
-
-        if any(pattern in last_line for pattern in string_patterns):
-            result["prompt"] = last_line
+        if last_line.endswith(('"', "'")):
             result["state"] = "multiline_string"
             return result
 
@@ -932,7 +1103,16 @@ class RailsConsoleClient:
                 msg = f"Error checking console state: {e}"
                 raise ConsoleNotReadyError(msg) from e
 
-        logger.error("Console not ready after %ss", timeout)
+        # Say *why* it is not ready. "Console not ready after 90s" on its own
+        # is indistinguishable between a wedged prompt, a slow query and a dead
+        # session, and that ambiguity cost several rounds of log archaeology.
+        final_state = self._get_console_state(self.capture_pane_tail(lines=10))
+        logger.error(
+            "Console not ready after %ss (state=%s, prompt=%r)",
+            timeout,
+            final_state["state"],
+            final_state["prompt"],
+        )
         return False
 
     def _send_command_to_tmux(
@@ -961,15 +1141,42 @@ class RailsConsoleClient:
         """
         target = self._get_target()
 
-        if not self._wait_for_console_ready(target, timeout=10, reset_on_stall=False):
+        # ``reset_on_stall=True``: a console parked on a continuation prompt is
+        # exactly the case worth recovering from, and Ctrl+C recovers it. With
+        # this disabled the client spun out the timeout and then typed into the
+        # open buffer, so three consecutive runs failed identically instead of
+        # the first one healing itself.
+        if not self._wait_for_console_ready(target, timeout=10, reset_on_stall=True):
             logger.error("Console not ready, forcing full stabilization")
             self._stabilize_console()
 
-            if not self._wait_for_console_ready(target, timeout=5, reset_on_stall=False):
-                msg = "Console could not be made ready"
+            if not self._wait_for_console_ready(target, timeout=5, reset_on_stall=True):
+                # Fail here rather than send. Typing a command into an open
+                # multi-line buffer produces no result file, so the caller
+                # would block for the whole poll timeout with nothing to
+                # report. The pane goes into the message because that is the
+                # evidence needed to tell a wedged console from a slow one.
+                pane = self.capture_pane_tail()
+                logger.error("Console could not be made ready. Pane tail:\n%s", pane)
+                msg = f"Console could not be made ready; pane tail:\n{pane}"
                 raise ConsoleNotReadyError(msg)
 
-        escaped_command = self._escape_command(command)
+        # ``rstrip()`` is load-bearing, not cosmetic.
+        #
+        # The script templates are triple-quoted Python literals whose closing
+        # ``"""`` is indented, so every command ends with a newline plus the
+        # indentation — e.g. ``...end # MARKER\n        ``. ``send-keys`` types
+        # that text and *then* presses Enter, so the console receives one extra
+        # whitespace-only line, submitted while the block it just closed is
+        # still evaluating. Under Reline 0.6.3 / IRB 1.18.0 that input-during-
+        # eval corrupts the line buffer: the block never reports and the prompt
+        # is left in continuation (``open-project(prod):053*``) for good. IRB
+        # 1.17.0 tolerated it, which is why identical bytes worked before the
+        # container was upgraded.
+        #
+        # Reproduced by hand: the same command executes cleanly without the
+        # trailing whitespace and wedges the console with it.
+        escaped_command = self._escape_command(command).rstrip()
 
         try:
             # Removed TMUX_CMD_* markers; rely solely on EXEC_* markers from the script
