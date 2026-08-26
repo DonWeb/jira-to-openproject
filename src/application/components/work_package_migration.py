@@ -158,6 +158,22 @@ class WorkPackageMigration(BaseMigration):
         },
     )
 
+    # Jira changelog field (lowercased) -> OpenProject custom field *name*.
+    #
+    # These are the changes with no native column to land in, so they become
+    # ``customizable_journals`` rows instead of journal notes — which is what
+    # turns them into changes in the activity tab rather than comments. Keyed by
+    # name because custom field ids are not stable across installs; the Ruby
+    # template resolves them per batch and reports the misses.
+    #
+    # Every name here must be a custom field the pipeline itself creates
+    # (``custom_fields``, ``resolutions``, ``labels``, …). A name with no custom
+    # field behind it is not a silent no-op any more, but it is still lost
+    # history, so keep the two in sync.
+    JIRA_FIELD_TO_OP_CF_NAME: dict[str, str] = {
+        "resolution": "Resolution",
+    }
+
     # Default OpenProject role ID for mentioned users (Member role)
     _DEFAULT_MENTION_ROLE_ID = 4
 
@@ -1286,7 +1302,8 @@ class WorkPackageMigration(BaseMigration):
         - field_changes mapped to OpenProject field names/IDs
         - user_id from mapping
         - notes from comments/changelog
-        - cf_state_snapshot for J2O Workflow/Resolution
+        - cf_state_snapshot: the progressive custom field state, keyed by
+          OpenProject custom field name (see :attr:`JIRA_FIELD_TO_OP_CF_NAME`)
 
         Ruby only does (requires DB access):
         - Read WP initial state
@@ -1411,9 +1428,12 @@ class WorkPackageMigration(BaseMigration):
                 "Story Points": "story_points",
             }
 
-            # Track J2O Workflow/Resolution for cf_state_snapshot
-            cf_workflow_value: str | None = None
-            cf_resolution_value: str | None = None
+            # Progressive custom field state, keyed by OpenProject custom field
+            # *name*. Carried across entries (not reset per entry) so every
+            # journal ships the full state seen so far and the Ruby template can
+            # emit a customizable_journals row only where the value actually
+            # changed.
+            cf_state: dict[str, str] = {}
 
             # Build rails_ops with full pre-computation
             for i, entry in enumerate(all_entries):
@@ -1476,7 +1496,6 @@ class WorkPackageMigration(BaseMigration):
 
                     for item in items:
                         jira_field = item.get("field", "")
-                        field_id = item.get("fieldId", "")
                         from_val = item.get("from")
                         from_str = item.get("fromString", "")
                         to_val = item.get("to")
@@ -1560,11 +1579,23 @@ class WorkPackageMigration(BaseMigration):
                                 field_changes[op_field] = [from_str, to_str]
                                 field_mapped = True
 
-                        # Track J2O Workflow/Resolution for cf_state_snapshot
-                        if jira_field.lower() == "workflow" or field_id == "customfield_10500":
-                            cf_workflow_value = to_str or to_val
-                        elif jira_field.lower() == "resolution":
-                            cf_resolution_value = to_str or to_val
+                        # Track changes that belong in a custom field.
+                        #
+                        # Dropped from here: the ``field_id == "customfield_10500"``
+                        # arm that used to feed the Workflow snapshot. On this
+                        # Jira ``customfield_10500`` is "Bugs" (the Okapya
+                        # checklist plugin), not the workflow scheme — the id came
+                        # from upstream's instance — so every Bugs value was
+                        # filed as a workflow change. Workflow itself is no longer
+                        # tracked at all: no custom field on this OpenProject
+                        # backs it, so the snapshot had nowhere to land.
+                        cf_name = self.JIRA_FIELD_TO_OP_CF_NAME.get(jira_field.lower())
+                        if cf_name:
+                            cf_state[cf_name] = to_str or to_val or ""
+                            # A field that produces a change must not also
+                            # produce a note, or the journal keeps rendering as
+                            # a comment on top of the change.
+                            field_mapped = True
 
                         # Build human-readable notes ONLY for unmapped fields (not already in field_changes)
                         if not field_mapped and jira_field:
@@ -1572,16 +1603,11 @@ class WorkPackageMigration(BaseMigration):
 
                     notes = "\n".join(notes_lines) if notes_lines else ""
 
-                # Build cf_state_snapshot for J2O custom fields
-                cf_state_snapshot: dict[str, str] | None = None
-                if cf_workflow_value or cf_resolution_value:
-                    cf_state_snapshot = {}
-                    # We need the CF IDs - these are loaded elsewhere, use placeholders
-                    # Ruby will look these up by name if needed
-                    if cf_workflow_value:
-                        cf_state_snapshot["workflow"] = cf_workflow_value
-                    if cf_resolution_value:
-                        cf_state_snapshot["resolution"] = cf_resolution_value
+                # Snapshot of the custom field state as of this journal. Names,
+                # not ids: ids are not stable across installs, so the Ruby side
+                # resolves them once per batch and reports the ones it could not
+                # find instead of dropping the history in silence.
+                cf_state_snapshot: dict[str, str] | None = dict(cf_state) if cf_state else None
 
                 # Build the operation with all pre-computed data
                 op: dict[str, Any] = {

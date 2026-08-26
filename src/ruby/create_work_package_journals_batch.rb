@@ -19,14 +19,38 @@ results = []
 if input_data && input_data.respond_to?(:each)
   conn = ActiveRecord::Base.connection
 
-  # Cache lookups shared across all WPs (one-time cost)
-  workflow_cf = CustomField.find_by(name: "J2O Jira Workflow")
-  resolution_cf = CustomField.find_by(name: "J2O Jira Resolution")
-  affects_version_cf = CustomField.find_by(name: "J2O Affects Version")
-  j2o_cf_ids = [workflow_cf&.id, resolution_cf&.id, affects_version_cf&.id].compact
-  workflow_cf_id = workflow_cf&.id
-  resolution_cf_id = resolution_cf&.id
-  affects_version_cf_id = affects_version_cf&.id
+  # Custom fields are resolved by the names Python actually sent, once for the
+  # whole batch.
+  #
+  # This used to hardcode "J2O Jira Workflow" / "J2O Jira Resolution" /
+  # "J2O Affects Version". Those three are created by
+  # ``WorkPackageMigration._ensure_j2o_custom_fields`` — the ``work_packages``
+  # component, which is in neither DEFAULT_COMPONENT_SEQUENCE nor the ``full``
+  # profile — so on this instance none of them exist (probed 2026-08-26:
+  # ``j2o_legacy_cfs: {}``). ``j2o_cf_ids`` came out empty and the entire
+  # customizable_journals block below was a no-op: not one custom field change
+  # was ever journaled, including the resolution the code believed it was
+  # storing.
+  #
+  # Python now keys ``cf_state_snapshot`` by OpenProject custom field *name*
+  # and the ids are resolved here, because ids are not stable across installs
+  # while names are what the pipeline's own ``custom_fields`` component
+  # guarantees.
+  requested_cf_names = input_data.flat_map { |wp_data|
+    # Not named ``ops``: the per-WP loop below binds that name, and relying on
+    # parse-order to keep this one block-local is a trap for the next edit.
+    wp_ops = wp_data['rails_ops'] || wp_data[:rails_ops] || []
+    next [] unless wp_ops.respond_to?(:each)
+    wp_ops.flat_map { |op|
+      snapshot = op['cf_state_snapshot'] || op[:cf_state_snapshot]
+      snapshot.is_a?(Hash) ? snapshot.keys.map(&:to_s) : []
+    }
+  }.uniq
+  cf_ids_by_name = requested_cf_names.any? ? CustomField.where(name: requested_cf_names).pluck(:name, :id).to_h : {}
+  # Reported back so Python can warn instead of losing the history in silence —
+  # a missing custom field is exactly how the three J2O ones went unnoticed.
+  missing_cf_names = requested_cf_names - cf_ids_by_name.keys
+  j2o_cf_ids = cf_ids_by_name.values
 
   priority_cache = {}
   IssuePriority.all.each { |p| priority_cache[p.name.downcase] = p.id }
@@ -41,12 +65,25 @@ if input_data && input_data.respond_to?(:each)
   # hardcoded id. Per-WP the work package's own author still wins over this.
   j2o_fallback_user_id = User.find_by(admin: true)&.id || User.anonymous.id
 
-  valid_journal_attributes = [
-    :type_id, :project_id, :subject, :description, :due_date, :category_id,
-    :status_id, :assigned_to_id, :priority_id, :version_id, :author_id,
-    :done_ratio, :estimated_hours, :start_date, :parent_id,
-    :schedule_manually, :ignore_non_working_days
-  ].freeze
+  # Snapshot columns derived from the schema instead of hardcoded.
+  #
+  # This list, the ``current_state`` initialiser and the work_package_journals
+  # INSERT all used to spell out the same 17 columns by hand. OpenProject 17.6's
+  # work_package_journals has 28, so 11 were written NULL on every rebuilt
+  # journal — ``sprint_id``, ``story_points``, ``remaining_hours``,
+  # ``responsible_id``, ``budget_id``, ``duration``,
+  # ``project_phase_definition_id`` and the ``derived_*`` trio. Two costs: the
+  # newest journal no longer matched the work package, so the next native save
+  # rendered a diff that never happened in Jira ("Sprint removed"); and v1 lost
+  # them too, because its payload row is replaced wholesale rather than updated.
+  # It is also why Story Points changes vanished — the column exists, this list
+  # was filtering them out.
+  #
+  # Intersecting with WorkPackage's own columns keeps ``rec.attributes.slice``
+  # below well-defined and drops anything journal-only.
+  journal_columns = Journal::WorkPackageJournal.column_names - %w[id]
+  shared_columns = journal_columns & WorkPackage.column_names
+  valid_journal_attributes = shared_columns.map(&:to_sym).freeze
 
   # Lambda: Apply field_changes to state hash
   apply_field_changes_to_state = lambda do |current_state, field_changes, priority_cache, rec|
@@ -152,15 +189,9 @@ if input_data && input_data.respond_to?(:each)
         # Get base version for this WP
         base_version = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage').maximum(:version) || 0
 
-        # Initialize state from WP record (Ruby has DB access)
-        current_state = {
-          type_id: rec.type_id, project_id: rec.project_id, subject: rec.subject,
-          description: rec.description, due_date: rec.due_date, category_id: rec.category_id,
-          status_id: rec.status_id, assigned_to_id: rec.assigned_to_id, priority_id: rec.priority_id,
-          version_id: rec.version_id, author_id: rec.author_id, done_ratio: rec.done_ratio,
-          estimated_hours: rec.estimated_hours, start_date: rec.start_date, parent_id: rec.parent_id,
-          schedule_manually: rec.schedule_manually, ignore_non_working_days: rec.ignore_non_working_days
-        }
+        # Initialize state from WP record (Ruby has DB access). Every shared
+        # column, not a hand-picked subset — see ``shared_columns`` above.
+        current_state = rec.attributes.slice(*shared_columns).symbolize_keys
 
         # Collect journal data using pre-computed values from Python
         bulk_journals = []
@@ -209,16 +240,20 @@ if input_data && input_data.respond_to?(:each)
             sanitized_state = current_state.dup
           end
 
-          # Get cf_state_snapshot (pre-computed by Python with field names, resolve to IDs here)
+          # cf_state_snapshot arrives keyed by OpenProject custom field name and
+          # is resolved to ids through ``cf_ids_by_name``. Any name is accepted,
+          # so adding a field is a Python-side change only — the two hardcoded
+          # keys this replaced ('workflow' / 'resolution') were the reason no
+          # custom field change ever reached the activity tab.
           cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
           resolved_cf_snapshot = nil
           if cf_snapshot.is_a?(Hash)
             resolved_cf_snapshot = {}
-            if cf_snapshot['workflow'] && workflow_cf_id
-              resolved_cf_snapshot[workflow_cf_id] = cf_snapshot['workflow']
-            end
-            if cf_snapshot['resolution'] && resolution_cf_id
-              resolved_cf_snapshot[resolution_cf_id] = cf_snapshot['resolution']
+            cf_snapshot.each do |cf_name, cf_value|
+              cf_id = cf_ids_by_name[cf_name.to_s]
+              next unless cf_id
+              next if cf_value.nil?
+              resolved_cf_snapshot[cf_id] = cf_value
             end
           end
 
@@ -338,24 +373,27 @@ if input_data && input_data.respond_to?(:each)
 
         # Bulk INSERT work_package_journals first (to get data_id)
         if bulk_journals.any?
+          # Columns and values both come from ``shared_columns``, so a column
+          # added by a future OpenProject release is carried instead of silently
+          # NULLed. ``conn.quote`` covers nil -> NULL, Date/Time, booleans and
+          # numerics, which also retires the hand-rolled date interpolation that
+          # used to sit here and could not quote a Date safely.
           wp_journal_values = bulk_journals.map do |j|
             s = j[:state]
-            subject_escaped = conn.quote(s[:subject].to_s)
-            desc_escaped = conn.quote(s[:description].to_s)
-            due_date_sql = s[:due_date] ? "'#{s[:due_date]}'" : "NULL"
-            start_date_sql = s[:start_date] ? "'#{s[:start_date]}'" : "NULL"
-
-            "(#{s[:type_id] || 'NULL'}, #{s[:project_id] || 'NULL'}, #{subject_escaped}, #{desc_escaped}, " +
-            "#{due_date_sql}, #{s[:category_id] || 'NULL'}, #{s[:status_id] || 'NULL'}, #{s[:assigned_to_id] || 'NULL'}, " +
-            "#{sanitize_id_field.call(s[:priority_id], priority_cache, rec.priority_id) || 'NULL'}, #{s[:version_id] || 'NULL'}, #{s[:author_id] || 'NULL'}, " +
-            "#{s[:done_ratio] || 0}, #{s[:estimated_hours] || 'NULL'}, #{start_date_sql}, #{s[:parent_id] || 'NULL'}, " +
-            "#{s[:schedule_manually] || false}, #{s[:ignore_non_working_days] || false})"
+            row = shared_columns.map do |col|
+              value = s[col.to_sym]
+              # priority_id is the one column Python may hand over as a name
+              # ("High") rather than an id; NOT NULL, so it also needs the WP's
+              # own value as a floor.
+              value = sanitize_id_field.call(value, priority_cache, rec.priority_id) if col == 'priority_id'
+              value = 0 if col == 'done_ratio' && value.nil?
+              conn.quote(value)
+            end
+            "(#{row.join(', ')})"
           end
 
           wp_insert_sql = <<~SQL
-            INSERT INTO work_package_journals (type_id, project_id, subject, description,
-              due_date, category_id, status_id, assigned_to_id, priority_id, version_id, author_id,
-              done_ratio, estimated_hours, start_date, parent_id, schedule_manually, ignore_non_working_days)
+            INSERT INTO work_package_journals (#{shared_columns.join(', ')})
             VALUES #{wp_journal_values.join(",\n       ")}
             RETURNING id
           SQL
@@ -451,6 +489,17 @@ if input_data && input_data.respond_to?(:each)
 
     results << result
   end
+end
+
+# A custom field named in the payload that this instance does not have means
+# lost history, so it travels back as a diagnostics row rather than staying in
+# the Rails log. Prepended and tagged so Python can pull it out before it walks
+# the per-WP results; older Python readers skip it as a row with no wp_id.
+# ``missing_cf_names`` is assigned inside the ``input_data`` guard above. Ruby
+# creates the local at parse time either way, so an empty payload leaves it nil
+# rather than undefined — ``defined?`` alone would not save this.
+if !missing_cf_names.nil? && missing_cf_names.any?
+  results.unshift({ 'diagnostics' => true, 'missing_cf_names' => missing_cf_names })
 end
 
 # Output JSON result with dynamic markers (set by Python via $j2o_start_marker / $j2o_end_marker)

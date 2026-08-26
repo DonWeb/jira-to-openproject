@@ -148,10 +148,19 @@ if rails_ops && rails_ops.respond_to?(:each)
       schedule_manually: rec.schedule_manually, ignore_non_working_days: rec.ignore_non_working_days
     }
 
-    # Lookup J2O CF IDs for CF journal entries
-    workflow_cf = CustomField.find_by(name: "J2O Jira Workflow")
-    resolution_cf = CustomField.find_by(name: "J2O Jira Resolution")
-    j2o_cf_ids = [workflow_cf&.id, resolution_cf&.id].compact
+    # Custom field ids resolved from the names Python sent, matching
+    # ``create_work_package_journals_batch.rb``. This used to look up
+    # "J2O Jira Workflow" / "J2O Jira Resolution", which the ``work_packages``
+    # component creates and which therefore do not exist on an instance migrated
+    # through the default sequence — and then read the snapshot as if it were
+    # already keyed by id, so a name would have been inserted as
+    # ``custom_field_id = 0``. Both halves are name-based now.
+    requested_cf_names = ops.flat_map { |op|
+      snapshot = op['cf_state_snapshot'] || op[:cf_state_snapshot]
+      snapshot.is_a?(Hash) ? snapshot.keys.map(&:to_s) : []
+    }.uniq
+    cf_ids_by_name = requested_cf_names.any? ? CustomField.where(name: requested_cf_names).pluck(:name, :id).to_h : {}
+    j2o_cf_ids = cf_ids_by_name.values
 
     # Build priority name->ID cache for resolving string priority values
     priority_cache = {}
@@ -222,8 +231,18 @@ if rails_ops && rails_ops.respond_to?(:each)
         sanitized_state = current_state.dup
       end
 
-      # Get CF state snapshot
-      cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
+      # CF state snapshot, resolved from names to ids so the inserts below can
+      # keep treating it as {cf_id => value}.
+      raw_cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
+      cf_snapshot = nil
+      if raw_cf_snapshot.is_a?(Hash)
+        cf_snapshot = {}
+        raw_cf_snapshot.each do |cf_name, cf_value|
+          cf_id = cf_ids_by_name[cf_name.to_s]
+          next if cf_id.nil? || cf_value.nil?
+          cf_snapshot[cf_id] = cf_value
+        end
+      end
 
       if op_idx == 0
         # V1: will update existing journal

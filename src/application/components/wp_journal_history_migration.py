@@ -302,6 +302,7 @@ class WpJournalHistoryMigration(BaseMigration):
         skip_reasons: Counter[str] = Counter()
         wp_errors: list[str] = []
         no_history: list[int] = []
+        missing_cfs: set[str] = set()
 
         for i in range(0, len(records), self.BATCH_SIZE):
             batch = records[i : i + self.BATCH_SIZE]
@@ -378,6 +379,22 @@ class WpJournalHistoryMigration(BaseMigration):
             for row in results:
                 if not isinstance(row, dict):
                     continue
+                if row.get("diagnostics"):
+                    # Not a work package: the template's report of custom field
+                    # names it could not resolve. Warned about rather than
+                    # counted, because a missing custom field silently drops
+                    # that field's whole history — which is how the three
+                    # ``J2O …`` fields went unnoticed for the entire migration.
+                    missing = row.get("missing_cf_names") or []
+                    if missing:
+                        self.logger.warning(
+                            "Custom fields not found in OpenProject, their change"
+                            " history was not journaled: %s",
+                            ", ".join(str(name) for name in missing),
+                        )
+                        for name in missing:
+                            missing_cfs.add(str(name))
+                    continue
                 error = row.get("error")
                 if error:
                     totals["wp_failed"] += 1
@@ -405,6 +422,8 @@ class WpJournalHistoryMigration(BaseMigration):
             details["skipped"] = dict(skip_reasons)
         if wp_errors:
             details["wp_errors"] = wp_errors
+        if missing_cfs:
+            details["missing_custom_fields"] = sorted(missing_cfs)
 
         # Surface the rest of the reattribution counters only when they carry
         # information, so a clean run's details stay readable.
