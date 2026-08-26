@@ -57,6 +57,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method name, where escaping does not apply and only an allowlist works.
 
 ### Fixed
+- Attachment references in migrated comments resolve to the OpenProject API URL
+  again. `MarkdownConverter.convert` takes a `jira_key` and needs it to scope the
+  lookup, because the attachment mapping is keyed issue → filename → id; without
+  it `_convert_attachments` resolves nothing and falls back to `[file](file)`, a
+  relative link the browser resolves against the instance root. Reported on
+  ES-4218 / work package 1552: the activity tab linked
+  `https://<host>/76_renewable_free_end.html`, which 404s, while the Files tab
+  served the same attachment correctly from `/api/v3/attachments/413/content`.
+  A regression from moving comment creation into `wp_journal_history`, which did
+  not forward the key where `work_packages_content` did. All nine call sites in
+  `work_package_migration` now pass it — six were missing it — and the
+  description conversion in `_prepare_work_package` moved below the `jira_key`
+  binding, which had been declared two lines after the call that needed it.
 - Rebuilding a work package's journal chain no longer strands v1's previous
   payload row. Assigning a fresh `data` object inserts a new
   `work_package_journals` row and repoints `data_id`, leaving the old one

@@ -1088,7 +1088,9 @@ class WorkPackageMigration(BaseMigration):
                     # Convert Jira wiki markup to OpenProject markdown
                     if raw_body and hasattr(self, "markdown_converter") and self.markdown_converter:
                         try:
-                            journal_notes = self.markdown_converter.convert(raw_body)
+                            # Scopes the attachment lookup — see the comment in
+                            # ``_build_rails_ops_for_issue``.
+                            journal_notes = self.markdown_converter.convert(raw_body, jira_key=jira_key)
                         except Exception:
                             journal_notes = raw_body
                     else:
@@ -1104,9 +1106,9 @@ class WorkPackageMigration(BaseMigration):
                         # Convert field values through markdown converter (may contain user mentions)
                         if hasattr(self, "markdown_converter") and self.markdown_converter:
                             if from_val:
-                                from_val = self.markdown_converter.convert(str(from_val))
+                                from_val = self.markdown_converter.convert(str(from_val), jira_key=jira_key)
                             if to_val:
-                                to_val = self.markdown_converter.convert(str(to_val))
+                                to_val = self.markdown_converter.convert(str(to_val), jira_key=jira_key)
                         journal_notes += f"- {field}: {from_val} → {to_val}\n"
 
                 comment_body = journal_notes
@@ -1447,7 +1449,15 @@ class WorkPackageMigration(BaseMigration):
                     # invoke before using this builder.
                     if hasattr(self, "markdown_converter") and self.markdown_converter:
                         try:
-                            notes = self.markdown_converter.convert(raw_body)
+                            # ``jira_key`` is what scopes the attachment lookup:
+                            # the mapping is keyed issue → filename → OP id, so
+                            # without it ``_convert_attachments`` cannot resolve
+                            # anything and falls back to ``[file](file)``. That
+                            # relative link resolves against the instance root —
+                            # ``https://<host>/76_renewable_free_end.html`` — and
+                            # 404s, while the Files tab shows the same attachment
+                            # working, because it uses the real id.
+                            notes = self.markdown_converter.convert(raw_body, jira_key=jira_key)
                         except Exception:
                             notes = raw_body
                     else:
@@ -2408,12 +2418,15 @@ class WorkPackageMigration(BaseMigration):
         subject = jira_issue.fields.summary
         description = getattr(jira_issue.fields, "description", "") or ""
 
-        # Convert Jira wiki markup to OpenProject markdown
-        if description:
-            description = self.markdown_converter.convert(description)
-
         jira_id = jira_issue.id
         jira_key = jira_issue.key
+
+        # Convert Jira wiki markup to OpenProject markdown. Bound after
+        # ``jira_key`` on purpose: the conversion needs it to resolve attachment
+        # references, and it used to run two lines earlier where the name did not
+        # exist yet.
+        if description:
+            description = self.markdown_converter.convert(description, jira_key=jira_key)
 
         # Ensure subject is non-empty; fall back to Jira key if missing
         if not subject or not str(subject).strip():
@@ -2652,7 +2665,10 @@ class WorkPackageMigration(BaseMigration):
                         # Convert Jira wiki markup to OpenProject markdown
                         if raw_comment_body and hasattr(self, "markdown_converter") and self.markdown_converter:
                             try:
-                                comment_body = self.markdown_converter.convert(raw_comment_body)
+                                comment_body = self.markdown_converter.convert(
+                                    raw_comment_body,
+                                    jira_key=jira_key,
+                                )
                             except Exception:
                                 comment_body = raw_comment_body
                         else:
@@ -2725,9 +2741,15 @@ class WorkPackageMigration(BaseMigration):
                                 # Convert field values through markdown converter (may contain user mentions/emoticons)
                                 if hasattr(self, "markdown_converter") and self.markdown_converter:
                                     if from_val:
-                                        from_val = self.markdown_converter.convert(str(from_val))
+                                        from_val = self.markdown_converter.convert(
+                                            str(from_val),
+                                            jira_key=jira_key,
+                                        )
                                     if to_val:
-                                        to_val = self.markdown_converter.convert(str(to_val))
+                                        to_val = self.markdown_converter.convert(
+                                            str(to_val),
+                                            jira_key=jira_key,
+                                        )
 
                                 # Bug #21: Track Workflow/Resolution as CF field changes
                                 if field_name == "Workflow" and workflow_cf_id:
@@ -3177,7 +3199,7 @@ class WorkPackageMigration(BaseMigration):
 
             # Convert Jira wiki markup to OpenProject markdown
             if description:
-                description = self.markdown_converter.convert(description)
+                description = self.markdown_converter.convert(description, jira_key=jira_key)
 
             # Format the description to include the Jira key
             formatted_description = f"Jira Issue: {jira_key}\n\n{description}"
