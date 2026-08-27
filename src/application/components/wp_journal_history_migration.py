@@ -127,6 +127,10 @@ class WpJournalHistoryMigration(BaseMigration):
         builder.user_mapping = config.mappings.get_mapping("user") or {}
         builder.status_mapping = config.mappings.get_mapping("status") or {}
         builder.issue_type_mapping = config.mappings.get_mapping("issue_type") or {}
+        # Needed by ``_resolve_sprint_id``: a Sprint changelog entry becomes a
+        # native ``sprint_id`` change, and without this mapping it resolves to
+        # nothing and the sprint history is dropped.
+        builder.sprint_mapping = config.mappings.get_mapping("sprint") or {}
         builder.work_package_mapping = wp_map
         builder.attachment_mapping = self._load_attachment_mapping()
         # Rebuilds ``markdown_converter`` with the user/WP/attachment mappings;
@@ -134,10 +138,11 @@ class WpJournalHistoryMigration(BaseMigration):
         builder._update_markdown_converter_mappings()
 
         self.logger.info(
-            "Journal builder mappings: users=%d statuses=%d issue_types=%d attachments=%d",
+            "Journal builder mappings: users=%d statuses=%d issue_types=%d sprints=%d attachments=%d",
             len(builder.user_mapping),
             len(builder.status_mapping),
             len(builder.issue_type_mapping),
+            len(builder.sprint_mapping),
             len(builder.attachment_mapping),
         )
         self._builder = builder

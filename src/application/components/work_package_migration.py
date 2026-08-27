@@ -158,6 +158,11 @@ class WorkPackageMigration(BaseMigration):
         },
     )
 
+    # Lowercased companion, because Jira is not consistent about the case of a
+    # changelog field name ("Attachment" but "labels", "Sprint" but "timespent")
+    # and the set above was written by hand against whatever each report showed.
+    _IGNORED_CHANGELOG_FIELDS_LOWER = frozenset(name.lower() for name in IGNORED_CHANGELOG_FIELDS)
+
     # Jira changelog field (lowercased) -> OpenProject custom field *name*.
     #
     # These are the changes with no native column to land in, so they become
@@ -170,8 +175,28 @@ class WorkPackageMigration(BaseMigration):
     # (``custom_fields``, ``resolutions``, ``labels``, …). A name with no custom
     # field behind it is not a silent no-op any more, but it is still lost
     # history, so keep the two in sync.
+    #
+    # Verified against the instance's inventory on 2026-08-26 (``cf_missing: []``):
+    # Resolution 58, Labels 59, Rank 46, Bugs 63, Story Points 48.
+    #
+    # ``Story Points`` goes here rather than to the native ``story_points``
+    # column even though OpenProject 17.6 has one: ``story_points_migration``
+    # writes the custom field, so that is where the value a reader sees on the
+    # work package actually lives. Journaling the native column instead would
+    # show changes to a field the form does not display.
+    #
+    # Precedence, and it matters: ``jira_to_op_field`` (native column) wins over
+    # this map, which wins over :attr:`IGNORED_CHANGELOG_FIELDS` — the ignore
+    # list only ever gates the note fallback. So ``Rank`` and ``Global Rank``
+    # appearing in both is not a contradiction: they become custom field changes,
+    # and the ignore list never gets asked about them.
     JIRA_FIELD_TO_OP_CF_NAME: dict[str, str] = {
         "resolution": "Resolution",
+        "labels": "Labels",
+        "rank": "Rank",
+        "global rank": "Rank",
+        "bugs": "Bugs",
+        "story points": "Story Points",
     }
 
     # Default OpenProject role ID for mentioned users (Member role)
@@ -210,6 +235,8 @@ class WorkPackageMigration(BaseMigration):
         self.project_mapping: dict[str, Any] = {}
         self.user_mapping: dict[str, Any] = {}
         self.issue_type_mapping: dict[str, Any] = {}
+        # Populated by callers that rebuild journals; see ``_resolve_sprint_id``.
+        self.sprint_mapping: dict[str, Any] = {}
         self.status_mapping: dict[str, Any] = {}
 
         # Track mentioned users per project for membership assignment
@@ -1289,6 +1316,51 @@ class WorkPackageMigration(BaseMigration):
         except Exception as e:
             self.logger.warning(f"Failed to update existing work package {existing_wp.get('jira_key')}: {e}")
 
+    def _resolve_sprint_id(self, raw_ids: str | None, raw_names: str | None) -> int | None:
+        """Resolve a Jira Sprint changelog value to an OpenProject sprint id.
+
+        A Sprint changelog item carries the sprint *ids* in ``from``/``to`` and
+        the *names* in ``fromString``/``toString``, comma-separated when the
+        issue sat in more than one sprint at once. ``work_packages.sprint_id`` is
+        a scalar foreign key, so only one can survive — the last one listed wins,
+        which is the sprint the issue ended up in.
+
+        ``sprint_mapping`` is indexed both ways (on this instance 259 ids plus
+        the same 259 names), so ids are tried first and names are the fallback
+        for the rows where Jira reported no id.
+
+        Returns:
+            The OpenProject sprint id, or ``None`` when nothing resolves — which
+            callers read as "no change to record" rather than "cleared".
+
+        """
+        # ``getattr`` rather than direct access: tests construct this class via
+        # ``__new__`` to skip ``__init__``, the same reason the caller guards
+        # ``markdown_converter`` with ``hasattr``.
+        sprint_mapping = getattr(self, "sprint_mapping", None)
+        if not sprint_mapping:
+            return None
+
+        for raw in (raw_ids, raw_names):
+            if not raw:
+                continue
+            candidates = [part.strip() for part in str(raw).split(",") if part and part.strip()]
+            for candidate in reversed(candidates):
+                entry = sprint_mapping.get(candidate)
+                if not isinstance(entry, dict):
+                    continue
+                # ``openproject_sprint_id`` is the native Sprint written by
+                # ``SprintMigration``; ``openproject_id`` is the legacy Version,
+                # which is not what ``sprint_id`` points at.
+                native_id = entry.get("openproject_sprint_id")
+                try:
+                    resolved = int(native_id) if native_id else 0
+                except (TypeError, ValueError):
+                    resolved = 0
+                if resolved > 0:
+                    return resolved
+        return None
+
     def _build_rails_ops_for_issue(
         self,
         jira_issue: Issue,
@@ -1425,7 +1497,13 @@ class WorkPackageMigration(BaseMigration):
                 "Component": "category_id",
                 "component": "category_id",
                 "duedate": "due_date",
-                "Story Points": "story_points",
+                # OpenProject 17.6 journals the sprint natively
+                # (``work_package_journals.sprint_id``, confirmed by probe) and
+                # ``sprint_epic`` writes ``work_packages.sprint_id``, so a sprint
+                # change belongs in the snapshot rather than in a custom field.
+                # ``Story Points`` deliberately does *not* live here — see
+                # ``JIRA_FIELD_TO_OP_CF_NAME``.
+                "sprint": "sprint_id",
             }
 
             # Progressive custom field state, keyed by OpenProject custom field
@@ -1539,6 +1617,17 @@ class WorkPackageMigration(BaseMigration):
                                     if mapped_to:
                                         field_changes[op_field] = [mapped_from, mapped_to]
                                         field_mapped = True
+                                elif op_field == "sprint_id":
+                                    mapped_from = self._resolve_sprint_id(from_val, from_str)
+                                    mapped_to = self._resolve_sprint_id(to_val, to_str)
+                                    if mapped_from == mapped_to:
+                                        # Nothing resolved, or the issue moved
+                                        # between two Jira sprints that map to
+                                        # the same OpenProject one. Either way a
+                                        # journal here would show no change.
+                                        continue
+                                    field_changes[op_field] = [mapped_from, mapped_to]
+                                    field_mapped = True
                                 elif op_field == "assigned_to_id":
                                     # Map user names to IDs
                                     mapped_to = (
@@ -1597,8 +1686,30 @@ class WorkPackageMigration(BaseMigration):
                             # a comment on top of the change.
                             field_mapped = True
 
-                        # Build human-readable notes ONLY for unmapped fields (not already in field_changes)
-                        if not field_mapped and jira_field:
+                        # Notes are the last resort: only for a field that got
+                        # neither a native column nor a custom field, and that no
+                        # other component already owns.
+                        #
+                        # ``IGNORED_CHANGELOG_FIELDS`` is applied *here*, after
+                        # the mapping, not before it. Filtering earlier would also
+                        # drop ``duedate`` — which is in the ignore list and in
+                        # ``jira_to_op_field`` — and lose a real due-date change.
+                        #
+                        # Until this gate existed the list had exactly one
+                        # reference in the module, at the ``work_packages``
+                        # component that is in neither DEFAULT_COMPONENT_SEQUENCE
+                        # nor the ``full`` profile, so it never ran. That is why
+                        # 1844 of the instance's 7557 work package journals —
+                        # 24.4%, measured 2026-08-26 — were changelog lines
+                        # rendered as comments: Link 90, RemoteIssueLink 326,
+                        # WorklogId and timespent 48 (they share a journal, Jira
+                        # emits both for one worklog edit), and the rest now
+                        # covered by a real change above.
+                        if (
+                            not field_mapped
+                            and jira_field
+                            and jira_field.lower() not in self._IGNORED_CHANGELOG_FIELDS_LOWER
+                        ):
                             notes_lines.append(f"**{jira_field}**: {from_str or '(none)'} → {to_str or '(none)'}")
 
                     notes = "\n".join(notes_lines) if notes_lines else ""
