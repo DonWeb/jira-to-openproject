@@ -332,11 +332,26 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
         #
         # ``openproject_sprint_id`` (native Sprint, written by
         # ``SprintMigration``) wins over ``openproject_id`` (the legacy
-        # Version). Both are scalar foreign keys on the work package, so
-        # an issue that belonged to several Jira sprints still keeps only
-        # the first that resolves — the complete list lives in the
-        # "Sprint" custom field below, and native sprints do not change
-        # that: ``work_packages.sprint_id`` is single-valued too.
+        # Version). Both are scalar foreign keys on the work package, so an
+        # issue that belonged to several Jira sprints keeps only one — the
+        # complete list lives in the "Sprint" custom field below, and native
+        # sprints do not change that: ``work_packages.sprint_id`` is
+        # single-valued too.
+        #
+        # The one it keeps is the **last** that resolves, not the first. Jira's
+        # Sprint field lists every sprint an issue passed through in the order it
+        # joined them, so the first is the oldest and the last is the one it
+        # ended in — which is what "what sprint is this in" means.
+        #
+        # Taking the first was assigning each issue to the sprint it *started*
+        # in, and it stayed invisible until the journal chain began carrying
+        # ``sprint_id`` (see ``_build_rails_ops_for_issue._resolve_sprint_id``,
+        # which walks the same list from the other end). Measured against the
+        # live instance on 2026-08-28: 25 work packages whose newest journal
+        # disagreed with the work package row, 23 of them off by exactly one
+        # sprint — Sprint v0.0.260 on the work package against v0.0.261 in its
+        # own history. Left alone, each of those renders a "Sprint changed"
+        # that never happened on the next native save.
         sprint_mapping = config.mappings.get_mapping("sprint") or {}
         sprint_updates: list[dict[str, Any]] = []
         native_assignments = 0
@@ -349,7 +364,7 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
                 item.strip() for item in str(text or "").split(",") if item and isinstance(item, str) and item.strip()
             ]
             mapped_entry = None
-            for candidate in sprint_names:
+            for candidate in reversed(sprint_names):
                 mapped_entry = sprint_mapping.get(candidate) or sprint_mapping.get(str(candidate))
                 if mapped_entry:
                     break

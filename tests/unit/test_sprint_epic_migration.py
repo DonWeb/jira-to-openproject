@@ -182,3 +182,76 @@ def test_coerce_sprint_names_extracts_name_from_greenhopper_tostring():
 
 def test_coerce_sprint_names_passes_through_clean_string_unchanged():
     assert SprintEpicMigration._coerce_sprint_names("Sprint 5") == ["Sprint 5"]
+
+
+def test_the_last_sprint_wins_not_the_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Jira lists every sprint an issue passed through, in join order.
+
+    So the first is the oldest and the last is the one it ended in, which is what
+    ``work_packages.sprint_id`` has to say. Taking the first assigned each issue
+    to the sprint it *started* in.
+
+    It stayed invisible until the journal chain began carrying ``sprint_id``:
+    ``_build_rails_ops_for_issue._resolve_sprint_id`` walks the same list from the
+    other end, and measured against the live instance on 2026-08-28 the two
+    disagreed on 25 work packages — 23 of them off by exactly one sprint. Each
+    would render a "Sprint changed" that never happened on the next native save.
+    """
+    _sprint_mapping_fixture(
+        monkeypatch,
+        {
+            "Sprint A": {"openproject_id": 800, "openproject_sprint_id": 901, "project_id": 11},
+            "Sprint B": {"openproject_id": 801, "openproject_sprint_id": 902, "project_id": 11},
+        },
+    )
+    op = DummyOp()
+    mig = SprintEpicMigration(jira_client=DummyJira(), op_client=op)  # type: ignore[arg-type]
+
+    mig._load(mig._map(mig._extract()))
+
+    by_wp = {u["id"]: u["sprint_id"] for u in op.updates if "sprint_id" in u}
+    # EPIC-1 only ever sat in Sprint A.
+    assert by_wp[12000] == 901
+    # PRJ-1 went A -> B, so it belongs to B.
+    assert by_wp[12001] == 902
+
+
+def test_falls_back_to_an_earlier_sprint_when_the_last_is_unmapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sprint whose board never resolved to a project is not in the mapping.
+
+    Walking backwards has to keep going rather than give up, or the issue loses
+    its sprint entirely.
+    """
+    _sprint_mapping_fixture(
+        monkeypatch,
+        {"Sprint A": {"openproject_id": 800, "openproject_sprint_id": 901, "project_id": 11}},
+    )
+    op = DummyOp()
+    mig = SprintEpicMigration(jira_client=DummyJira(), op_client=op)  # type: ignore[arg-type]
+
+    mig._load(mig._map(mig._extract()))
+
+    by_wp = {u["id"]: u["sprint_id"] for u in op.updates if "sprint_id" in u}
+    assert by_wp[12001] == 901
+
+
+def test_both_ends_of_the_pipeline_pick_the_same_sprint() -> None:
+    """``sprint_epic`` and the journal rebuild must agree, or the newest journal
+    disagrees with the work package it describes.
+
+    They read the same comma-separated list from opposite code paths, so the
+    direction has to match in both.
+    """
+    import inspect
+
+    from src.application.components.sprint_epic_migration import SprintEpicMigration as SEM
+    from src.application.components.work_package_migration import WorkPackageMigration
+
+    assert "for candidate in reversed(sprint_names)" in inspect.getsource(SEM._load)
+    assert "for candidate in reversed(candidates)" in inspect.getsource(
+        WorkPackageMigration._resolve_sprint_id,
+    )
