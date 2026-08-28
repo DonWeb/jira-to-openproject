@@ -1059,3 +1059,155 @@ def test_template_applies_a_clear_only_when_it_was_declared(template: str) -> No
     assert "current_state[field_sym] = nil" in text
     # The blanket skips this replaced.
     assert "next if new_value.nil?\n" not in text
+
+
+# --------------------------------------------------------------------------
+# C9 — Component and Fix Version were writing Jira ids into OpenProject FKs
+#
+# Both fell through to the generic ID branch, which put ``from``/``to`` — Jira's
+# own component and version ids — straight into ``category_id`` / ``version_id``.
+# Those are foreign keys into OpenProject's own tables, so the journal pointed at
+# whatever row happened to share that number, or at nothing.
+#
+# Python cannot resolve them: the lookup is scoped to a project. category_mapping.json
+# has the right shape (project id -> name -> id) but nothing reads it, and versions
+# builds its map in memory and never persists it. So names travel and Ruby resolves.
+# --------------------------------------------------------------------------
+
+
+def _named_item(field: str, *, from_id: str = "", to_id: str = "",
+                from_name: str = "", to_name: str = "") -> dict[str, object]:
+    """A component/version item: from/to carry Jira's ids, *String the names."""
+    return {
+        "field": field,
+        "fieldId": "",
+        "from": from_id or None,
+        "fromString": from_name,
+        "to": to_id or None,
+        "toString": to_name,
+    }
+
+
+@pytest.mark.parametrize(
+    ("jira_field", "op_field"),
+    [
+        ("Component", "category_id"),
+        ("component", "category_id"),
+        ("Fix Version", "version_id"),
+        ("fixVersion", "version_id"),
+    ],
+)
+def test_component_and_fix_version_travel_as_names(
+    component: WorkPackageMigration,
+    jira_field: str,
+    op_field: str,
+) -> None:
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T17:03:16.000-0300",
+            [_named_item(jira_field, from_id="10021", to_id="10022",
+                         from_name="Backend", to_name="Frontend")],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"][op_field] == ["Backend", "Frontend"]
+
+
+@pytest.mark.parametrize(
+    ("jira_field", "op_field"),
+    [("Component", "category_id"), ("Fix Version", "version_id")],
+)
+def test_jira_ids_never_reach_the_foreign_key(
+    component: WorkPackageMigration,
+    jira_field: str,
+    op_field: str,
+) -> None:
+    """The regression this fixes: 10021/10022 are Jira ids, not OpenProject ids."""
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T17:03:16.000-0300",
+            [_named_item(jira_field, from_id="10021", to_id="10022",
+                         from_name="Backend", to_name="Frontend")],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert "10021" not in ops[0]["field_changes"][op_field]
+    assert "10022" not in ops[0]["field_changes"][op_field]
+
+
+def test_an_item_with_no_names_records_nothing(
+    component: WorkPackageMigration,
+) -> None:
+    """Ids alone are unusable, so there is nothing to send."""
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T17:03:16.000-0300", [_named_item("Component", from_id="10021", to_id="10022")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert all("field_changes" not in op for op in ops)
+    assert all(op["notes"] == "" for op in ops)
+
+
+@pytest.mark.parametrize(
+    ("jira_field", "op_field"),
+    [("Component", "category_id"), ("Fix Version", "version_id")],
+)
+def test_removing_the_component_or_version_is_a_clear(
+    component: WorkPackageMigration,
+    jira_field: str,
+    op_field: str,
+) -> None:
+    """Both columns are nullable, so N4 can represent the removal."""
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T17:03:16.000-0300", [_named_item(jira_field, from_name="Backend")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"][op_field] == ["Backend", ""]
+    assert ops[0]["field_clears"] == [op_field]
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["create_work_package_journals_batch.rb", "create_work_package_journals.rb"],
+)
+def test_templates_resolve_the_names_scoped_to_the_project(template: str) -> None:
+    """A category or version name is only unique within its project."""
+    text = _template(template)
+
+    assert "resolve_scoped_name" in text
+    assert "WHERE project_id = #{project_id.to_i}" in text
+    assert "table = field_sym == :category_id ? 'categories' : 'versions'" in text
+    # Skipped, not written: a bogus foreign key is worse than a missing change.
+    assert "next if resolved.nil?" in text or "unresolved_scoped_names += 1" in text
+
+
+def test_batch_template_reports_the_names_it_could_not_resolve() -> None:
+    """Silence is how the three J2O custom fields went unnoticed for a whole migration."""
+    text = _template("create_work_package_journals_batch.rb")
+
+    assert "unresolved_scoped_names += 1" in text
+    assert "diagnostics['unresolved_scoped_names']" in text
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["create_work_package_journals_batch.rb", "create_work_package_journals.rb"],
+)
+def test_multivalue_names_fall_back_to_the_last_segment(template: str) -> None:
+    """A Jira issue can hold several components or fix versions; the column cannot.
+
+    Whole string first so a name containing a comma still resolves, then the last
+    segment — same "last one wins" as ``sprint_id``, and for the same reason.
+    """
+    text = _template(template)
+
+    assert "text.split(',').map(&:strip).reject(&:empty?).last" in text
+    # Whole-string lookup comes first.
+    assert text.index("found = by_name[text.downcase]") < text.index("text.split(',')")

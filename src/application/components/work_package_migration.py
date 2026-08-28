@@ -1768,6 +1768,31 @@ class WorkPackageMigration(BaseMigration):
                                     # Priority uses string names that Ruby will resolve
                                     field_changes[op_field] = [from_str, to_str]
                                     field_mapped = True
+                                elif op_field in ("category_id", "version_id"):
+                                    # Names, not ids — and the Ruby side resolves
+                                    # them against the work package's project.
+                                    #
+                                    # These two used to fall through to the
+                                    # generic branch below, which put Jira's own
+                                    # component and version ids into
+                                    # ``category_id`` / ``version_id``. Those are
+                                    # foreign keys into OpenProject's
+                                    # ``categories`` and ``versions``, so the
+                                    # journal pointed at whatever row happened to
+                                    # share that number — a category from another
+                                    # project, or nothing at all.
+                                    #
+                                    # Python cannot do the lookup: it is scoped to
+                                    # a project, and the two on-disk maps are no
+                                    # help. ``category_mapping.json`` has the
+                                    # right shape (project id → name → id) but
+                                    # nothing in the codebase reads it, and
+                                    # ``versions`` never persisted a map at all —
+                                    # it builds one in memory and drops it.
+                                    if not from_str and not to_str:
+                                        continue
+                                    field_changes[op_field] = [from_str, to_str]
+                                    field_mapped = True
                                 else:
                                     # Generic ID field
                                     field_changes[op_field] = [from_val, to_val]

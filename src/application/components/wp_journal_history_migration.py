@@ -414,6 +414,18 @@ class WpJournalHistoryMigration(BaseMigration):
                         )
                         for name in missing:
                             missing_cfs.add(str(name))
+                    # Component / Fix Version names the target project does not
+                    # have. The field is left at its previous value rather than
+                    # pointed at an unrelated row, so the activity shows no
+                    # change — worth knowing about, not worth failing over.
+                    unresolved = row.get("unresolved_scoped_names")
+                    if isinstance(unresolved, int) and unresolved:
+                        self.logger.warning(
+                            "%d component/version name(s) did not resolve in their"
+                            " project; those changes were skipped",
+                            unresolved,
+                        )
+                        totals["unresolved_scoped_names"] += unresolved
                     continue
                 error = row.get("error")
                 if error:
@@ -444,6 +456,8 @@ class WpJournalHistoryMigration(BaseMigration):
             details["wp_errors"] = wp_errors
         if missing_cfs:
             details["missing_custom_fields"] = sorted(missing_cfs)
+        if totals.get("unresolved_scoped_names"):
+            details["unresolved_scoped_names"] = totals["unresolved_scoped_names"]
 
         # Surface the rest of the reattribution counters only when they carry
         # information, so a clean run's details stay readable.

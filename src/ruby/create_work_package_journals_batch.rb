@@ -99,6 +99,43 @@ if input_data && input_data.respond_to?(:each)
   shared_columns = journal_columns & WorkPackage.column_names
   valid_journal_attributes = shared_columns.map(&:to_sym).freeze
 
+  # Name -> id caches for the two foreign keys that are scoped to a project,
+  # filled lazily per project because one batch can span several.
+  #
+  # Python sends ``category_id`` and ``version_id`` as *names*. It used to send
+  # Jira's own component and version ids straight through, and those are foreign
+  # keys into OpenProject's ``categories`` and ``versions`` — so the journal ended
+  # up pointing at whatever OpenProject row happened to share that number, or at
+  # nothing. The name is the only part of a Jira changelog item that means the
+  # same thing on both sides, and resolving it needs the work package's project,
+  # which is why it happens here and not in Python.
+  #
+  # Queried through ``conn`` rather than through ``Category`` / ``Version`` so the
+  # template does not depend on those constants existing.
+  scoped_name_caches = { 'categories' => {}, 'versions' => {} }
+  unresolved_scoped_names = 0
+
+  resolve_scoped_name = lambda do |table, project_id, value|
+    return nil if project_id.nil? || value.nil?
+    text = value.to_s.strip
+    return nil if text.empty?
+    cache = scoped_name_caches[table]
+    cache[project_id] ||= conn.select_rows(
+      "SELECT LOWER(name), id FROM #{table} WHERE project_id = #{project_id.to_i}",
+    ).map { |name, id| [name.to_s, id.to_i] }.to_h
+    # Whole string first, so a name that legitimately contains a comma still
+    # resolves. Failing that, the last comma-separated segment: a Jira issue can
+    # carry several components or fix versions at once and reports them as a
+    # list, while ``category_id`` and ``version_id`` are scalar foreign keys —
+    # same constraint, and same "last one wins", as ``sprint_id``.
+    by_name = cache[project_id]
+    found = by_name[text.downcase]
+    return found if found
+    return nil unless text.include?(',')
+    last = text.split(',').map(&:strip).reject(&:empty?).last
+    last ? by_name[last.downcase] : nil
+  end
+
   # Lambda: Apply field_changes to state hash
   apply_field_changes_to_state = lambda do |current_state, field_changes, priority_cache, rec, field_clears|
     return current_state unless field_changes && field_changes.is_a?(Hash)
@@ -125,6 +162,23 @@ if input_data && input_data.respond_to?(:each)
       if field_sym == :priority_id && new_value.is_a?(String) && !(new_value =~ /^\d+$/)
         resolved = priority_cache[new_value.downcase]
         new_value = resolved if resolved
+      end
+
+      # category_id and version_id arrive as names, scoped to the project.
+      #
+      # An unresolvable name is skipped rather than written: the alternative is a
+      # foreign key pointing at a row that has nothing to do with this issue,
+      # which is what the old code did with Jira's raw ids. Skipping leaves the
+      # previous value in place, so the activity shows no change instead of a
+      # wrong one — and the count comes back so it is not silent.
+      if field_sym == :category_id || field_sym == :version_id
+        table = field_sym == :category_id ? 'categories' : 'versions'
+        resolved = resolve_scoped_name.call(table, rec.project_id, new_value)
+        if resolved.nil?
+          unresolved_scoped_names += 1
+          next
+        end
+        new_value = resolved
       end
 
       next unless new_value.is_a?(Integer) || new_value.is_a?(String) ||
@@ -617,9 +671,12 @@ end
 # ``missing_cf_names`` is assigned inside the ``input_data`` guard above. Ruby
 # creates the local at parse time either way, so an empty payload leaves it nil
 # rather than undefined — ``defined?`` alone would not save this.
-if !missing_cf_names.nil? && missing_cf_names.any?
-  results.unshift({ 'diagnostics' => true, 'missing_cf_names' => missing_cf_names })
+diagnostics = {}
+diagnostics['missing_cf_names'] = missing_cf_names if !missing_cf_names.nil? && missing_cf_names.any?
+if !unresolved_scoped_names.nil? && unresolved_scoped_names > 0
+  diagnostics['unresolved_scoped_names'] = unresolved_scoped_names
 end
+results.unshift({ 'diagnostics' => true }.merge(diagnostics)) if diagnostics.any?
 
 # Output JSON result with dynamic markers (set by Python via $j2o_start_marker / $j2o_end_marker)
 start_marker = defined?($j2o_start_marker) && $j2o_start_marker ? $j2o_start_marker : "JSON_OUTPUT_START"

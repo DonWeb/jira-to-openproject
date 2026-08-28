@@ -65,6 +65,28 @@ if rails_ops && rails_ops.respond_to?(:each)
     ].freeze
 
     # Lambda: Apply field_changes to state hash
+    # Same project-scoped name resolution as the batch template: Python sends
+    # ``category_id`` / ``version_id`` as names, because Jira's own component and
+    # version ids are meaningless as OpenProject foreign keys.
+    scoped_name_caches = { 'categories' => {}, 'versions' => {} }
+    resolve_scoped_name = lambda do |table, project_id, value|
+      return nil if project_id.nil? || value.nil?
+      text = value.to_s.strip
+      return nil if text.empty?
+      cache = scoped_name_caches[table]
+      cache[project_id] ||= conn.select_rows(
+        "SELECT LOWER(name), id FROM #{table} WHERE project_id = #{project_id.to_i}",
+      ).map { |name, id| [name.to_s, id.to_i] }.to_h
+      # Whole string first, then the last comma-separated segment — a Jira issue
+      # can hold several components or fix versions while the column is scalar.
+      by_name = cache[project_id]
+      found = by_name[text.downcase]
+      return found if found
+      return nil unless text.include?(',')
+      last = text.split(',').map(&:strip).reject(&:empty?).last
+      last ? by_name[last.downcase] : nil
+    end
+
     apply_field_changes_to_state = lambda do |current_state, field_changes, field_clears|
       return current_state unless field_changes && field_changes.is_a?(Hash)
       clears = Array(field_clears).map(&:to_sym)
@@ -84,6 +106,15 @@ if rails_ops && rails_ops.respond_to?(:each)
           current_state[field_sym] = nil
           next
         end
+        # Unresolvable name: skip rather than write a foreign key that points at
+        # an unrelated row.
+        if field_sym == :category_id || field_sym == :version_id
+          table = field_sym == :category_id ? 'categories' : 'versions'
+          resolved = resolve_scoped_name.call(table, rec.project_id, new_value)
+          next if resolved.nil?
+          new_value = resolved
+        end
+
         next unless new_value.is_a?(Integer) || new_value.is_a?(String) ||
                     new_value.is_a?(TrueClass) || new_value.is_a?(FalseClass) ||
                     new_value.is_a?(Float) || new_value.is_a?(Date) ||
