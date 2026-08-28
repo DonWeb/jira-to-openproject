@@ -204,6 +204,30 @@ class WorkPackageMigration(BaseMigration):
         "story points": "Story Points",
     }
 
+    # Journal columns where "Jira emptied this field" is a state OpenProject can
+    # actually hold, so a change to nothing is worth recording.
+    #
+    # The ones deliberately absent are NOT NULL: ``subject``, ``author_id``,
+    # ``priority_id``, ``status_id``, ``type_id``, ``project_id``. Asking to clear
+    # one of those would fail the insert, and in the normal path nothing puts the
+    # value back — ``ensure_required_fields`` only runs for the pre-built
+    # ``state_snapshot`` branch.
+    _CLEARABLE_JOURNAL_FIELDS = frozenset(
+        {
+            "assigned_to_id",
+            "responsible_id",
+            "sprint_id",
+            "version_id",
+            "category_id",
+            "parent_id",
+            "due_date",
+            "start_date",
+            "description",
+            "estimated_hours",
+            "remaining_hours",
+        },
+    )
+
     # Default OpenProject role ID for mentioned users (Member role)
     _DEFAULT_MENTION_ROLE_ID = 4
 
@@ -1321,6 +1345,48 @@ class WorkPackageMigration(BaseMigration):
         except Exception as e:
             self.logger.warning(f"Failed to update existing work package {existing_wp.get('jira_key')}: {e}")
 
+    def _resolve_changelog_user_id(self, raw_id: str | None, raw_display: str | None) -> int | None:
+        """Resolve a Jira changelog user value to an OpenProject user id.
+
+        A changelog item carries the *username* (Jira Server/DC) or account id
+        (Cloud) in ``from``/``to``, and the *display name* in
+        ``fromString``/``toString``. This used to read only the display names,
+        which resolved nothing: ``user_mapping.json`` is keyed by Jira user key
+        (``JIRAUSER10800``) plus, on this instance, 14 login-style keys — display
+        names appear in neither. Every assignee change came out ``[None, None]``,
+        the Ruby side skipped the nil, and because the field counted as mapped it
+        did not even leave a note. The change simply vanished.
+
+        Resolution still depends on :meth:`_augment_user_mapping_indices` having
+        run, which is what adds the secondary indices on username, display name
+        and email. ``IssueTransformer.process_changelog_item`` has read the right
+        fields since BUG #20; this brings the rebuild path in line.
+
+        Returns:
+            The OpenProject user id, or ``None`` when nothing resolves. Callers
+            must not read that as "unassigned" — see
+            :attr:`_CLEARABLE_JOURNAL_FIELDS` for how a real clear is signalled.
+
+        """
+        user_mapping = getattr(self, "user_mapping", None)
+        if not user_mapping:
+            return None
+
+        for candidate in (raw_id, raw_display):
+            if not candidate:
+                continue
+            entry = user_mapping.get(str(candidate).strip())
+            if not isinstance(entry, dict):
+                continue
+            op_id = entry.get("openproject_id")
+            try:
+                resolved = int(op_id) if op_id else 0
+            except (TypeError, ValueError):
+                resolved = 0
+            if resolved > 0:
+                return resolved
+        return None
+
     def _resolve_sprint_id(self, raw_ids: str | None, raw_names: str | None) -> int | None:
         """Resolve a Jira Sprint changelog value to an OpenProject sprint id.
 
@@ -1558,20 +1624,36 @@ class WorkPackageMigration(BaseMigration):
                 entry_ts = entry.get("timestamp", "")
                 validity_start, validity_end = validity_periods[i]
 
-                # Get author and map to OP user_id
+                # Get author and map to OP user_id.
+                #
+                # Probes every key the mapping is indexed under, not just
+                # ``name``. ``user_mapping.json`` is keyed by Jira user key
+                # (``JIRAUSER10800``), so a changelog author only reachable by
+                # key resolved to nobody and the whole journal was attributed to
+                # the work package's author.
                 author_info = entry_data.get("author") or {}
-                author_name = author_info.get("name")
-                user_dict = self.user_mapping.get(author_name) if author_name else None
-                # Emit 0 (not a hardcoded builtin id) when the Jira author does
-                # not resolve. ``1`` used to be sent here, which is
-                # ``SystemUser`` on this instance and not stable across
-                # installs. 0 makes the Ruby side's ``raw_user_id > 0`` check
-                # fall through to its own chain: the work package's author
-                # first, then a real admin resolved from the DB.
-                user_id = (user_dict.get("openproject_id") if user_dict else None) or 0
+                user_id = 0
+                for probe_key in self._JOURNAL_AUTHOR_PROBE_KEYS:
+                    candidate = author_info.get(probe_key)
+                    if not candidate:
+                        continue
+                    user_dict = self.user_mapping.get(str(candidate).strip()) if self.user_mapping else None
+                    resolved = user_dict.get("openproject_id") if isinstance(user_dict, dict) else None
+                    if resolved:
+                        user_id = int(resolved)
+                        break
+                # 0 rather than a hardcoded builtin id when nothing resolves.
+                # ``1`` used to be sent here, which is ``SystemUser`` on this
+                # instance and not stable across installs. 0 makes the Ruby
+                # side's ``raw_user_id > 0`` check fall through to its own chain:
+                # the work package's author first, then a real admin from the DB.
 
                 # Build field_changes for changelog entries (mapped to OP field names)
                 field_changes: dict[str, Any] = {}
+                # Subset of ``field_changes`` whose nil is a real clear rather
+                # than a value we could not resolve. Per journal, like
+                # ``field_changes`` itself.
+                field_clears: set[str] = set()
                 notes = ""
 
                 if entry_type == JournalEntryType.COMMENT:
@@ -1666,31 +1748,20 @@ class WorkPackageMigration(BaseMigration):
                                         continue
                                     field_changes[op_field] = [mapped_from, mapped_to]
                                     field_mapped = True
-                                elif op_field == "assigned_to_id":
-                                    # Map user names to IDs
-                                    mapped_to = (
-                                        self.user_mapping.get(to_str, {}).get("openproject_id")
-                                        if self.user_mapping and to_str
-                                        else None
-                                    )
-                                    mapped_from = (
-                                        self.user_mapping.get(from_str, {}).get("openproject_id")
-                                        if self.user_mapping and from_str
-                                        else None
-                                    )
-                                    field_changes[op_field] = [mapped_from, mapped_to]
-                                    field_mapped = True
-                                elif op_field == "author_id":
-                                    mapped_to = (
-                                        self.user_mapping.get(to_str, {}).get("openproject_id")
-                                        if self.user_mapping and to_str
-                                        else None
-                                    )
-                                    mapped_from = (
-                                        self.user_mapping.get(from_str, {}).get("openproject_id")
-                                        if self.user_mapping and from_str
-                                        else None
-                                    )
+                                elif op_field in ("assigned_to_id", "author_id"):
+                                    # One branch for both: they were identical
+                                    # copies, and both read the display name
+                                    # instead of the username. See
+                                    # ``_resolve_changelog_user_id`` for why that
+                                    # resolved nothing.
+                                    mapped_from = self._resolve_changelog_user_id(from_val, from_str)
+                                    mapped_to = self._resolve_changelog_user_id(to_val, to_str)
+                                    if mapped_from == mapped_to:
+                                        # Neither side resolved, or both resolve
+                                        # to the same OpenProject user (two Jira
+                                        # accounts merged into one). A journal
+                                        # here would render nothing.
+                                        continue
                                     field_changes[op_field] = [mapped_from, mapped_to]
                                     field_mapped = True
                                 elif op_field == "priority_id" and to_str:
@@ -1705,6 +1776,27 @@ class WorkPackageMigration(BaseMigration):
                                 # Non-ID fields use string values
                                 field_changes[op_field] = [from_str, to_str]
                                 field_mapped = True
+
+                            # Tell the Ruby side that this nil is deliberate.
+                            #
+                            # A nil in ``field_changes`` is ambiguous: either
+                            # Python could not resolve the new value, or Jira
+                            # emptied the field. The template skips nils, which is
+                            # right for the first case and wrong for the second —
+                            # so an unassignment, a removal from a sprint or a
+                            # deleted due date left the old value in place and
+                            # rendered no change at all.
+                            #
+                            # Jira reporting both halves of the new value as empty
+                            # is the signal. Restricted to the columns that can
+                            # hold NULL; see ``_CLEARABLE_JOURNAL_FIELDS``.
+                            if (
+                                field_mapped
+                                and op_field in self._CLEARABLE_JOURNAL_FIELDS
+                                and not to_val
+                                and not to_str
+                            ):
+                                field_clears.add(op_field)
 
                         # Track changes that belong in a custom field.
                         #
@@ -1788,6 +1880,11 @@ class WorkPackageMigration(BaseMigration):
                 # Only include field_changes if non-empty
                 if field_changes:
                     op["field_changes"] = field_changes
+
+                # Sorted for a stable payload, which keeps the Ruby-side
+                # comparisons and any diffing of two runs readable.
+                if field_clears:
+                    op["field_clears"] = sorted(field_clears)
 
                 # Only include cf_state_snapshot if we have values
                 if cf_state_snapshot:

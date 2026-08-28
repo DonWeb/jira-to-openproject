@@ -100,15 +100,26 @@ if input_data && input_data.respond_to?(:each)
   valid_journal_attributes = shared_columns.map(&:to_sym).freeze
 
   # Lambda: Apply field_changes to state hash
-  apply_field_changes_to_state = lambda do |current_state, field_changes, priority_cache, rec|
+  apply_field_changes_to_state = lambda do |current_state, field_changes, priority_cache, rec, field_clears|
     return current_state unless field_changes && field_changes.is_a?(Hash)
+    clears = Array(field_clears).map(&:to_sym)
     field_changes.each do |k, v|
       field_sym = k.to_sym
       next unless valid_journal_attributes.include?(field_sym)
       new_value = v.is_a?(Array) ? v[1] : v
-      next if new_value.nil?
-      next if new_value.is_a?(String) && new_value.empty?
       next if new_value.is_a?(Array)
+
+      # An empty new value means one of two different things, and treating them
+      # the same is what made a real clear invisible: either Python could not
+      # resolve the value (keep what was there — the old behaviour, still right),
+      # or Jira emptied the field, which Python signals in ``field_clears``. Only
+      # the second is applied, so an unassignment, a removal from a sprint or a
+      # deleted due date finally renders as a change.
+      if new_value.nil? || (new_value.is_a?(String) && new_value.empty?)
+        next unless clears.include?(field_sym)
+        current_state[field_sym] = nil
+        next
+      end
 
       # Special handling for priority_id - resolve string name to ID
       if field_sym == :priority_id && new_value.is_a?(String) && !(new_value =~ /^\d+$/)
@@ -309,7 +320,9 @@ if input_data && input_data.respond_to?(:each)
             state_snapshot = op["state_snapshot"] || op[:state_snapshot]
             sanitized_state = ensure_required_fields.call(state_snapshot, rec)
           else
-            current_state = apply_field_changes_to_state.call(current_state, field_changes, priority_cache, rec)
+            current_state = apply_field_changes_to_state.call(
+              current_state, field_changes, priority_cache, rec, op['field_clears'] || op[:field_clears],
+            )
             sanitized_state = current_state.dup
           end
 

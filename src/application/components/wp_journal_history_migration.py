@@ -132,6 +132,14 @@ class WpJournalHistoryMigration(BaseMigration):
 
         builder = WorkPackageMigration(jira_client=self.jira_client, op_client=self.op_client)
         builder.user_mapping = config.mappings.get_mapping("user") or {}
+        # ``user_mapping.json`` is keyed by Jira user key (``JIRAUSER10800``);
+        # on this instance 8 of its 22 rows are, and the other 14 by login.
+        # Changelog and comment payloads carry ``name`` and ``displayName``, so
+        # without the secondary indices this builds, almost nothing resolved:
+        # every journal author fell back to the work package's own author, and
+        # every assignee change came out as a no-op. ``WorkPackageMigration``
+        # calls this from its own mapping load, which this component never runs.
+        builder._augment_user_mapping_indices()
         builder.status_mapping = config.mappings.get_mapping("status") or {}
         builder.issue_type_mapping = config.mappings.get_mapping("issue_type") or {}
         # Needed by ``_resolve_sprint_id``: a Sprint changelog entry becomes a

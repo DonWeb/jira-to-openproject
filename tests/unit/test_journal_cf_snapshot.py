@@ -711,3 +711,351 @@ def test_snapshots_are_resolved_before_the_skip_test() -> None:
     assert text.index("raw_attachment_snapshot = op['attachment_snapshot']") < text.index(
         "next if is_empty && op_idx != 0",
     )
+
+
+# --------------------------------------------------------------------------
+# C4 — assignee and reporter resolve by username, not display name
+#
+# Both branches read fromString/toString, which are display names, while
+# user_mapping.json is keyed by Jira user key (JIRAUSER10800) plus, on this
+# instance, 14 login-style keys. Display names appear in neither, so every
+# assignee change came out [None, None]: the Ruby side skips a nil, and because
+# the field counted as mapped it did not even leave a note. The change vanished.
+# --------------------------------------------------------------------------
+
+# The shape of user_mapping.json: primary key is the Jira user key.
+USERS = {
+    "JIRAUSER10800": {
+        "jira_name": "melina.rosell",
+        "jira_display_name": "Melina Rosell",
+        "jira_email": "melina.rosell@donweb.com",
+        "openproject_id": 59,
+    },
+    "JIRAUSER10900": {
+        "jira_name": "leonardo.perez",
+        "jira_display_name": "Leonardo Perez",
+        "jira_email": "leonardo.perez@donweb.com",
+        "openproject_id": 56,
+    },
+}
+
+
+def _augmented(mapping: dict) -> dict:
+    """Run the real index augmentation, which is what makes lookups work."""
+    with patch.object(WorkPackageMigration, "__init__", lambda self, **_: None):
+        helper = WorkPackageMigration()  # type: ignore[call-arg]
+    helper.logger = MagicMock()
+    helper.user_mapping = dict(mapping)
+    helper._augment_user_mapping_indices()
+    return helper.user_mapping
+
+
+def _user_item(field: str, *, from_user: str = "", to_user: str = "",
+               from_display: str = "", to_display: str = "") -> dict[str, object]:
+    """A user changelog item: from/to carry the username, *String the display name."""
+    return {
+        "field": field,
+        "fieldId": "",
+        "from": from_user or None,
+        "fromString": from_display,
+        "to": to_user or None,
+        "toString": to_display,
+    }
+
+
+def test_assignee_resolves_from_the_username(
+    component: WorkPackageMigration,
+) -> None:
+    component.user_mapping = _augmented(USERS)
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T17:03:16.000-0300",
+            [
+                _user_item(
+                    "assignee",
+                    from_user="melina.rosell",
+                    to_user="leonardo.perez",
+                    from_display="Melina Rosell",
+                    to_display="Leonardo Perez",
+                ),
+            ],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"]["assigned_to_id"] == [59, 56]
+
+
+def test_assignee_resolves_from_the_jira_user_key(
+    component: WorkPackageMigration,
+) -> None:
+    """Some instances put the user key in from/to rather than the username."""
+    component.user_mapping = _augmented(USERS)
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T17:03:16.000-0300",
+            [_user_item("assignee", from_user="JIRAUSER10800", to_user="JIRAUSER10900")],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"]["assigned_to_id"] == [59, 56]
+
+
+def test_assignee_falls_back_to_the_display_name(
+    component: WorkPackageMigration,
+) -> None:
+    """The old behaviour still has to work where it is the only thing on offer."""
+    component.user_mapping = _augmented(USERS)
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T17:03:16.000-0300",
+            [_user_item("assignee", from_display="Melina Rosell", to_display="Leonardo Perez")],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"]["assigned_to_id"] == [59, 56]
+
+
+def test_display_names_alone_resolve_nothing_without_augmentation(
+    component: WorkPackageMigration,
+) -> None:
+    """This is the bug, pinned: the raw mapping has no display-name index.
+
+    Without ``_augment_user_mapping_indices`` the lookup fails, which is exactly
+    what happened while ``wp_journal_history`` assigned the mapping directly.
+    """
+    component.user_mapping = dict(USERS)  # NOT augmented
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T17:03:16.000-0300",
+            [_user_item("assignee", from_display="Melina Rosell", to_display="Leonardo Perez")],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert all("field_changes" not in op for op in ops)
+
+
+def test_a_reassignment_that_maps_to_the_same_user_records_nothing(
+    component: WorkPackageMigration,
+) -> None:
+    """Two Jira accounts consolidated into one OpenProject user."""
+    component.user_mapping = _augmented(
+        {
+            "JIRAUSER1": {"jira_name": "vieja.cuenta", "openproject_id": 59},
+            "JIRAUSER2": {"jira_name": "nueva.cuenta", "openproject_id": 59},
+        },
+    )
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T17:03:16.000-0300",
+            [_user_item("assignee", from_user="vieja.cuenta", to_user="nueva.cuenta")],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert all("field_changes" not in op for op in ops)
+
+
+def test_reporter_shares_the_assignee_branch(
+    component: WorkPackageMigration,
+) -> None:
+    component.user_mapping = _augmented(USERS)
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T17:03:16.000-0300",
+            [_user_item("reporter", from_user="melina.rosell", to_user="leonardo.perez")],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"]["author_id"] == [59, 56]
+
+
+# --------------------------------------------------------------------------
+# C5 — the journal author, and the indices that make it resolvable
+# --------------------------------------------------------------------------
+
+
+def test_journal_author_resolves_by_jira_user_key(
+    component: WorkPackageMigration,
+) -> None:
+    """The changelog author payload now carries ``key``, the mapping's primary index.
+
+    While only ``name`` was probed and only ``name`` was extracted, an author
+    mapped under their user key resolved to nobody and the journal was attributed
+    to the work package's author instead.
+    """
+    component.user_mapping = _augmented(USERS)
+    entries = _changelog(("2026-02-03T17:03:16.000-0300", [_item("status", "Closed")]))
+    entries[0]["author"] = {"name": None, "key": "JIRAUSER10900", "displayName": None}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = entries
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["user_id"] == 56
+
+
+def test_journal_author_unresolved_stays_zero(
+    component: WorkPackageMigration,
+) -> None:
+    """0, not a hardcoded builtin id: the Ruby side has its own fallback chain."""
+    component.user_mapping = _augmented(USERS)
+    entries = _changelog(("2026-02-03T17:03:16.000-0300", [_item("status", "Closed")]))
+    entries[0]["author"] = {"name": "nadie.conocido"}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = entries
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["user_id"] == 0
+
+
+def test_extractors_carry_every_probe_key() -> None:
+    """The probe order is only useful if the payload actually carries the fields."""
+    import inspect
+
+    from src.utils.enhanced_audit_trail_migrator import EnhancedAuditTrailMigrator
+
+    for method in (
+        EnhancedAuditTrailMigrator.extract_changelog_from_issue,
+        EnhancedAuditTrailMigrator.extract_comments_from_issue,
+    ):
+        source = inspect.getsource(method)
+        for probe_key in WorkPackageMigration._JOURNAL_AUTHOR_PROBE_KEYS:
+            assert f'"{probe_key}"' in source, (method.__name__, probe_key)
+
+
+def test_builder_augments_the_user_indices() -> None:
+    """``wp_journal_history`` assigned the mapping and never built the indices."""
+    from src.application.components import wp_journal_history_migration as mod
+
+    with open(mod.__file__, encoding="utf-8") as handle:
+        text = handle.read()
+
+    assert "builder._augment_user_mapping_indices()" in text
+    assert text.index("builder.user_mapping = ") < text.index("builder._augment_user_mapping_indices()")
+
+
+# --------------------------------------------------------------------------
+# N4 — a clear is not the same as an unresolvable value
+#
+# The template skipped every nil, which is right for "we could not resolve this"
+# and wrong for "Jira emptied the field". So an unassignment, a removal from a
+# sprint or a deleted due date left the old value standing and rendered nothing.
+# --------------------------------------------------------------------------
+
+
+def test_unassigning_is_reported_as_a_clear(
+    component: WorkPackageMigration,
+) -> None:
+    component.user_mapping = _augmented(USERS)
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T17:03:16.000-0300",
+            [_user_item("assignee", from_user="melina.rosell", from_display="Melina Rosell")],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"]["assigned_to_id"] == [59, None]
+    assert ops[0]["field_clears"] == ["assigned_to_id"]
+
+
+def test_an_unresolvable_new_value_is_not_a_clear(
+    component: WorkPackageMigration,
+) -> None:
+    """Jira named a new assignee we cannot map. Keeping the old value beats nulling it."""
+    component.user_mapping = _augmented(USERS)
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T17:03:16.000-0300",
+            [
+                _user_item(
+                    "assignee",
+                    from_user="melina.rosell",
+                    to_user="usuario.borrado",
+                    to_display="Usuario Borrado",
+                ),
+            ],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"]["assigned_to_id"] == [59, None]
+    assert "field_clears" not in ops[0]
+
+
+def test_removal_from_a_sprint_is_a_clear(
+    component: WorkPackageMigration,
+) -> None:
+    component.sprint_mapping = SPRINT_MAPPING
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T17:03:16.000-0300", [_item("Sprint", "", from_string="Sprint v0.0.104")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"]["sprint_id"] == [12, None]
+    assert ops[0]["field_clears"] == ["sprint_id"]
+
+
+def test_a_deleted_due_date_is_a_clear(
+    component: WorkPackageMigration,
+) -> None:
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T17:03:16.000-0300", [_item("duedate", "", from_string="2026-02-01")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"]["due_date"] == ["2026-02-01", ""]
+    assert ops[0]["field_clears"] == ["due_date"]
+
+
+def test_not_null_columns_are_never_asked_to_clear() -> None:
+    """Clearing one of these would fail the insert.
+
+    Nothing puts the value back in the normal path — ``ensure_required_fields``
+    only runs for the pre-built ``state_snapshot`` branch.
+    """
+    not_null = {"subject", "author_id", "priority_id", "status_id", "type_id", "project_id"}
+
+    assert not (WorkPackageMigration._CLEARABLE_JOURNAL_FIELDS & not_null)
+
+
+def test_clearing_the_reporter_is_not_offered(
+    component: WorkPackageMigration,
+) -> None:
+    """``author_id`` is NOT NULL, so an emptied Jira reporter cannot be applied."""
+    component.user_mapping = _augmented(USERS)
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T17:03:16.000-0300", [_user_item("reporter", from_user="melina.rosell")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert "field_clears" not in ops[0]
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["create_work_package_journals_batch.rb", "create_work_package_journals.rb"],
+)
+def test_template_applies_a_clear_only_when_it_was_declared(template: str) -> None:
+    """Both templates make the distinction; neither skips every nil any more."""
+    text = _template(template)
+
+    assert "clears.include?(field_sym)" in text
+    assert "current_state[field_sym] = nil" in text
+    # The blanket skips this replaced.
+    assert "next if new_value.nil?\n" not in text

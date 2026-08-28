@@ -65,17 +65,25 @@ if rails_ops && rails_ops.respond_to?(:each)
     ].freeze
 
     # Lambda: Apply field_changes to state hash
-    apply_field_changes_to_state = lambda do |current_state, field_changes|
+    apply_field_changes_to_state = lambda do |current_state, field_changes, field_clears|
       return current_state unless field_changes && field_changes.is_a?(Hash)
+      clears = Array(field_clears).map(&:to_sym)
 
       field_changes.each do |k, v|
         field_sym = k.to_sym
         next unless valid_journal_attributes.include?(field_sym)
 
         new_value = v.is_a?(Array) ? v[1] : v
-        next if new_value.nil?
-        next if new_value.is_a?(String) && new_value.empty?
         next if new_value.is_a?(Array)
+
+        # Same distinction as the batch template: an empty value is a clear only
+        # when Python said so, otherwise it is a value we could not resolve and
+        # the previous one stands.
+        if new_value.nil? || (new_value.is_a?(String) && new_value.empty?)
+          next unless clears.include?(field_sym)
+          current_state[field_sym] = nil
+          next
+        end
         next unless new_value.is_a?(Integer) || new_value.is_a?(String) ||
                     new_value.is_a?(TrueClass) || new_value.is_a?(FalseClass) ||
                     new_value.is_a?(Float) || new_value.is_a?(Date) ||
@@ -231,7 +239,9 @@ if rails_ops && rails_ops.respond_to?(:each)
         state_snapshot = op["state_snapshot"] || op[:state_snapshot]
         sanitized_state = ensure_required_fields.call(state_snapshot)
       else
-        current_state = apply_field_changes_to_state.call(current_state, field_changes)
+        current_state = apply_field_changes_to_state.call(
+          current_state, field_changes, op['field_clears'] || op[:field_clears],
+        )
         sanitized_state = current_state.dup
       end
 
