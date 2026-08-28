@@ -88,16 +88,23 @@ class WpJournalHistoryMigration(BaseMigration):
     def _load_attachment_mapping(self) -> dict[str, dict[str, int]]:
         """Load ``attachment_mapping.json``, or ``{}`` when absent.
 
-        Without it the markdown converter cannot turn ``!image.png!`` into
-        ``/api/v3/attachments/{id}/content``, so recreated comments would lose
-        their inline images. Missing mapping is a warning, not an error: the
-        history is still worth rebuilding without resolved attachments.
+        Two things depend on it. The markdown converter needs it to turn
+        ``!image.png!`` into ``/api/v3/attachments/{id}/content``, or recreated
+        comments lose their inline images. And the attachment snapshots need it
+        to resolve a Jira filename to an OpenProject attachment id, or the
+        ``Attachment`` changelog entries produce no "File added" change at all —
+        the rebuild will still delete the attachment rows of the journals it
+        replaces, so that history goes from wrong to absent.
+
+        Missing mapping is a warning, not an error: the rest of the history is
+        still worth rebuilding.
         """
         path = self.data_dir / self.ATTACHMENT_MAPPING_FILE
         if not path.exists():
             self.logger.warning(
                 "Attachment mapping %s not found — inline attachment references"
-                " in rebuilt comments will not resolve to OpenProject URLs",
+                " in rebuilt comments will not resolve to OpenProject URLs, and"
+                " no attachment changes will be journaled",
                 path,
             )
             return {}

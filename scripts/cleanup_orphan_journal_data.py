@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Delete journal data rows that no journal points at any more.
 
-An OpenProject journal keeps its payload in a side table: ``journals.data_id``
+An OpenProject journal keeps its payload in side tables: ``journals.data_id``
 references ``work_package_journals`` (for ``data_type =
-'Journal::WorkPackageJournal'``), and ``customizable_journals.journal_id``
-references ``journals`` for the custom-field values captured in that revision.
-Neither is reachable except through its journal, so a row whose journal is gone
-is dead by definition.
+'Journal::WorkPackageJournal'``), while ``customizable_journals.journal_id`` and
+``attachable_journals.journal_id`` reference ``journals`` for the custom-field
+values and the attachment set captured in that revision. None is reachable except
+through its journal, so a row whose journal is gone is dead by definition.
 
 They accumulated because ``delete_all`` — used by the migration's own journal
 templates and by ``cleanup_anonymous_comment_duplicates.py`` — issues a single
@@ -66,6 +66,19 @@ _ORPHAN_PREDICATES: dict[str, str] = {
         NOT EXISTS (
           SELECT 1 FROM journals j
           WHERE j.id = customizable_journals.journal_id
+        )
+    """,
+    # Added 2026-08-26. This table was leaking the same way and nobody was
+    # sweeping it: ``create_work_package_journals_batch.rb`` deleted a work
+    # package's v2+ journals along with their ``customizable_journals`` and
+    # ``work_package_journals`` rows, but never their ``attachable_journals``.
+    # Measured before the template was fixed: **1399 of 3156 rows orphaned, 44.3%**
+    # — and unlike the other two, this share grew with every re-run because the
+    # rebuild is meant to be idempotent.
+    "attachable_journals": """
+        NOT EXISTS (
+          SELECT 1 FROM journals j
+          WHERE j.id = attachable_journals.journal_id
         )
     """,
 }

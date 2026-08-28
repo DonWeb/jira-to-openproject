@@ -31,6 +31,10 @@ if rails_ops && rails_ops.respond_to?(:each)
       v2_plus_ids = v2_plus_journals.pluck(:id)
       if v2_plus_ids.any?
         Journal::CustomizableJournal.where(journal_id: v2_plus_ids).delete_all
+        # Same omission the batch template had: ``delete_all`` skips
+        # ``dependent: :destroy``, so without this the attachment rows of the
+        # deleted journals are stranded.
+        Journal::AttachableJournal.where(journal_id: v2_plus_ids).delete_all
         # Get data_ids before deleting journals
         data_ids = v2_plus_journals.pluck(:data_id).compact
         v2_plus_journals.delete_all

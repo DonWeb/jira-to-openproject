@@ -139,7 +139,12 @@ class WorkPackageMigration(BaseMigration):
             "Parent",
             "Epic Link",
             "Epic Child",
-            # Attachments (migrated separately)
+            # Attachments. Kept here for the legacy ``work_packages`` flow, but
+            # in ``_build_rails_ops_for_issue`` these never reach the note
+            # fallback this list gates: the attachment branch there sets
+            # ``field_mapped`` and turns them into an ``attachable_journals``
+            # snapshot, i.e. a real "File added" change. Same precedence as
+            # ``Rank`` — see ``JIRA_FIELD_TO_OP_CF_NAME``.
             "Attachment",
             "attachment",
             # Sprint/agile (migrated separately)
@@ -1513,6 +1518,39 @@ class WorkPackageMigration(BaseMigration):
             # changed.
             cf_state: dict[str, str] = {}
 
+            # Progressive attachment set, as OpenProject attachment ids.
+            #
+            # Unlike the custom field snapshot this is an *absolute set on every
+            # journal*, never a delta: OpenProject renders "File added" and
+            # "File removed" by diffing a journal's ``attachable_journals`` rows
+            # against its predecessor's, so a journal that carries nothing reads
+            # as "every attachment was removed". That is also why a work package
+            # whose attachments never changed still gets the same set repeated on
+            # each journal — a constant set diffs to nothing, which is correct.
+            # ``getattr`` for the same reason as ``sprint_mapping`` above: tests
+            # build this class via ``__new__`` and skip ``__init__``.
+            attachment_ids_by_filename = (getattr(self, "attachment_mapping", None) or {}).get(jira_key) or {}
+            attachment_state: set[int] = set()
+            if attachment_ids_by_filename:
+                added_later: set[int] = set()
+                for entry in all_entries:
+                    if entry["type"] != JournalEntryType.CHANGELOG:
+                        continue
+                    for item in entry["data"].get("items") or []:
+                        if str(item.get("field", "")).lower() != "attachment":
+                            continue
+                        resolved = attachment_ids_by_filename.get(item.get("toString"))
+                        if resolved:
+                            added_later.add(int(resolved))
+                # Jira's changelog only records what changed *after* creation, so
+                # anything that was migrated and never appears as an addition was
+                # already attached when the issue was created. That is the v1
+                # baseline, and getting it right is what keeps the newest journal
+                # in step with the work package's real attachments.
+                attachment_state = {
+                    int(op_id) for op_id in attachment_ids_by_filename.values() if op_id
+                } - added_later
+
             # Build rails_ops with full pre-computation
             for i, entry in enumerate(all_entries):
                 entry_type = entry["type"]
@@ -1678,6 +1716,22 @@ class WorkPackageMigration(BaseMigration):
                         # filed as a workflow change. Workflow itself is no longer
                         # tracked at all: no custom field on this OpenProject
                         # backs it, so the snapshot had nowhere to land.
+                        if jira_field.lower() == "attachment":
+                            # ``to``/``toString`` name the file on an addition,
+                            # ``from``/``fromString`` on a removal. A side that
+                            # does not resolve is a file Jira no longer has, so
+                            # it was never migrated and there is nothing to
+                            # snapshot — but the entry still counts as handled,
+                            # or it falls through to a note and the journal goes
+                            # back to being a comment.
+                            added = attachment_ids_by_filename.get(to_str)
+                            removed = attachment_ids_by_filename.get(from_str)
+                            if added:
+                                attachment_state.add(int(added))
+                            if removed:
+                                attachment_state.discard(int(removed))
+                            field_mapped = True
+
                         cf_name = self.JIRA_FIELD_TO_OP_CF_NAME.get(jira_field.lower())
                         if cf_name:
                             cf_state[cf_name] = to_str or to_val or ""
@@ -1738,6 +1792,13 @@ class WorkPackageMigration(BaseMigration):
                 # Only include cf_state_snapshot if we have values
                 if cf_state_snapshot:
                     op["cf_state_snapshot"] = cf_state_snapshot
+
+                # Emitted only when the issue has attachments this migration
+                # resolved. Absent means "leave this work package's attachment
+                # rows alone" — writing an empty set would tell OpenProject every
+                # file had been removed.
+                if attachment_state:
+                    op["attachment_snapshot"] = sorted(attachment_state)
 
                 rails_ops.append(op)
 

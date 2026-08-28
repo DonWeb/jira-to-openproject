@@ -457,3 +457,257 @@ def test_the_six_requested_fields_all_have_a_destination() -> None:
     assert native <= {"sprint"}
     assert {"resolution", "labels", "rank", "global rank", "bugs"} <= by_cf
     assert {"link", "remoteissuelink", "worklogid", "timespent"} <= suppressed
+
+
+# --------------------------------------------------------------------------
+# C3 — Attachment becomes a real "File added" change
+#
+# OpenProject renders attachment changes from ``attachable_journals``, diffing a
+# journal's rows against its predecessor's. That makes the snapshot an absolute
+# set on every journal, not a delta — the opposite of the custom field rows.
+# --------------------------------------------------------------------------
+
+# {jira_key: {filename: op_attachment_id}} — the shape of attachment_mapping.json
+ATTACHMENTS = {JIRA_KEY: {"informe.pdf": 501, "captura.png": 502, "extra.txt": 503}}
+
+
+def _attachment_item(*, added: str = "", removed: str = "") -> dict[str, object]:
+    """An Attachment changelog item: ``to*`` on an addition, ``from*`` on a removal."""
+    return {
+        "field": "Attachment",
+        "fieldId": "",
+        "from": None,
+        "fromString": removed,
+        "to": None,
+        "toString": added,
+    }
+
+
+def test_attachment_addition_becomes_a_snapshot_not_a_note(
+    component: WorkPackageMigration,
+) -> None:
+    component.attachment_mapping = {JIRA_KEY: {"informe.pdf": 501}}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T17:03:16.000-0300", [_attachment_item(added="informe.pdf")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["attachment_snapshot"] == [501]
+    assert ops[0]["notes"] == ""
+
+
+def test_snapshot_is_the_full_set_at_each_journal_not_the_delta(
+    component: WorkPackageMigration,
+) -> None:
+    """A journal carrying only what changed reads as "everything else removed"."""
+    component.attachment_mapping = ATTACHMENTS
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_attachment_item(added="informe.pdf")]),
+        ("2026-02-04T10:00:00.000-0300", [_attachment_item(added="captura.png")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    # extra.txt never appears as an addition, so it was there at creation.
+    assert ops[0]["attachment_snapshot"] == [501, 503]
+    assert ops[1]["attachment_snapshot"] == [501, 502, 503]
+
+
+def test_baseline_is_what_was_attached_at_creation(
+    component: WorkPackageMigration,
+) -> None:
+    """Jira's changelog only records post-creation changes.
+
+    Anything migrated that never shows up as an addition was attached when the
+    issue was created, and belongs in the first snapshot — otherwise the first
+    diff invents a "File added" that never happened.
+    """
+    component.attachment_mapping = ATTACHMENTS
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_item("status", "Closed")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["attachment_snapshot"] == [501, 502, 503]
+
+
+def test_the_last_journal_matches_the_work_package(
+    component: WorkPackageMigration,
+) -> None:
+    """Otherwise the next native save renders a diff that never happened."""
+    component.attachment_mapping = ATTACHMENTS
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_attachment_item(added="informe.pdf")]),
+        ("2026-02-04T10:00:00.000-0300", [_attachment_item(added="captura.png")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[-1]["attachment_snapshot"] == sorted(ATTACHMENTS[JIRA_KEY].values())
+
+
+def test_removal_drops_the_file_from_later_snapshots(
+    component: WorkPackageMigration,
+) -> None:
+    component.attachment_mapping = {JIRA_KEY: {"informe.pdf": 501, "captura.png": 502}}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_item("status", "Closed")]),
+        ("2026-02-04T10:00:00.000-0300", [_attachment_item(removed="captura.png")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["attachment_snapshot"] == [501, 502]
+    assert ops[1]["attachment_snapshot"] == [501]
+
+
+def test_an_unresolved_filename_is_handled_and_never_becomes_a_note(
+    component: WorkPackageMigration,
+) -> None:
+    """A file Jira no longer has was never migrated, so there is nothing to snapshot.
+
+    The entry still counts as handled — otherwise it falls through to the note
+    fallback and the journal goes back to being a comment.
+    """
+    component.attachment_mapping = {JIRA_KEY: {"informe.pdf": 501}}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_attachment_item(added="borrado-en-jira.zip")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["notes"] == ""
+    assert "**Attachment**" not in ops[0]["notes"]
+
+
+def test_no_mapped_attachments_emits_no_snapshot_at_all(
+    component: WorkPackageMigration,
+) -> None:
+    """Absent means "leave the rows alone"; an empty list would mean "all removed".
+
+    The Ruby side keys its delete-then-rewrite of v1 on the snapshot being
+    non-nil, so emitting an empty one would wipe attachment history the migration
+    cannot rebuild.
+    """
+    component.attachment_mapping = {}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_attachment_item(added="informe.pdf")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert all("attachment_snapshot" not in op for op in ops)
+    assert all(op["notes"] == "" for op in ops)
+
+
+def test_snapshot_is_scoped_to_the_issue(
+    component: WorkPackageMigration,
+) -> None:
+    """Two issues can attach files with the same name."""
+    component.attachment_mapping = {"OTRO-1": {"informe.pdf": 999}}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_attachment_item(added="informe.pdf")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert all("attachment_snapshot" not in op for op in ops)
+
+
+# --------------------------------------------------------------------------
+# N2 — the attachment rows of deleted journals were being stranded
+# --------------------------------------------------------------------------
+
+
+def _template(name: str) -> str:
+    """Read a Ruby template from ``src/ruby``.
+
+    Resolved from the test's own path: ``src.ruby`` holds no ``__init__.py``, so
+    it is a namespace package whose ``__file__`` is ``None``.
+    """
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parents[2] / "src" / "ruby" / name).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["create_work_package_journals_batch.rb", "create_work_package_journals.rb"],
+)
+def test_deleting_v2_plus_journals_also_deletes_their_attachment_rows(template: str) -> None:
+    """``delete_all`` skips ``dependent: :destroy``, so this has to be explicit.
+
+    Measured on 2026-08-26 before the line existed: 1399 of 3156
+    ``attachable_journals`` rows orphaned — 44.3%, growing on every re-run of a
+    component that is supposed to be idempotent.
+    """
+    text = _template(template)
+
+    assert "Journal::AttachableJournal.where(journal_id: v2_plus_ids).delete_all" in text
+
+
+def test_batch_template_writes_absolute_attachment_sets() -> None:
+    text = _template("create_work_package_journals_batch.rb")
+
+    assert "INSERT INTO attachable_journals (journal_id, attachment_id, filename)" in text
+    # filename is NOT NULL and comes from the Attachment rows, not the payload.
+    assert "Attachment.where(id: requested_attachment_ids).pluck(:id, :filename)" in text
+
+
+def test_batch_template_rewrites_v1_attachment_rows_only_when_it_has_a_snapshot() -> None:
+    """v1 can hold attachment rows via OpenProject's journal aggregation.
+
+    Wiping them when the migration resolved no attachments would destroy history
+    it cannot rebuild.
+    """
+    text = _template("create_work_package_journals_batch.rb")
+
+    assert "if v1_journal && !v1_attachment_snapshot.nil?" in text
+    assert "Journal::AttachableJournal.where(journal_id: v1_journal.id).delete_all" in text
+
+
+def test_orphan_cleanup_sweeps_attachable_journals() -> None:
+    """The script covered the other two side tables but not this one."""
+    from scripts.cleanup_orphan_journal_data import _ORPHAN_PREDICATES
+
+    assert "attachable_journals" in _ORPHAN_PREDICATES
+    predicate = _ORPHAN_PREDICATES["attachable_journals"]
+    # NOT EXISTS, not NOT IN: a NOT IN against a nullable subquery matches nothing.
+    assert "NOT EXISTS" in predicate
+    assert "attachable_journals.journal_id" in predicate
+
+
+def test_skip_test_compares_snapshots_instead_of_testing_emptiness() -> None:
+    """An absolute snapshot is non-empty on every op, so emptiness is the wrong test.
+
+    A work package that merely *has* attachments carries the full set on every
+    single op. If the skip test only looked at ``notes`` and ``field_changes``,
+    the 512 Link / RemoteIssueLink / WorklogId / timespent entries this rebuild
+    is meant to drop would each keep a journal showing nothing at all.
+
+    The guard's behaviour was checked by running the extracted loop under the
+    local Ruby against five op sequences; this pins its shape so the comparison
+    cannot quietly revert to an emptiness check.
+    """
+    text = _template("create_work_package_journals_batch.rb")
+
+    assert "cf_unchanged = resolved_cf_snapshot == prev_written_cf_snapshot" in text
+    assert "attachment_unchanged = attachment_snapshot == prev_written_attachment_snapshot" in text
+    assert "cf_unchanged && attachment_unchanged" in text
+    # Seeded nil so the first op always counts as a change...
+    assert "prev_written_cf_snapshot = nil" in text
+    # ...and only advanced past an op that actually became a journal.
+    assert text.index("next if is_empty && op_idx != 0") < text.index(
+        "prev_written_cf_snapshot = resolved_cf_snapshot",
+    )
+
+
+def test_snapshots_are_resolved_before_the_skip_test() -> None:
+    """The comparison needs them, so their resolution has to come first."""
+    text = _template("create_work_package_journals_batch.rb")
+
+    assert text.index("raw_attachment_snapshot = op['attachment_snapshot']") < text.index(
+        "next if is_empty && op_idx != 0",
+    )

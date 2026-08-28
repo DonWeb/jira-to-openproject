@@ -52,6 +52,20 @@ if input_data && input_data.respond_to?(:each)
   missing_cf_names = requested_cf_names - cf_ids_by_name.keys
   j2o_cf_ids = cf_ids_by_name.values
 
+  # ``attachable_journals.filename`` is NOT NULL. The name is read from the
+  # Attachment rows rather than carried in the payload so it matches what
+  # OpenProject actually stores (it sanitises on upload) and so the payload does
+  # not repeat it once per journal per file. One query for the whole batch.
+  requested_attachment_ids = input_data.flat_map { |wp_data|
+    wp_ops = wp_data['rails_ops'] || wp_data[:rails_ops] || []
+    next [] unless wp_ops.respond_to?(:each)
+    wp_ops.flat_map { |op|
+      snapshot = op['attachment_snapshot'] || op[:attachment_snapshot]
+      snapshot.is_a?(Array) ? snapshot.map(&:to_i) : []
+    }
+  }.uniq
+  attachment_filenames = requested_attachment_ids.any? ? Attachment.where(id: requested_attachment_ids).pluck(:id, :filename).to_h : {}
+
   priority_cache = {}
   IssuePriority.all.each { |p| priority_cache[p.name.downcase] = p.id }
 
@@ -177,6 +191,14 @@ if input_data && input_data.respond_to?(:each)
           v2_plus_ids = v2_plus_journals.pluck(:id)
           if v2_plus_ids.any?
             Journal::CustomizableJournal.where(journal_id: v2_plus_ids).delete_all
+            # ``attachable_journals`` was missing from this list, and ``delete_all``
+            # skips the ``dependent: :destroy`` that would otherwise have covered
+            # it, so every rebuild stranded the attachment rows of the journals it
+            # deleted. Measured on 2026-08-26 before this line existed: 1399 of
+            # 3156 rows orphaned, 44.3%, and growing with each supposedly
+            # idempotent re-run. ``scripts/cleanup_orphan_journal_data.py`` now
+            # sweeps the table too, for the ones already there.
+            Journal::AttachableJournal.where(journal_id: v2_plus_ids).delete_all
             data_ids = v2_plus_journals.pluck(:data_id).compact
             v2_plus_journals.delete_all
             Journal::WorkPackageJournal.where(id: data_ids).delete_all if data_ids.any?
@@ -197,7 +219,14 @@ if input_data && input_data.respond_to?(:each)
         bulk_journals = []
         v1_journal = nil
         v1_cf_snapshot = nil
+        v1_attachment_snapshot = nil
         v1_target_time = nil
+
+        # State of the last op that actually became a journal, so the skip test
+        # below can ask "did anything change?" rather than "is this empty?".
+        # Seeded with nil so the first op always counts as a change.
+        prev_written_cf_snapshot = nil
+        prev_written_attachment_snapshot = nil
 
         ops.each_with_index do |op, op_idx|
           op_type = op['type'] || op[:type]
@@ -206,9 +235,53 @@ if input_data && input_data.respond_to?(:each)
           notes = op['notes'] || op[:notes] || ''
           field_changes = op['field_changes'] || op[:field_changes]
 
-          # Skip empty operations (except first which updates v1)
-          is_empty = (notes.nil? || notes.to_s.strip.empty?) && (field_changes.nil? || field_changes.empty?)
+          # cf_state_snapshot arrives keyed by OpenProject custom field name and
+          # is resolved to ids through ``cf_ids_by_name``. Any name is accepted,
+          # so adding a field is a Python-side change only — the two hardcoded
+          # keys this replaced ('workflow' / 'resolution') were the reason no
+          # custom field change ever reached the activity tab.
+          cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
+          resolved_cf_snapshot = nil
+          if cf_snapshot.is_a?(Hash)
+            resolved_cf_snapshot = {}
+            cf_snapshot.each do |cf_name, cf_value|
+              cf_id = cf_ids_by_name[cf_name.to_s]
+              next unless cf_id
+              next if cf_value.nil?
+              resolved_cf_snapshot[cf_id] = cf_value
+            end
+          end
+
+          # Absolute set of OpenProject attachment ids present at this journal,
+          # or nil when this work package has no resolved attachments — nil means
+          # "leave the rows alone", an empty array would mean "everything was
+          # removed".
+          raw_attachment_snapshot = op['attachment_snapshot'] || op[:attachment_snapshot]
+          attachment_snapshot = raw_attachment_snapshot.is_a?(Array) ? raw_attachment_snapshot.map(&:to_i).uniq : nil
+
+          # Skip an operation that contributes nothing (except the first, which
+          # updates v1).
+          #
+          # "Contributes nothing" is not the same as "is empty": the snapshots
+          # above are *absolute*, so on a work package that merely has
+          # attachments every single op carries a non-empty attachment set, and on
+          # one that ever set a tracked custom field every op after that carries
+          # its value. Testing those for emptiness would keep a journal for each
+          # of the 512 Link / RemoteIssueLink / WorklogId / timespent entries that
+          # this rebuild is supposed to drop — 512 activity entries showing
+          # nothing at all. So they are compared against the previous op instead.
+          cf_unchanged = resolved_cf_snapshot == prev_written_cf_snapshot
+          attachment_unchanged = attachment_snapshot == prev_written_attachment_snapshot
+          is_empty = (notes.nil? || notes.to_s.strip.empty?) &&
+                     (field_changes.nil? || field_changes.empty?) &&
+                     cf_unchanged && attachment_unchanged
           next if is_empty && op_idx != 0
+
+          # Only advanced for ops that actually become a journal: a skipped op
+          # writes nothing, so what the *next* one has to differ from is still
+          # the last journal written.
+          prev_written_cf_snapshot = resolved_cf_snapshot
+          prev_written_attachment_snapshot = attachment_snapshot
 
           # Use pre-computed user_id from Python
           raw_user_id = (op['user_id'] || op[:user_id]).to_i
@@ -240,29 +313,13 @@ if input_data && input_data.respond_to?(:each)
             sanitized_state = current_state.dup
           end
 
-          # cf_state_snapshot arrives keyed by OpenProject custom field name and
-          # is resolved to ids through ``cf_ids_by_name``. Any name is accepted,
-          # so adding a field is a Python-side change only — the two hardcoded
-          # keys this replaced ('workflow' / 'resolution') were the reason no
-          # custom field change ever reached the activity tab.
-          cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
-          resolved_cf_snapshot = nil
-          if cf_snapshot.is_a?(Hash)
-            resolved_cf_snapshot = {}
-            cf_snapshot.each do |cf_name, cf_value|
-              cf_id = cf_ids_by_name[cf_name.to_s]
-              next unless cf_id
-              next if cf_value.nil?
-              resolved_cf_snapshot[cf_id] = cf_value
-            end
-          end
-
           # Use pre-computed version from Python, or calculate if not provided
           pre_computed_version = op['version'] || op[:version]
 
           if op_idx == 0
             # First operation updates v1 journal
             v1_cf_snapshot = resolved_cf_snapshot
+            v1_attachment_snapshot = attachment_snapshot
             v1_journal = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage', version: 1).first
             if v1_journal
               # Remember the payload row this journal currently points at.
@@ -293,7 +350,8 @@ if input_data && input_data.respond_to?(:each)
             bulk_journals << {
               version: version, user_id: user_id, notes: notes,
               created_at: target_time, validity_period: validity_period,
-              state: sanitized_state, cf_snapshot: resolved_cf_snapshot
+              state: sanitized_state, cf_snapshot: resolved_cf_snapshot,
+              attachment_snapshot: attachment_snapshot
             }
           end
         end
@@ -461,6 +519,29 @@ if input_data && input_data.respond_to?(:each)
                 conn.execute("INSERT INTO customizable_journals (journal_id, custom_field_id, value) VALUES #{cf_journal_values.join(', ')}")
               end
             end
+
+            # Bulk INSERT attachable_journals for v2+.
+            #
+            # Absolute sets, unlike the custom field rows above: OpenProject
+            # diffs a journal's attachment rows against its predecessor's, so
+            # writing only what changed would read as "everything else was
+            # removed". A work package whose attachments never moved therefore
+            # repeats the same set on every journal, which diffs to nothing.
+            attachable_values = []
+            bulk_journals.each do |j|
+              journal_id = version_to_id[j[:version]]
+              next unless journal_id
+              (j[:attachment_snapshot] || []).each do |att_id|
+                filename = attachment_filenames[att_id]
+                # No Attachment row means the file is gone from OpenProject;
+                # filename is NOT NULL, so skip rather than invent one.
+                next unless filename
+                attachable_values << "(#{journal_id}, #{att_id.to_i}, #{conn.quote(filename)})"
+              end
+            end
+            if attachable_values.any?
+              conn.execute("INSERT INTO attachable_journals (journal_id, attachment_id, filename) VALUES #{attachable_values.join(', ')}")
+            end
           end
         end
 
@@ -473,6 +554,31 @@ if input_data && input_data.respond_to?(:each)
               "(#{v1_journal.id}, #{cf_id.to_i}, #{conn.quote(cf_value.to_s)})"
             end.compact
             conn.execute("INSERT INTO customizable_journals (journal_id, custom_field_id, value) VALUES #{cf_values.join(', ')}") if cf_values.any?
+          end
+        end
+
+        # Insert attachable_journals for v1, delete-then-rewrite like the custom
+        # field rows above.
+        #
+        # v1 genuinely can hold attachment rows: OpenProject aggregates
+        # consecutive changes by the same user inside
+        # ``journal_aggregation_time_minutes``, so files attached right after the
+        # work package was created fold into the creation journal. Leaving those
+        # in place would put them alongside the baseline computed from Jira and
+        # the first attachment diff would come out wrong.
+        #
+        # Guarded on a non-nil snapshot: nil means this work package has no
+        # attachments this migration resolved, and wiping its rows on that basis
+        # would destroy history we cannot rebuild.
+        if v1_journal && !v1_attachment_snapshot.nil?
+          Journal::AttachableJournal.where(journal_id: v1_journal.id).delete_all
+          v1_attachable = v1_attachment_snapshot.map { |att_id|
+            filename = attachment_filenames[att_id]
+            next nil unless filename
+            "(#{v1_journal.id}, #{att_id.to_i}, #{conn.quote(filename)})"
+          }.compact
+          if v1_attachable.any?
+            conn.execute("INSERT INTO attachable_journals (journal_id, attachment_id, filename) VALUES #{v1_attachable.join(', ')}")
           end
         end
 
