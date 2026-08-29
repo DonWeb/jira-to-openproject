@@ -77,6 +77,18 @@ def _item(field: str, to_string: str, *, from_string: str = "", field_id: str = 
     }
 
 
+def _real(ops: list[dict]) -> list[dict]:
+    """The chain without the creation journal.
+
+    ``ops[0]`` is always the synthetic creation entry now (see the N3 section
+    below), so a test about a changelog entry or a comment means ``ops[1]``.
+    Asserting that here keeps every one of those tests honest about the
+    difference instead of silently shifting an index.
+    """
+    assert ops and ops[0]["version"] == 1, "the first operation must be the creation journal"
+    return ops[1:]
+
+
 def test_snapshot_is_keyed_by_custom_field_name(
     component: WorkPackageMigration,
 ) -> None:
@@ -91,8 +103,8 @@ def test_snapshot_is_keyed_by_custom_field_name(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["cf_state_snapshot"] == {"Resolution": "Fixed"}
-    assert "resolution" not in ops[0]["cf_state_snapshot"]
+    assert _real(ops)[0]["cf_state_snapshot"] == {"Resolution": "Fixed"}
+    assert "resolution" not in _real(ops)[0]["cf_state_snapshot"]
 
 
 def test_snapshot_accumulates_across_entries(
@@ -112,10 +124,10 @@ def test_snapshot_accumulates_across_entries(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["cf_state_snapshot"] == {"Resolution": "Fixed"}
+    assert _real(ops)[0]["cf_state_snapshot"] == {"Resolution": "Fixed"}
     # Carried, not dropped, even though this entry changed a different field.
-    assert ops[1]["cf_state_snapshot"] == {"Resolution": "Fixed"}
-    assert ops[2]["cf_state_snapshot"] == {"Resolution": "Won't Do"}
+    assert _real(ops)[1]["cf_state_snapshot"] == {"Resolution": "Fixed"}
+    assert _real(ops)[2]["cf_state_snapshot"] == {"Resolution": "Won't Do"}
 
 
 def test_a_custom_field_change_does_not_also_emit_a_note(
@@ -132,8 +144,8 @@ def test_a_custom_field_change_does_not_also_emit_a_note(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["notes"] == ""
-    assert "**resolution**" not in ops[0]["notes"]
+    assert _real(ops)[0]["notes"] == ""
+    assert "**resolution**" not in _real(ops)[0]["notes"]
 
 
 def test_customfield_10500_is_not_treated_as_the_workflow_scheme(
@@ -153,7 +165,7 @@ def test_customfield_10500_is_not_treated_as_the_workflow_scheme(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    snapshot = ops[0].get("cf_state_snapshot") or {}
+    snapshot = _real(ops)[0].get("cf_state_snapshot") or {}
     assert "Workflow" not in snapshot
     assert "workflow" not in snapshot
 
@@ -172,7 +184,7 @@ def test_no_tracked_custom_field_means_no_snapshot_key(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert "cf_state_snapshot" not in ops[0]
+    assert "cf_state_snapshot" not in _real(ops)[0]
 
 
 def test_every_mapped_name_is_a_custom_field_the_pipeline_creates() -> None:
@@ -257,7 +269,7 @@ def test_worklog_pair_shares_one_journal_and_both_halves_are_dropped(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["notes"] == ""
+    assert _real(ops)[0]["notes"] == ""
 
 
 def test_an_unknown_field_still_gets_its_note(
@@ -273,7 +285,7 @@ def test_an_unknown_field_still_gets_its_note(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert "**Complejidad**: Baja → Alta" in ops[0]["notes"]
+    assert "**Complejidad**: Baja → Alta" in _real(ops)[0]["notes"]
 
 
 def test_duedate_keeps_its_native_change_despite_being_in_the_ignore_list(
@@ -291,8 +303,8 @@ def test_duedate_keeps_its_native_change_despite_being_in_the_ignore_list(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"]["due_date"] == ["2026-02-01", "2026-03-01"]
-    assert ops[0]["notes"] == ""
+    assert _real(ops)[0]["field_changes"]["due_date"] == ["2026-02-01", "2026-03-01"]
+    assert _real(ops)[0]["notes"] == ""
 
 
 def test_ignore_list_matching_is_case_insensitive() -> None:
@@ -338,8 +350,8 @@ def test_field_becomes_a_custom_field_change_and_not_a_note(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["cf_state_snapshot"] == {cf_name: "nuevo"}
-    assert ops[0]["notes"] == ""
+    assert _real(ops)[0]["cf_state_snapshot"] == {cf_name: "nuevo"}
+    assert _real(ops)[0]["notes"] == ""
 
 
 def test_story_points_does_not_use_the_native_column(
@@ -357,8 +369,8 @@ def test_story_points_does_not_use_the_native_column(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert "field_changes" not in ops[0]
-    assert ops[0]["cf_state_snapshot"] == {"Story Points": "5"}
+    assert "field_changes" not in _real(ops)[0]
+    assert _real(ops)[0]["cf_state_snapshot"] == {"Story Points": "5"}
 
 
 # --------------------------------------------------------------------------
@@ -388,9 +400,9 @@ def test_sprint_becomes_a_native_sprint_id_change(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"]["sprint_id"] == [12, 13]
-    assert ops[0]["notes"] == ""
-    assert "cf_state_snapshot" not in ops[0]
+    assert _real(ops)[0]["field_changes"]["sprint_id"] == [12, 13]
+    assert _real(ops)[0]["notes"] == ""
+    assert "cf_state_snapshot" not in _real(ops)[0]
 
 
 def test_sprint_resolves_the_last_of_several_because_the_column_is_scalar(
@@ -493,8 +505,8 @@ def test_attachment_addition_becomes_a_snapshot_not_a_note(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["attachment_snapshot"] == [501]
-    assert ops[0]["notes"] == ""
+    assert _real(ops)[0]["attachment_snapshot"] == [501]
+    assert _real(ops)[0]["notes"] == ""
 
 
 def test_snapshot_is_the_full_set_at_each_journal_not_the_delta(
@@ -510,8 +522,8 @@ def test_snapshot_is_the_full_set_at_each_journal_not_the_delta(
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
     # extra.txt never appears as an addition, so it was there at creation.
-    assert ops[0]["attachment_snapshot"] == [501, 503]
-    assert ops[1]["attachment_snapshot"] == [501, 502, 503]
+    assert _real(ops)[0]["attachment_snapshot"] == [501, 503]
+    assert _real(ops)[1]["attachment_snapshot"] == [501, 502, 503]
 
 
 def test_baseline_is_what_was_attached_at_creation(
@@ -530,7 +542,7 @@ def test_baseline_is_what_was_attached_at_creation(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["attachment_snapshot"] == [501, 502, 503]
+    assert _real(ops)[0]["attachment_snapshot"] == [501, 502, 503]
 
 
 def test_the_last_journal_matches_the_work_package(
@@ -545,7 +557,7 @@ def test_the_last_journal_matches_the_work_package(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[-1]["attachment_snapshot"] == sorted(ATTACHMENTS[JIRA_KEY].values())
+    assert _real(ops)[-1]["attachment_snapshot"] == sorted(ATTACHMENTS[JIRA_KEY].values())
 
 
 def test_removal_drops_the_file_from_later_snapshots(
@@ -559,8 +571,8 @@ def test_removal_drops_the_file_from_later_snapshots(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["attachment_snapshot"] == [501, 502]
-    assert ops[1]["attachment_snapshot"] == [501]
+    assert _real(ops)[0]["attachment_snapshot"] == [501, 502]
+    assert _real(ops)[1]["attachment_snapshot"] == [501]
 
 
 def test_an_unresolved_filename_is_handled_and_never_becomes_a_note(
@@ -578,8 +590,8 @@ def test_an_unresolved_filename_is_handled_and_never_becomes_a_note(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["notes"] == ""
-    assert "**Attachment**" not in ops[0]["notes"]
+    assert _real(ops)[0]["notes"] == ""
+    assert "**Attachment**" not in _real(ops)[0]["notes"]
 
 
 def test_no_mapped_attachments_emits_no_snapshot_at_all(
@@ -784,7 +796,7 @@ def test_assignee_resolves_from_the_username(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"]["assigned_to_id"] == [59, 56]
+    assert _real(ops)[0]["field_changes"]["assigned_to_id"] == [59, 56]
 
 
 def test_assignee_resolves_from_the_jira_user_key(
@@ -801,7 +813,7 @@ def test_assignee_resolves_from_the_jira_user_key(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"]["assigned_to_id"] == [59, 56]
+    assert _real(ops)[0]["field_changes"]["assigned_to_id"] == [59, 56]
 
 
 def test_assignee_falls_back_to_the_display_name(
@@ -818,7 +830,7 @@ def test_assignee_falls_back_to_the_display_name(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"]["assigned_to_id"] == [59, 56]
+    assert _real(ops)[0]["field_changes"]["assigned_to_id"] == [59, 56]
 
 
 def test_display_names_alone_resolve_nothing_without_augmentation(
@@ -877,7 +889,7 @@ def test_reporter_shares_the_assignee_branch(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"]["author_id"] == [59, 56]
+    assert _real(ops)[0]["field_changes"]["author_id"] == [59, 56]
 
 
 # --------------------------------------------------------------------------
@@ -901,7 +913,7 @@ def test_journal_author_resolves_by_jira_user_key(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["user_id"] == 56
+    assert _real(ops)[0]["user_id"] == 56
 
 
 def test_journal_author_unresolved_stays_zero(
@@ -915,7 +927,7 @@ def test_journal_author_unresolved_stays_zero(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["user_id"] == 0
+    assert _real(ops)[0]["user_id"] == 0
 
 
 def test_extractors_carry_every_probe_key() -> None:
@@ -966,8 +978,8 @@ def test_unassigning_is_reported_as_a_clear(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"]["assigned_to_id"] == [59, None]
-    assert ops[0]["field_clears"] == ["assigned_to_id"]
+    assert _real(ops)[0]["field_changes"]["assigned_to_id"] == [59, None]
+    assert _real(ops)[0]["field_clears"] == ["assigned_to_id"]
 
 
 def test_an_unresolvable_new_value_is_not_a_clear(
@@ -991,8 +1003,8 @@ def test_an_unresolvable_new_value_is_not_a_clear(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"]["assigned_to_id"] == [59, None]
-    assert "field_clears" not in ops[0]
+    assert _real(ops)[0]["field_changes"]["assigned_to_id"] == [59, None]
+    assert "field_clears" not in _real(ops)[0]
 
 
 def test_removal_from_a_sprint_is_a_clear(
@@ -1005,8 +1017,8 @@ def test_removal_from_a_sprint_is_a_clear(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"]["sprint_id"] == [12, None]
-    assert ops[0]["field_clears"] == ["sprint_id"]
+    assert _real(ops)[0]["field_changes"]["sprint_id"] == [12, None]
+    assert _real(ops)[0]["field_clears"] == ["sprint_id"]
 
 
 def test_a_deleted_due_date_is_a_clear(
@@ -1018,8 +1030,8 @@ def test_a_deleted_due_date_is_a_clear(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"]["due_date"] == ["2026-02-01", ""]
-    assert ops[0]["field_clears"] == ["due_date"]
+    assert _real(ops)[0]["field_changes"]["due_date"] == ["2026-02-01", ""]
+    assert _real(ops)[0]["field_clears"] == ["due_date"]
 
 
 def test_not_null_columns_are_never_asked_to_clear() -> None:
@@ -1044,7 +1056,7 @@ def test_clearing_the_reporter_is_not_offered(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert "field_clears" not in ops[0]
+    assert "field_clears" not in _real(ops)[0]
 
 
 @pytest.mark.parametrize(
@@ -1112,7 +1124,7 @@ def test_component_and_fix_version_travel_as_names(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"][op_field] == ["Backend", "Frontend"]
+    assert _real(ops)[0]["field_changes"][op_field] == ["Backend", "Frontend"]
 
 
 @pytest.mark.parametrize(
@@ -1135,8 +1147,8 @@ def test_jira_ids_never_reach_the_foreign_key(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert "10021" not in ops[0]["field_changes"][op_field]
-    assert "10022" not in ops[0]["field_changes"][op_field]
+    assert "10021" not in _real(ops)[0]["field_changes"][op_field]
+    assert "10022" not in _real(ops)[0]["field_changes"][op_field]
 
 
 def test_an_item_with_no_names_records_nothing(
@@ -1169,8 +1181,8 @@ def test_removing_the_component_or_version_is_a_clear(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert ops[0]["field_changes"][op_field] == ["Backend", ""]
-    assert ops[0]["field_clears"] == [op_field]
+    assert _real(ops)[0]["field_changes"][op_field] == ["Backend", ""]
+    assert _real(ops)[0]["field_clears"] == [op_field]
 
 
 @pytest.mark.parametrize(
@@ -1211,3 +1223,235 @@ def test_multivalue_names_fall_back_to_the_last_segment(template: str) -> None:
     assert "text.split(',').map(&:strip).reject(&:empty?).last" in text
     # Whole-string lookup comes first.
     assert text.index("found = by_name[text.downcase]") < text.index("text.split(',')")
+
+
+# --------------------------------------------------------------------------
+# N3 — the creation journal
+#
+# The Ruby template writes whatever operation comes first into the existing v1
+# row. That used to be the issue's first comment or changelog entry, so v1 — the
+# journal that represents creation — carried an event that happened *after* it:
+# its notes, its author, and the state left behind by its changes.
+#
+# Three consequences, all fixed by giving v1 an operation of its own: the first
+# change to every field was invisible (v1 already showed the post-change value),
+# v1 was attributed to whoever touched the issue first rather than to its
+# creator, and version 2 was never written, leaving a gap in the chain.
+# --------------------------------------------------------------------------
+
+STATUS_MAPPING = {
+    "1": {"openproject_id": 7},   # Open
+    "3": {"openproject_id": 8},   # In Progress
+    "6": {"openproject_id": 9},   # Closed
+}
+
+
+def _status_item(from_id: str, to_id: str, from_name: str, to_name: str) -> dict[str, object]:
+    return {
+        "field": "status",
+        "fieldId": "",
+        "from": from_id,
+        "fromString": from_name,
+        "to": to_id,
+        "toString": to_name,
+    }
+
+
+def _two_transitions(component: WorkPackageMigration) -> list[dict]:
+    """Open -> In Progress -> Closed, on a work package now sitting in Closed."""
+    component.status_mapping = STATUS_MAPPING
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_status_item("1", "3", "Open", "In Progress")]),
+        ("2026-02-04T10:00:00.000-0300", [_status_item("3", "6", "In Progress", "Closed")]),
+    )
+    return component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+
+def test_the_first_operation_is_the_creation_journal(
+    component: WorkPackageMigration,
+) -> None:
+    ops = _two_transitions(component)
+
+    assert ops[0]["version"] == 1
+    assert ops[0]["notes"] == ""
+
+
+def test_creation_journal_holds_the_state_jira_created_the_issue_with(
+    component: WorkPackageMigration,
+) -> None:
+    """Reconstructed from the ``from`` of the first change to each field.
+
+    The replay starts from the work package as it is *now* and only moves
+    forward, so without this the value a field was created with exists nowhere.
+    """
+    ops = _two_transitions(component)
+
+    assert ops[0]["field_changes"]["status_id"] == [None, 7]
+
+
+def test_both_transitions_are_visible(
+    component: WorkPackageMigration,
+) -> None:
+    """The point of the whole change: Open -> In Progress -> Closed is two
+    changes, and the activity used to show one."""
+    ops = _two_transitions(component)
+
+    # Replay the way the template does: start from the work package's current
+    # state (Closed) and apply each operation in turn.
+    rendered = []
+    state = 9
+    for op in ops:
+        new = (op.get("field_changes") or {}).get("status_id")
+        if new and new[1] is not None:
+            state = new[1]
+        rendered.append(state)
+
+    assert rendered == [7, 8, 9]
+
+
+def test_versions_are_contiguous_with_no_gap_at_two(
+    component: WorkPackageMigration,
+) -> None:
+    """Folding the first entry into v1 meant version 2 was never written."""
+    ops = _two_transitions(component)
+
+    assert [op["version"] for op in ops] == [1, 2, 3]
+
+
+def test_creation_journal_defers_to_the_work_package_author(
+    component: WorkPackageMigration,
+) -> None:
+    """``user_id: 0`` sends the template to its fallback chain, which starts at
+    ``rec.author_id`` — the issue's creator.
+
+    v1 used to be attributed to whoever made the first change, who is often
+    somebody else entirely.
+    """
+    ops = _two_transitions(component)
+
+    assert ops[0]["user_id"] == 0
+
+
+def test_a_first_comment_no_longer_lands_on_the_creation_journal(
+    component: WorkPackageMigration,
+) -> None:
+    """A comment is not the creation of the issue."""
+    component.enhanced_audit_trail_migrator.extract_comments_from_issue.return_value = [
+        {
+            "id": "10001",
+            "created": "2026-02-03T10:00:00.000-0300",
+            "author": {"name": "melina.rosell"},
+            "body": "primer comentario",
+        },
+    ]
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = []
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["version"] == 1
+    assert ops[0]["notes"] == ""
+    assert "primer comentario" in ops[1]["notes"]
+    assert ops[1]["version"] == 2
+
+
+def test_untouched_fields_stay_out_of_the_creation_state(
+    component: WorkPackageMigration,
+) -> None:
+    """A field the changelog never mentions keeps the work package's own value.
+
+    Guessing at it would be worse than leaving the template's base state alone.
+    """
+    ops = _two_transitions(component)
+
+    assert set(ops[0]["field_changes"]) == {"status_id"}
+
+
+def test_only_the_first_change_defines_the_creation_value(
+    component: WorkPackageMigration,
+) -> None:
+    """A later change's ``from`` is not the creation value."""
+    ops = _two_transitions(component)
+
+    # 7 is the "from" of the first transition; 8 is the "from" of the second.
+    assert ops[0]["field_changes"]["status_id"][1] == 7
+
+
+def test_a_field_created_empty_is_declared_as_a_clear(
+    component: WorkPackageMigration,
+) -> None:
+    """Added to a sprint later means it had none at creation.
+
+    Without the declaration the template skips the nil and the creation journal
+    inherits the work package's current sprint, so the first assignment renders
+    as nothing.
+    """
+    component.sprint_mapping = SPRINT_MAPPING
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_item("Sprint", "Sprint v0.0.104")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["field_changes"]["sprint_id"] == [None, None]
+    assert ops[0]["field_clears"] == ["sprint_id"]
+
+
+def test_a_not_null_column_created_empty_is_never_declared_as_a_clear(
+    component: WorkPackageMigration,
+) -> None:
+    """``status_id`` cannot be NULL, so an unresolvable creation value has to
+    leave the template's base state standing."""
+    component.status_mapping = {"3": {"openproject_id": 8}}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_status_item("", "3", "", "In Progress")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert "field_clears" not in ops[0]
+
+
+def test_creation_journal_carries_the_custom_field_baseline(
+    component: WorkPackageMigration,
+) -> None:
+    """So the first custom field change reads "X to Y" and not "set to Y"."""
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_item("resolution", "Fixed", from_string="Unresolved")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops[0]["cf_state_snapshot"] == {"Resolution": "Unresolved"}
+    assert ops[1]["cf_state_snapshot"] == {"Resolution": "Fixed"}
+
+
+def test_creation_journal_carries_the_attachments_present_at_creation(
+    component: WorkPackageMigration,
+) -> None:
+    """The ones uploaded later must not already be on v1, or their upload
+    renders as nothing."""
+    component.attachment_mapping = ATTACHMENTS
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_attachment_item(added="informe.pdf")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    # captura.png and extra.txt never appear as additions, so they came with the issue.
+    assert ops[0]["attachment_snapshot"] == [502, 503]
+    assert ops[1]["attachment_snapshot"] == [501, 502, 503]
+
+
+def test_an_issue_with_no_history_gets_no_operations_at_all(
+    component: WorkPackageMigration,
+) -> None:
+    """Those work packages are handled by ``_reattribute_lone_creation_journals``.
+
+    Emitting a lone creation operation would make the template rewrite v1 for
+    every one of them to no purpose.
+    """
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = []
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert ops == []

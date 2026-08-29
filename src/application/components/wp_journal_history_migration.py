@@ -39,8 +39,10 @@ writer closes the *highest-id* journal when it creates the next one — leaving
 two journals open at once and tripping
 ``non_overlapping_journals_validity_periods`` on the following native save.
 
-Rebuilding also reattributes v1 to the real Jira author, which is why no
-separate v1-reattribution step is needed.
+Rebuilding also gives v1 a creation journal of its own — the issue's state as
+Jira created it, attributed to the work package's author — so no separate
+v1-reattribution step is needed for a work package that has history. The
+``_reattribute_lone_creation_journals`` pass still covers the ones that do not.
 """
 
 from __future__ import annotations

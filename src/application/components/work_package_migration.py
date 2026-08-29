@@ -1439,8 +1439,12 @@ class WorkPackageMigration(BaseMigration):
     ) -> list[dict[str, Any]]:
         """Build rails_ops for a single Jira issue's journals with full pre-computation.
 
+        The first operation returned is always the synthetic creation journal
+        (v1), carrying the issue's state as Jira created it — reconstructed by
+        walking the changelog backwards. The real entries follow as v2, v3, …
+
         Pre-computes in Python (fast, parallel):
-        - Version numbers (v2, v3, v4...)
+        - Version numbers (v1 for creation, then v2, v3, v4...)
         - validity_period ranges as ISO strings
         - field_changes mapped to OpenProject field names/IDs
         - user_id from mapping
@@ -1583,6 +1587,24 @@ class WorkPackageMigration(BaseMigration):
             # emit a customizable_journals row only where the value actually
             # changed.
             cf_state: dict[str, str] = {}
+            # The custom field values as of creation: the ``from`` of the first
+            # change to each field. Feeds the creation journal, so the first
+            # change renders as "X → Y" rather than "set to Y".
+            cf_baseline: dict[str, str] = {}
+
+            # The work package as Jira created it, reconstructed by walking the
+            # changelog and keeping the ``from`` of the *first* change to each
+            # field. Fields the changelog never touches are absent, and the Ruby
+            # side leaves those at the work package's current value.
+            #
+            # Without this the chain has no creation state at all: the replay
+            # starts from the work package as it is *now* and only moves forward,
+            # so the value each field was created with exists nowhere. Combined
+            # with the first operation being folded into v1, that made the first
+            # change to every field invisible — an issue that went
+            # ``Open → In Progress → Closed`` showed one transition instead of two.
+            initial_state: dict[str, Any] = {}
+            initial_clears: set[str] = set()
 
             # Progressive attachment set, as OpenProject attachment ids.
             #
@@ -1616,6 +1638,10 @@ class WorkPackageMigration(BaseMigration):
                 attachment_state = {
                     int(op_id) for op_id in attachment_ids_by_filename.values() if op_id
                 } - added_later
+            # Snapshotted before the loop mutates the set: this is what the
+            # creation journal carries, so the first upload renders as an
+            # addition instead of being already there.
+            attachment_baseline = sorted(attachment_state)
 
             # Build rails_ops with full pre-computation
             for i, entry in enumerate(all_entries):
@@ -1823,6 +1849,23 @@ class WorkPackageMigration(BaseMigration):
                             ):
                                 field_clears.add(op_field)
 
+                            # The ``from`` of the *first* change to a field is what
+                            # that field held at creation. Entries are walked in
+                            # chronological order, so first occurrence wins — and
+                            # it is recorded even when it is empty, or a later
+                            # change would overwrite it with a value that was
+                            # never the creation one.
+                            if field_mapped and op_field not in initial_state and op_field in field_changes:
+                                creation_value = field_changes[op_field][0]
+                                initial_state[op_field] = creation_value
+                                # Created with the field empty. Same rule as
+                                # ``field_clears``: only where NULL is allowed.
+                                if (
+                                    creation_value in (None, "")
+                                    and op_field in self._CLEARABLE_JOURNAL_FIELDS
+                                ):
+                                    initial_clears.add(op_field)
+
                         # Track changes that belong in a custom field.
                         #
                         # Dropped from here: the ``field_id == "customfield_10500"``
@@ -1851,6 +1894,8 @@ class WorkPackageMigration(BaseMigration):
 
                         cf_name = self.JIRA_FIELD_TO_OP_CF_NAME.get(jira_field.lower())
                         if cf_name:
+                            if cf_name not in cf_baseline:
+                                cf_baseline[cf_name] = from_str or ""
                             cf_state[cf_name] = to_str or to_val or ""
                             # A field that produces a change must not also
                             # produce a note, or the journal keeps rendering as
@@ -1923,6 +1968,49 @@ class WorkPackageMigration(BaseMigration):
                     op["attachment_snapshot"] = sorted(attachment_state)
 
                 rails_ops.append(op)
+
+            # The creation journal, prepended so it lands on v1.
+            #
+            # The Ruby template writes whatever operation comes first into the
+            # existing v1 row. That used to be the issue's first comment or
+            # changelog entry, which put an event *after* creation into the
+            # journal that represents creation itself: v1 carried that entry's
+            # notes, its author, and the state left behind by its changes. The
+            # first change to every field was invisible as a result — v1 already
+            # showed the post-change value, so the diff against v2 skipped it —
+            # and version 2 was never written, leaving a gap in the chain.
+            #
+            # Giving v1 its own operation fixes all three. It carries the
+            # reconstructed creation state, no notes, and ``user_id: 0`` so the
+            # template falls back to the work package's author — the person who
+            # created the issue, rather than whoever happened to touch it first.
+            #
+            # The timestamp is left empty on purpose: the template falls back to
+            # the work package's own ``created_at``, which is Jira's creation time
+            # once ``wp_timestamp_restore`` has run.
+            if rails_ops:
+                creation_op: dict[str, Any] = {
+                    "type": "journal",
+                    "created_at": "",
+                    "user_id": 0,
+                    "notes": "",
+                    "version": 1,
+                    "validity_period_start": "",
+                    "validity_period_end": None,
+                }
+                if initial_state:
+                    # Shaped as ``[from, to]`` like any other change so the
+                    # template's existing apply step handles it unchanged.
+                    creation_op["field_changes"] = {
+                        field: [None, value] for field, value in initial_state.items()
+                    }
+                if initial_clears:
+                    creation_op["field_clears"] = sorted(initial_clears)
+                if cf_baseline:
+                    creation_op["cf_state_snapshot"] = cf_baseline
+                if attachment_baseline:
+                    creation_op["attachment_snapshot"] = attachment_baseline
+                rails_ops.insert(0, creation_op)
 
         except Exception:
             # Propagate rather than returning what was built so far.
