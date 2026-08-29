@@ -1455,3 +1455,18 @@ def test_an_issue_with_no_history_gets_no_operations_at_all(
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
     assert ops == []
+
+
+def test_the_template_numbers_the_journals_it_actually_keeps() -> None:
+    """Python numbers one operation per Jira entry, but the skip test drops the
+    ones that contribute nothing, and every drop left a hole in the chain.
+
+    Measured after the rebuild on 2026-08-28: 158 work packages whose journal
+    count did not match their highest version. Only Ruby knows which operations
+    survived, so only Ruby can number them.
+    """
+    text = _template("create_work_package_journals_batch.rb")
+
+    assert "version = base_version + bulk_journals.size + 1" in text
+    # The payload's own number must not be read back.
+    assert "pre_computed_version" not in text

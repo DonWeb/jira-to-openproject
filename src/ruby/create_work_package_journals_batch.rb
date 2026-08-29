@@ -380,9 +380,6 @@ if input_data && input_data.respond_to?(:each)
             sanitized_state = current_state.dup
           end
 
-          # Use pre-computed version from Python, or calculate if not provided
-          pre_computed_version = op['version'] || op[:version]
-
           if op_idx == 0
             # First operation updates v1 journal
             v1_cf_snapshot = resolved_cf_snapshot
@@ -412,8 +409,16 @@ if input_data && input_data.respond_to?(:each)
               v1_target_time = target_time
             end
           else
-            # v2+ journals: use pre-computed version or increment
-            version = pre_computed_version || (base_version + bulk_journals.size + 1)
+            # Numbered here, from the journals actually kept — not from the
+            # ``version`` Python sent.
+            #
+            # Python numbers one operation per Jira entry, but the skip test
+            # above drops the ones that contribute nothing, and every drop left
+            # a hole in the chain. Measured after the rebuild on 2026-08-28: 158
+            # work packages whose journal count did not match their highest
+            # version. Only Ruby knows which operations survived, so only Ruby
+            # can number them. Python's value stays in the payload as intent.
+            version = base_version + bulk_journals.size + 1
             bulk_journals << {
               version: version, user_id: user_id, notes: notes,
               created_at: target_time, validity_period: validity_period,
