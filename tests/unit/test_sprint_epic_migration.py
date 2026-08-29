@@ -255,3 +255,99 @@ def test_both_ends_of_the_pipeline_pick_the_same_sprint() -> None:
     assert "for candidate in reversed(candidates)" in inspect.getsource(
         WorkPackageMigration._resolve_sprint_id,
     )
+
+
+class _OrderTrapJira:
+    """ESUX-85's real sprint history: 74 -> 75 -> 105, across 2019-2020.
+
+    The names are the trap. Alphabetically "Sprint v0.0.105" sorts *before*
+    "Sprint v0.0.75" because "1" < "7", so any sort here turns the newest sprint
+    into the oldest-looking one.
+    """
+
+    def __init__(self) -> None:
+        self.issues = {
+            "ESUX-85": DummyIssue(
+                "ESUX-85",
+                epic=None,
+                sprint=[
+                    {"name": "Sprint v0.0.74"},
+                    {"name": "Sprint v0.0.75"},
+                    {"name": "Sprint v0.0.105"},
+                ],
+            ),
+        }
+
+    def batch_get_issues(self, keys):
+        return {k: self.issues.get(k) for k in keys}
+
+
+def _order_trap_mappings(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.config as cfg
+
+    class DummyMappings:
+        def __init__(self) -> None:
+            self._m = {
+                "work_package": {"ESUX-85": {"openproject_id": 1714}},
+                "sprint": {
+                    "Sprint v0.0.74": {"openproject_sprint_id": 15, "project_id": 42},
+                    "Sprint v0.0.75": {"openproject_sprint_id": 16, "project_id": 42},
+                    "Sprint v0.0.105": {"openproject_sprint_id": 40, "project_id": 42},
+                },
+            }
+
+        def get_mapping(self, name: str):
+            return self._m.get(name, {})
+
+    monkeypatch.setattr(cfg, "mappings", DummyMappings(), raising=False)
+
+
+def test_sprint_names_keep_join_order_instead_of_being_sorted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sorting destroyed the only information the list carries.
+
+    Jira returns an issue's sprints in the order it joined them, so the order
+    *is* the chronology. ``sorted(set(...))`` replaced it with an alphabetical
+    one that disagrees whenever the numeric part changes digit count.
+    """
+    _order_trap_mappings(monkeypatch)
+    mig = SprintEpicMigration(jira_client=_OrderTrapJira(), op_client=DummyOp())  # type: ignore[arg-type]
+
+    mapped = mig._map(mig._extract())
+
+    assert mapped.data["sprint_text"]["ESUX-85"] == "Sprint v0.0.74, Sprint v0.0.75, Sprint v0.0.105"
+
+
+def test_the_issue_lands_in_the_sprint_it_actually_finished_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ESUX-85 ended in Sprint v0.0.105 (2020), not v0.0.75 (2019).
+
+    Measured on the live instance: with the names sorted, this work package was
+    the last one whose newest journal still disagreed with the work package row.
+    """
+    _order_trap_mappings(monkeypatch)
+    op = DummyOp()
+    mig = SprintEpicMigration(jira_client=_OrderTrapJira(), op_client=op)  # type: ignore[arg-type]
+
+    mig._load(mig._map(mig._extract()))
+
+    assert [u["sprint_id"] for u in op.updates if "sprint_id" in u] == [40]
+
+
+def test_duplicate_sprint_names_are_still_collapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """De-duplication was the point of the set; only the sorting had to go."""
+    _order_trap_mappings(monkeypatch)
+    mig = SprintEpicMigration(jira_client=_OrderTrapJira(), op_client=DummyOp())  # type: ignore[arg-type]
+    mig.jira_client.issues["ESUX-85"].fields.customfield_10020 = [  # type: ignore[attr-defined]
+        {"name": "Sprint v0.0.74"},
+        {"name": "Sprint v0.0.75"},
+        {"name": "Sprint v0.0.74"},
+    ]
+
+    mapped = mig._map(mig._extract())
+
+    assert mapped.data["sprint_text"]["ESUX-85"] == "Sprint v0.0.74, Sprint v0.0.75"

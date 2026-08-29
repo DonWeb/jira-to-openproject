@@ -257,10 +257,26 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
         sprint_raw: dict[str, list[str]] = data.get("sprint", {}) if isinstance(data, dict) else {}
         epic_pairs: list[tuple[str, str]] = data.get("epic", []) if isinstance(data, dict) else []
 
-        # Normalize sprint names (unique, sorted, joined)
+        # Normalize sprint names: unique, **in join order**, joined.
+        #
+        # This used to be ``sorted(set(...))``, which threw away the only
+        # information the list carries. Jira returns an issue's sprints in the
+        # order it joined them, so the last is the one it ended in — and that is
+        # what ``_load`` and the journal rebuild both read off the end of this
+        # string.
+        #
+        # Sorting is alphabetical, so "Sprint v0.0.105" lands before
+        # "Sprint v0.0.75" ("1" < "7"). ESUX-85 really went
+        # 74 → 75 → 105 across 2019-2020 and came out of here as
+        # "105, 74, 75", which made a 2019 sprint look like the one it finished
+        # in. It stayed hidden while ``_load`` took the *first* name, because
+        # that happened to pick 105 for this issue; it only surfaced once the
+        # last name became the one that counts.
+        #
+        # ``dict.fromkeys`` de-duplicates on first occurrence and keeps order.
         sprint_text: dict[str, str] = {}
         for key, names in sprint_raw.items():
-            uniq = sorted({n.strip() for n in names if n and isinstance(n, str)})
+            uniq = list(dict.fromkeys(n.strip() for n in names if n and isinstance(n, str)))
             if uniq:
                 sprint_text[key] = ", ".join(uniq)
 
