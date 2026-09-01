@@ -199,12 +199,14 @@ def test_every_mapped_name_is_a_custom_field_the_pipeline_creates() -> None:
         "Labels",
         "Rank",
         "Sprint",
-        "Story Points",
         "Bugs",
         "Flagged",
         "Security Level",
         "Affects Versions",
         "Votes",
+        # Provenance field, already created by the pipeline (id 5). Receives the
+        # Jira key when an issue is moved between projects.
+        "J2O Origin Key",
     }
 
     assert set(WorkPackageMigration.JIRA_FIELD_TO_OP_CF_NAME.values()) <= known_cf_names
@@ -329,7 +331,6 @@ def test_ignore_list_matching_is_case_insensitive() -> None:
         ("Rank", "Rank"),
         ("Global Rank", "Rank"),
         ("Bugs", "Bugs"),
-        ("Story Points", "Story Points"),
         ("resolution", "Resolution"),
     ],
 )
@@ -354,14 +355,17 @@ def test_field_becomes_a_custom_field_change_and_not_a_note(
     assert _real(ops)[0]["notes"] == ""
 
 
-def test_story_points_does_not_use_the_native_column(
+def test_story_points_uses_the_native_column(
     component: WorkPackageMigration,
 ) -> None:
-    """OpenProject 17.6 has ``work_package_journals.story_points``, but the
-    pipeline's ``story_points`` component writes the *custom field*.
+    """Reverses an earlier decision, deliberately.
 
-    Journaling the native column would show changes to a field the work package
-    form does not display, because the value a reader sees lives in the CF.
+    This used to assert the opposite: the custom field, because that is where
+    ``story_points`` wrote the value. The instance's "Story Points" custom field
+    turned out to be a *text* one, so it neither sorts nor sums, while
+    OpenProject 17.6 has a real integer ``story_points`` column. Decided on
+    2026-09-01 to move both the component and the history there; all 81 values in
+    this Jira are whole numbers, so the integer column loses nothing.
     """
     component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
         ("2026-02-03T17:03:16.000-0300", [_item("Story Points", "5", from_string="3")]),
@@ -369,8 +373,22 @@ def test_story_points_does_not_use_the_native_column(
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert "field_changes" not in _real(ops)[0]
-    assert _real(ops)[0]["cf_state_snapshot"] == {"Story Points": "5"}
+    assert _real(ops)[0]["field_changes"]["story_points"] == [3, 5]
+    assert "cf_state_snapshot" not in _real(ops)[0]
+
+
+def test_fractional_story_points_are_not_silently_truncated(
+    component: WorkPackageMigration,
+) -> None:
+    """The column is an integer. None of this Jira's values are fractional, but
+    rounding one away without saying so would be the wrong default."""
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T17:03:16.000-0300", [_item("Story Points", "2.5", from_string="3")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert _real(ops)[0]["field_changes"]["story_points"] == [3, None]
 
 
 # --------------------------------------------------------------------------
@@ -1470,3 +1488,232 @@ def test_the_template_numbers_the_journals_it_actually_keeps() -> None:
     assert "version = base_version + bulk_journals.size + 1" in text
     # The payload's own number must not be read back.
     assert "pre_computed_version" not in text
+
+
+# --------------------------------------------------------------------------
+# Etapa 10 — los seis campos que seguian llegando como comentarios
+#
+# Medido en la instancia el 2026-09-01, acotado a los work packages migrados:
+# Workflow 58, timeestimate 33, Key 27, project 27, issuetype 18, y Epic Link 0
+# porque ya estaba suprimido. 99 journals distintos en total: mover un issue de
+# proyecto emite Key y project en la misma entrada.
+# --------------------------------------------------------------------------
+
+TIPOS_POR_ID = {"10004": 7, "10005": 4}
+TIPOS_POR_NOMBRE = {"Bug": {"openproject_id": 7}, "Task": {"openproject_id": 4}}
+PROYECTOS = {"ES": {"openproject_id": 42}, "ESUX": {"openproject_id": 47}}
+
+
+def test_issuetype_resolves_by_id_where_it_used_to_fall_through_to_a_note(
+    component: WorkPackageMigration,
+) -> None:
+    """The mapping the code consulted is keyed by name; the changelog carries ids.
+
+    ``issue_type_mapping`` holds 'Bug'/'Epic'/… while ``to``/``from`` are
+    "10004"/"10005", so the lookup never matched, ``field_mapped`` stayed false,
+    and the entry became a comment — one whose text showed the right names,
+    proving the data was there and only the lookup was wrong. Same shape as the
+    ``assignee`` defect.
+    """
+    component.issue_type_id_mapping = TIPOS_POR_ID
+    component.issue_type_mapping = TIPOS_POR_NOMBRE
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T10:00:00.000-0300",
+            [{"field": "issuetype", "fieldId": "", "from": "10005", "fromString": "Task",
+              "to": "10004", "toString": "Bug"}],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert _real(ops)[0]["field_changes"]["type_id"] == [4, 7]
+    assert _real(ops)[0]["notes"] == ""
+
+
+def test_issuetype_falls_back_to_the_name_mapping(
+    component: WorkPackageMigration,
+) -> None:
+    """Ids first, names second — a fixture or instance may only have one."""
+    component.issue_type_id_mapping = {}
+    component.issue_type_mapping = TIPOS_POR_NOMBRE
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T10:00:00.000-0300",
+            [{"field": "issuetype", "fieldId": "", "from": "10005", "fromString": "Task",
+              "to": "10004", "toString": "Bug"}],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert _real(ops)[0]["field_changes"]["type_id"] == [4, 7]
+
+
+def test_an_unresolvable_issue_type_leaves_the_previous_one(
+    component: WorkPackageMigration,
+) -> None:
+    """``type_id`` is NOT NULL, so it must never be cleared."""
+    component.issue_type_id_mapping = {"10005": 4}
+    component.issue_type_mapping = {}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T10:00:00.000-0300",
+            [{"field": "issuetype", "fieldId": "", "from": "10005", "fromString": "Task",
+              "to": "99999", "toString": "Desconocido"}],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert "field_changes" not in _real(ops)[0]
+    assert "field_clears" not in _real(ops)[0]
+
+
+def test_a_project_move_becomes_a_project_id_change(
+    component: WorkPackageMigration,
+) -> None:
+    """``from``/``to`` carry Jira project ids; ``project_mapping`` is keyed by key."""
+    component.project_mapping = PROYECTOS
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T10:00:00.000-0300",
+            [{"field": "project", "fieldId": "", "from": "10000", "fromString": "ES",
+              "to": "10100", "toString": "ESUX"}],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert _real(ops)[0]["field_changes"]["project_id"] == [42, 47]
+    assert _real(ops)[0]["notes"] == ""
+
+
+def test_an_epic_link_becomes_a_parent_change(
+    component: WorkPackageMigration,
+) -> None:
+    """Jira models the epic as a link, OpenProject as the parent.
+
+    This one was not a comment before — it was in the ignore list and vanished
+    entirely, which is why the probe counted 0 for it.
+    """
+    component.work_package_mapping = {"10126": {"jira_key": "EF-38", "openproject_id": 1583}}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_item("Epic Link", "EF-38")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert _real(ops)[0]["field_changes"]["parent_id"] == [None, 1583]
+    assert _real(ops)[0]["notes"] == ""
+
+
+def test_time_estimates_are_converted_from_seconds_to_hours(
+    component: WorkPackageMigration,
+) -> None:
+    """Jira reports seconds and OpenProject stores hours.
+
+    Passing the raw value through the string branch would have written 7200
+    *hours* into the column.
+    """
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_item("timeestimate", "7200", from_string="3600")]),
+        ("2026-02-04T10:00:00.000-0300", [_item("timeoriginalestimate", "5400")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert _real(ops)[0]["field_changes"]["remaining_hours"] == [1.0, 2.0]
+    assert _real(ops)[1]["field_changes"]["estimated_hours"] == [None, 1.5]
+
+
+def test_an_issue_rename_lands_in_the_provenance_field(
+    component: WorkPackageMigration,
+) -> None:
+    """OpenProject has no key of its own; the Jira one already has a home."""
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_item("Key", "ESUX-85", from_string="ES-85")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert _real(ops)[0]["cf_state_snapshot"] == {"J2O Origin Key": "ESUX-85"}
+    assert _real(ops)[0]["notes"] == ""
+
+
+def test_workflow_is_suppressed_by_decision(
+    component: WorkPackageMigration,
+) -> None:
+    """Jira's workflow *scheme* is an administration object with no OpenProject
+    equivalent, and it was the single largest source of noise — 58 of 99
+    journals. Suppressed by decision on 2026-09-01 rather than given a custom
+    field of its own.
+    """
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_item("Workflow", "Scrum", from_string="Kanban")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert all(op["notes"] == "" for op in ops)
+    assert all("field_changes" not in op for op in ops)
+
+
+@pytest.mark.parametrize(
+    "jira_field",
+    ["Workflow", "Key", "issuetype", "project", "timeestimate", "Epic Link"],
+)
+def test_none_of_the_six_produces_a_comment_with_the_mappings_wired(
+    component: WorkPackageMigration,
+    jira_field: str,
+) -> None:
+    """The headline of the stage, under the conditions the pipeline actually runs in."""
+    component.issue_type_id_mapping = TIPOS_POR_ID
+    component.issue_type_mapping = TIPOS_POR_NOMBRE
+    component.project_mapping = PROYECTOS
+    component.work_package_mapping = {"10126": {"jira_key": "EF-38", "openproject_id": 1583}}
+    valores = {
+        "issuetype": ("10004", "Bug", "10005", "Task"),
+        "project": ("10100", "ESUX", "10000", "ES"),
+        "Epic Link": ("", "EF-38", "", ""),
+        "timeestimate": ("7200", "7200", "3600", "3600"),
+    }.get(jira_field, ("", "algo", "", "otra cosa"))
+    to_val, to_str, from_val, from_str = valores
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T10:00:00.000-0300",
+            [{"field": jira_field, "fieldId": "", "from": from_val or None,
+              "fromString": from_str, "to": to_val or None, "toString": to_str}],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert all(op["notes"] == "" for op in ops), f"{jira_field} sigue generando un comentario"
+
+
+@pytest.mark.parametrize("jira_field", ["issuetype", "project"])
+def test_an_unresolvable_type_or_project_degrades_to_a_note_on_purpose(
+    component: WorkPackageMigration,
+    jira_field: str,
+) -> None:
+    """These two are the only ones that can still produce a comment, and only
+    when their mapping cannot resolve the value.
+
+    Both columns are NOT NULL, so an unresolvable value cannot be written and
+    cannot be cleared either — the choice is a note or silence. A note is kept
+    deliberately: silent loss is the failure mode this project has been bitten by
+    four times over, and here the note still carries the names ("Task → Bug").
+    With the mappings wired, which is how the pipeline runs, this never fires —
+    the test above covers that case.
+    """
+    component.issue_type_id_mapping = {}
+    component.issue_type_mapping = {}
+    component.project_mapping = {}
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        ("2026-02-03T10:00:00.000-0300", [_item(jira_field, "Bug", from_string="Task")]),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert f"**{jira_field}**: Task → Bug" in _real(ops)[0]["notes"]

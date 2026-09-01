@@ -160,6 +160,12 @@ class WorkPackageMigration(BaseMigration):
             "watches",  # Watchers not migrated
             "votes",  # Votes not migrated
             "Flagged",  # Jira flag indicator
+            # Jira's workflow *scheme*, an administration object with no
+            # OpenProject equivalent — changing it says nothing about the issue.
+            # Suppressed by decision rather than given a custom field: measured
+            # 2026-09-01 it was the single largest source of changelog-as-comment
+            # noise, 58 of 99 journals.
+            "Workflow",
         },
     )
 
@@ -182,13 +188,13 @@ class WorkPackageMigration(BaseMigration):
     # history, so keep the two in sync.
     #
     # Verified against the instance's inventory on 2026-08-26 (``cf_missing: []``):
-    # Resolution 58, Labels 59, Rank 46, Bugs 63, Story Points 48.
+    # Resolution 58, Labels 59, Rank 46, Bugs 63, J2O Origin Key 5.
     #
-    # ``Story Points`` goes here rather than to the native ``story_points``
-    # column even though OpenProject 17.6 has one: ``story_points_migration``
-    # writes the custom field, so that is where the value a reader sees on the
-    # work package actually lives. Journaling the native column instead would
-    # show changes to a field the form does not display.
+    # ``Story Points`` used to live here and no longer does. It moved to the
+    # native ``story_points`` column that OpenProject 17.6 has, by decision on
+    # 2026-09-01: the custom field is a text one, so it neither sorts nor sums,
+    # and all 81 values in this Jira are whole numbers (1, 2, 3, 5, 8, 10, 13,
+    # 20, 40, 100) that fit the native column without loss.
     #
     # Precedence, and it matters: ``jira_to_op_field`` (native column) wins over
     # this map, which wins over :attr:`IGNORED_CHANGELOG_FIELDS` — the ignore
@@ -201,7 +207,10 @@ class WorkPackageMigration(BaseMigration):
         "rank": "Rank",
         "global rank": "Rank",
         "bugs": "Bugs",
-        "story points": "Story Points",
+        # Jira renames an issue when it moves between projects. OpenProject has
+        # no key of its own, but the provenance field already holds the Jira one,
+        # so the rename belongs there.
+        "key": "J2O Origin Key",
     }
 
     # Journal columns where "Jira emptied this field" is a state OpenProject can
@@ -225,6 +234,7 @@ class WorkPackageMigration(BaseMigration):
             "description",
             "estimated_hours",
             "remaining_hours",
+            "story_points",
         },
     )
 
@@ -1387,6 +1397,105 @@ class WorkPackageMigration(BaseMigration):
                 return resolved
         return None
 
+    @staticmethod
+    def _mapped_openproject_id(entry: Any) -> int | None:
+        """Read an OpenProject id out of a mapping row of either shape.
+
+        The mappings in this project are not consistent: ``issue_type`` holds a
+        dict per row while ``issue_type_id`` holds a bare int, and ``project``
+        has been seen both ways. Callers should not have to care.
+        """
+        if isinstance(entry, dict):
+            entry = entry.get("openproject_id")
+        try:
+            resolved = int(entry) if entry not in (None, "") else 0
+        except (TypeError, ValueError):
+            return None
+        return resolved if resolved > 0 else None
+
+    def _resolve_issue_type_id(self, raw_id: str | None, raw_name: str | None) -> int | None:
+        """Resolve a Jira issue type to an OpenProject type id.
+
+        A changelog item carries the type *id* in ``from``/``to`` and the *name*
+        in ``fromString``/``toString``. The previous code looked the id up in
+        ``issue_type_mapping``, which is keyed by **name** — so it never matched,
+        ``field_mapped`` stayed false, and every type change fell through to a
+        note. Measured on 2026-09-01: 18 journals rendered as comments whose text
+        showed the right names ("Task → Bug"), proving the data was there and only
+        the lookup was wrong. Same shape as the ``assignee`` defect.
+
+        ``issue_type_id_mapping`` is the one keyed by id, so it is tried first.
+        """
+        by_id = getattr(self, "issue_type_id_mapping", None) or {}
+        by_name = getattr(self, "issue_type_mapping", None) or {}
+        for candidate, mapping in ((raw_id, by_id), (raw_name, by_name)):
+            if not candidate:
+                continue
+            resolved = self._mapped_openproject_id(mapping.get(str(candidate).strip()))
+            if resolved:
+                return resolved
+        return None
+
+    def _resolve_project_id(self, raw_key: str | None) -> int | None:
+        """Resolve a Jira project key to an OpenProject project id.
+
+        A ``project`` changelog item reports the project *id* in ``from``/``to``
+        and the *key* in ``fromString``/``toString``; ``project_mapping`` is keyed
+        by key, so only the latter is usable.
+        """
+        project_mapping = getattr(self, "project_mapping", None) or {}
+        if not raw_key:
+            return None
+        return self._mapped_openproject_id(project_mapping.get(str(raw_key).strip()))
+
+    def _resolve_work_package_id(self, raw_key: str | None) -> int | None:
+        """Resolve a Jira issue key to the work package it became.
+
+        Used for Epic Link, where the value is the epic's own Jira key. The
+        mapping is keyed by numeric Jira id with the human key nested inside, so
+        the lookup goes through the index the caller built.
+        """
+        if not raw_key:
+            return None
+        by_jira_key = getattr(self, "_wp_id_by_jira_key", None)
+        if by_jira_key is None:
+            by_jira_key = {}
+            for outer_key, raw in (getattr(self, "work_package_mapping", None) or {}).items():
+                if not isinstance(raw, dict):
+                    continue
+                inner = raw.get("jira_key") or outer_key
+                op_id = self._mapped_openproject_id(raw)
+                if inner and op_id:
+                    by_jira_key[str(inner)] = op_id
+            self._wp_id_by_jira_key = by_jira_key
+        return by_jira_key.get(str(raw_key).strip())
+
+    @staticmethod
+    def _seconds_to_hours(raw: Any) -> float | None:
+        """Jira reports durations in seconds; OpenProject stores hours."""
+        if raw in (None, ""):
+            return None
+        try:
+            return round(float(raw) / 3600.0, 2)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _to_story_points(raw: Any) -> int | None:
+        """Jira hands these over as floats (13.0); the column is an integer.
+
+        Every value in this Jira is whole (1, 2, 3, 5, 8, 10, 13, 20, 40, 100),
+        so nothing is lost — but a fractional one would be, hence the explicit
+        check rather than a silent ``int()``.
+        """
+        if raw in (None, ""):
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return int(value) if value == int(value) else None
+
     def _resolve_sprint_id(self, raw_ids: str | None, raw_names: str | None) -> int | None:
         """Resolve a Jira Sprint changelog value to an OpenProject sprint id.
 
@@ -1576,10 +1685,26 @@ class WorkPackageMigration(BaseMigration):
                 # (``work_package_journals.sprint_id``, confirmed by probe) and
                 # ``sprint_epic`` writes ``work_packages.sprint_id``, so a sprint
                 # change belongs in the snapshot rather than in a custom field.
-                # ``Story Points`` deliberately does *not* live here — see
-                # ``JIRA_FIELD_TO_OP_CF_NAME``.
                 "sprint": "sprint_id",
+                # OpenProject 17.6 has a native ``story_points`` column and it is
+                # where ``story_points`` writes the value, so the history belongs
+                # there too.
+                "story points": "story_points",
+                # An issue moved between projects. ``project_id`` is journaled.
+                "project": "project_id",
+                # Jira models the epic as a link; OpenProject models it as the
+                # parent, which is what ``sprint_epic`` writes.
+                "epic link": "parent_id",
+                # Jira reports both in seconds; OpenProject stores hours.
+                "timeestimate": "remaining_hours",
+                "timeoriginalestimate": "estimated_hours",
             }
+
+            # The two above are the only fields whose value is a duration in
+            # seconds, and neither column name ends in ``_id``, so they would
+            # otherwise fall through to the plain-string branch and land a
+            # seconds figure in an hours column.
+            seconds_fields = {"remaining_hours", "estimated_hours"}
 
             # Progressive custom field state, keyed by OpenProject custom field
             # *name*. Carried across entries (not reset per entry) so every
@@ -1749,20 +1874,33 @@ class WorkPackageMigration(BaseMigration):
                                     if mapped_to:
                                         field_changes[op_field] = [mapped_from, mapped_to]
                                         field_mapped = True
-                                elif op_field == "type_id" and to_val:
-                                    mapped_to = (
-                                        self.issue_type_mapping.get(to_val, {}).get("openproject_id")
-                                        if self.issue_type_mapping
-                                        else None
-                                    )
-                                    mapped_from = (
-                                        self.issue_type_mapping.get(from_val, {}).get("openproject_id")
-                                        if self.issue_type_mapping and from_val
-                                        else None
-                                    )
-                                    if mapped_to:
+                                elif op_field == "type_id":
+                                    mapped_from = self._resolve_issue_type_id(from_val, from_str)
+                                    mapped_to = self._resolve_issue_type_id(to_val, to_str)
+                                    if mapped_to and mapped_from != mapped_to:
+                                        # ``type_id`` is NOT NULL, so an
+                                        # unresolvable new type leaves the
+                                        # previous one standing rather than
+                                        # clearing it.
                                         field_changes[op_field] = [mapped_from, mapped_to]
                                         field_mapped = True
+                                elif op_field == "project_id":
+                                    mapped_from = self._resolve_project_id(from_str)
+                                    mapped_to = self._resolve_project_id(to_str)
+                                    if mapped_to and mapped_from != mapped_to:
+                                        # Also NOT NULL. And the work package
+                                        # itself has already been created in the
+                                        # target project, so this only records
+                                        # that the move happened.
+                                        field_changes[op_field] = [mapped_from, mapped_to]
+                                        field_mapped = True
+                                elif op_field == "parent_id":
+                                    mapped_from = self._resolve_work_package_id(from_str or from_val)
+                                    mapped_to = self._resolve_work_package_id(to_str or to_val)
+                                    if mapped_from == mapped_to:
+                                        continue
+                                    field_changes[op_field] = [mapped_from, mapped_to]
+                                    field_mapped = True
                                 elif op_field == "sprint_id":
                                     mapped_from = self._resolve_sprint_id(from_val, from_str)
                                     mapped_to = self._resolve_sprint_id(to_val, to_str)
@@ -1823,6 +1961,25 @@ class WorkPackageMigration(BaseMigration):
                                     # Generic ID field
                                     field_changes[op_field] = [from_val, to_val]
                                     field_mapped = True
+                            elif op_field in seconds_fields:
+                                # Seconds in Jira, hours in OpenProject. Sent as
+                                # numbers so the template writes them straight
+                                # into the column instead of the template's
+                                # digits-only string coercion turning "3600"
+                                # into 3600 hours.
+                                mapped_from = self._seconds_to_hours(from_val or from_str)
+                                mapped_to = self._seconds_to_hours(to_val or to_str)
+                                if mapped_from == mapped_to:
+                                    continue
+                                field_changes[op_field] = [mapped_from, mapped_to]
+                                field_mapped = True
+                            elif op_field == "story_points":
+                                mapped_from = self._to_story_points(from_val or from_str)
+                                mapped_to = self._to_story_points(to_val or to_str)
+                                if mapped_from == mapped_to:
+                                    continue
+                                field_changes[op_field] = [mapped_from, mapped_to]
+                                field_mapped = True
                             else:
                                 # Non-ID fields use string values
                                 field_changes[op_field] = [from_str, to_str]

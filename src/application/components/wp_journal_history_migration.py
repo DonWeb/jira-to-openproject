@@ -144,6 +144,12 @@ class WpJournalHistoryMigration(BaseMigration):
         builder._augment_user_mapping_indices()
         builder.status_mapping = config.mappings.get_mapping("status") or {}
         builder.issue_type_mapping = config.mappings.get_mapping("issue_type") or {}
+        # Keyed by Jira type id, where ``issue_type_mapping`` is keyed by name.
+        # A changelog item carries the id, so without this one every issue type
+        # change resolved to nothing and became a comment.
+        builder.issue_type_id_mapping = config.mappings.get_mapping("issue_type_id") or {}
+        # Needed to turn a project move into a ``project_id`` change.
+        builder.project_mapping = config.mappings.get_mapping("project") or {}
         # Needed by ``_resolve_sprint_id``: a Sprint changelog entry becomes a
         # native ``sprint_id`` change, and without this mapping it resolves to
         # nothing and the sprint history is dropped.
@@ -155,10 +161,13 @@ class WpJournalHistoryMigration(BaseMigration):
         builder._update_markdown_converter_mappings()
 
         self.logger.info(
-            "Journal builder mappings: users=%d statuses=%d issue_types=%d sprints=%d attachments=%d",
+            "Journal builder mappings: users=%d statuses=%d issue_types=%d/%d"
+            " projects=%d sprints=%d attachments=%d",
             len(builder.user_mapping),
             len(builder.status_mapping),
             len(builder.issue_type_mapping),
+            len(builder.issue_type_id_mapping),
+            len(builder.project_mapping),
             len(builder.sprint_mapping),
             len(builder.attachment_mapping),
         )
