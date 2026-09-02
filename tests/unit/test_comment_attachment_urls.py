@@ -134,9 +134,14 @@ class TestJournalRebuildPassesTheKey:
 
         ops = component._build_rails_ops_for_issue(self._issue(), {"id": 1552})
 
-        assert len(ops) == 1
-        assert API_URL in ops[0]["notes"]
-        assert f"({FILENAME})" not in ops[0]["notes"]
+        # ops[0] is the synthetic creation journal (v1); the comment is the
+        # entry after it. A comment is not the creation of the issue, so it no
+        # longer gets folded into v1.
+        assert len(ops) == 2
+        assert ops[0]["version"] == 1
+        assert ops[0]["notes"] == ""
+        assert API_URL in ops[1]["notes"]
+        assert f"({FILENAME})" not in ops[1]["notes"]
 
     def test_the_key_is_forwarded_to_the_converter(
         self,

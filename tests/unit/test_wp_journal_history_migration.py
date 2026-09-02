@@ -251,3 +251,153 @@ def test_rebuilt_comments_keep_the_provenance_marker() -> None:
         text = handle.read()
 
     assert '_build_comment_with_marker(notes, entry_data.get("id"))' in text
+
+
+# --------------------------------------------------------------------------
+# C6 — custom field ids resolved from the names Python sends
+#
+# The template used to look up "J2O Jira Workflow" / "J2O Jira Resolution" /
+# "J2O Affects Version", created by ``WorkPackageMigration`` — the
+# ``work_packages`` component, absent from the default sequence. Probed against
+# the live instance on 2026-08-26: ``j2o_legacy_cfs: {}``, so ``j2o_cf_ids``
+# came out empty and the whole customizable_journals block was a no-op. Not one
+# custom field change had ever been journaled.
+# --------------------------------------------------------------------------
+
+
+def _batch_template() -> str:
+    return WpJournalHistoryMigration._rails_script()
+
+
+def test_template_no_longer_hardcodes_the_j2o_custom_field_names() -> None:
+    """Those three do not exist on an instance built by the default sequence."""
+    template = _batch_template()
+
+    assert 'find_by(name: "J2O Jira Workflow")' not in template
+    assert 'find_by(name: "J2O Jira Resolution")' not in template
+    assert 'find_by(name: "J2O Affects Version")' not in template
+
+
+def test_template_resolves_custom_fields_from_the_payload() -> None:
+    """Ids are resolved per batch from the names, which are what is stable."""
+    template = _batch_template()
+
+    assert "requested_cf_names" in template
+    assert "cf_ids_by_name" in template
+    assert "CustomField.where(name: requested_cf_names)" in template
+    # And the snapshot is looked up by name rather than by the two dead keys.
+    assert "cf_ids_by_name[cf_name.to_s]" in template
+    assert "cf_snapshot['workflow']" not in template
+    assert "cf_snapshot['resolution']" not in template
+
+
+def test_missing_custom_fields_are_reported_not_swallowed(
+    component: WpJournalHistoryMigration,
+) -> None:
+    """A custom field the instance lacks means that field's history is lost.
+
+    Silence is how the three ``J2O …`` fields went unnoticed for the whole
+    migration, so the template sends the misses back as a diagnostics row.
+    """
+    builder = MagicMock()
+    builder._build_rails_ops_for_issue.return_value = [{"type": "journal"}]
+    component._get_builder = MagicMock(return_value=builder)  # type: ignore[method-assign]
+    component._merge_batch_issues = MagicMock(return_value={"EF-38": MagicMock()})  # type: ignore[method-assign]
+    component.op_client.execute_script_with_data.return_value = {
+        "status": "success",
+        "data": [
+            {"diagnostics": True, "missing_cf_names": ["Sprint", "Rank"]},
+            {"wp_id": 1574, "jira_key": "EF-38", "created": 3, "error": None},
+        ],
+    }
+
+    with (
+        patch("src.application.components.wp_journal_history_migration.config") as cfg,
+        patch.object(WpJournalHistoryMigration, "_rails_script", return_value="RUBY"),
+    ):
+        cfg.mappings.get_mapping.return_value = {
+            "10126": {"jira_key": "EF-38", "openproject_id": 1574},
+        }
+        result = component.run()
+
+    assert result.details["missing_custom_fields"] == ["Rank", "Sprint"]
+    component.logger.warning.assert_called()
+    # The diagnostics row is not a work package and must not inflate the counts.
+    assert result.details["wp_rebuilt"] == 1
+    assert result.details["journals_created"] == 3
+    assert result.success is True
+
+
+def test_clean_run_reports_no_missing_custom_fields(
+    component: WpJournalHistoryMigration,
+) -> None:
+    builder = MagicMock()
+    builder._build_rails_ops_for_issue.return_value = [{"type": "journal"}]
+    component._get_builder = MagicMock(return_value=builder)  # type: ignore[method-assign]
+    component._merge_batch_issues = MagicMock(return_value={"EF-38": MagicMock()})  # type: ignore[method-assign]
+    component.op_client.execute_script_with_data.return_value = {
+        "status": "success",
+        "data": [{"wp_id": 1574, "jira_key": "EF-38", "created": 3, "error": None}],
+    }
+
+    with (
+        patch("src.application.components.wp_journal_history_migration.config") as cfg,
+        patch.object(WpJournalHistoryMigration, "_rails_script", return_value="RUBY"),
+    ):
+        cfg.mappings.get_mapping.return_value = {
+            "10126": {"jira_key": "EF-38", "openproject_id": 1574},
+        }
+        result = component.run()
+
+    assert "missing_custom_fields" not in result.details
+
+
+# --------------------------------------------------------------------------
+# N1 — the snapshot must cover every column, not a hand-picked 17
+#
+# OpenProject 17.6's work_package_journals has 28 columns; the template spelled
+# out the same 17 in three places, so 11 were written NULL on every rebuilt
+# journal — sprint_id and story_points among them. The newest journal then no
+# longer matched the work package and the next native save rendered a diff that
+# never happened in Jira.
+# --------------------------------------------------------------------------
+
+
+def test_snapshot_columns_come_from_the_schema() -> None:
+    template = _batch_template()
+
+    assert "Journal::WorkPackageJournal.column_names" in template
+    assert "shared_columns = journal_columns & WorkPackage.column_names" in template
+    assert "valid_journal_attributes = shared_columns.map(&:to_sym).freeze" in template
+
+
+def test_no_hardcoded_column_list_survives_in_the_template() -> None:
+    """All three former copies of the 17-column list are gone.
+
+    ``valid_journal_attributes``, the ``current_state`` initialiser and the
+    INSERT each carried their own copy; any one left behind re-truncates the
+    snapshot.
+    """
+    template = _batch_template()
+
+    # The literal attribute list.
+    assert ":type_id, :project_id, :subject, :description, :due_date, :category_id" not in template
+    # The current_state initialiser.
+    assert "current_state = rec.attributes.slice(*shared_columns).symbolize_keys" in template
+    assert "type_id: rec.type_id, project_id: rec.project_id, subject: rec.subject" not in template
+    # The INSERT column list.
+    assert "INSERT INTO work_package_journals (#{shared_columns.join(', ')})" in template
+    assert "INSERT INTO work_package_journals (type_id, project_id, subject, description," not in template
+
+
+def test_insert_quotes_every_value_through_the_connection() -> None:
+    """``conn.quote`` handles nil, Date/Time and booleans uniformly.
+
+    The old INSERT interpolated dates as ``'#{s[:due_date]}'`` and fell back to
+    the string ``'NULL'`` per column, which is what made adding a column a
+    three-place edit in the first place.
+    """
+    template = _batch_template()
+
+    assert "conn.quote(value)" in template
+    assert "due_date_sql = s[:due_date] ? \"'#{s[:due_date]}'\" : \"NULL\"" not in template

@@ -257,10 +257,26 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
         sprint_raw: dict[str, list[str]] = data.get("sprint", {}) if isinstance(data, dict) else {}
         epic_pairs: list[tuple[str, str]] = data.get("epic", []) if isinstance(data, dict) else []
 
-        # Normalize sprint names (unique, sorted, joined)
+        # Normalize sprint names: unique, **in join order**, joined.
+        #
+        # This used to be ``sorted(set(...))``, which threw away the only
+        # information the list carries. Jira returns an issue's sprints in the
+        # order it joined them, so the last is the one it ended in — and that is
+        # what ``_load`` and the journal rebuild both read off the end of this
+        # string.
+        #
+        # Sorting is alphabetical, so "Sprint v0.0.105" lands before
+        # "Sprint v0.0.75" ("1" < "7"). ESUX-85 really went
+        # 74 → 75 → 105 across 2019-2020 and came out of here as
+        # "105, 74, 75", which made a 2019 sprint look like the one it finished
+        # in. It stayed hidden while ``_load`` took the *first* name, because
+        # that happened to pick 105 for this issue; it only surfaced once the
+        # last name became the one that counts.
+        #
+        # ``dict.fromkeys`` de-duplicates on first occurrence and keeps order.
         sprint_text: dict[str, str] = {}
         for key, names in sprint_raw.items():
-            uniq = sorted({n.strip() for n in names if n and isinstance(n, str)})
+            uniq = list(dict.fromkeys(n.strip() for n in names if n and isinstance(n, str)))
             if uniq:
                 sprint_text[key] = ", ".join(uniq)
 
@@ -332,11 +348,26 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
         #
         # ``openproject_sprint_id`` (native Sprint, written by
         # ``SprintMigration``) wins over ``openproject_id`` (the legacy
-        # Version). Both are scalar foreign keys on the work package, so
-        # an issue that belonged to several Jira sprints still keeps only
-        # the first that resolves — the complete list lives in the
-        # "Sprint" custom field below, and native sprints do not change
-        # that: ``work_packages.sprint_id`` is single-valued too.
+        # Version). Both are scalar foreign keys on the work package, so an
+        # issue that belonged to several Jira sprints keeps only one — the
+        # complete list lives in the "Sprint" custom field below, and native
+        # sprints do not change that: ``work_packages.sprint_id`` is
+        # single-valued too.
+        #
+        # The one it keeps is the **last** that resolves, not the first. Jira's
+        # Sprint field lists every sprint an issue passed through in the order it
+        # joined them, so the first is the oldest and the last is the one it
+        # ended in — which is what "what sprint is this in" means.
+        #
+        # Taking the first was assigning each issue to the sprint it *started*
+        # in, and it stayed invisible until the journal chain began carrying
+        # ``sprint_id`` (see ``_build_rails_ops_for_issue._resolve_sprint_id``,
+        # which walks the same list from the other end). Measured against the
+        # live instance on 2026-08-28: 25 work packages whose newest journal
+        # disagreed with the work package row, 23 of them off by exactly one
+        # sprint — Sprint v0.0.260 on the work package against v0.0.261 in its
+        # own history. Left alone, each of those renders a "Sprint changed"
+        # that never happened on the next native save.
         sprint_mapping = config.mappings.get_mapping("sprint") or {}
         sprint_updates: list[dict[str, Any]] = []
         native_assignments = 0
@@ -349,7 +380,7 @@ class SprintEpicMigration(BaseMigration):  # noqa: D101
                 item.strip() for item in str(text or "").split(",") if item and isinstance(item, str) and item.strip()
             ]
             mapped_entry = None
-            for candidate in sprint_names:
+            for candidate in reversed(sprint_names):
                 mapped_entry = sprint_mapping.get(candidate) or sprint_mapping.get(str(candidate))
                 if mapped_entry:
                     break

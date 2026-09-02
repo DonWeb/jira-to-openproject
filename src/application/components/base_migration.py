@@ -464,6 +464,30 @@ class BaseMigration:
             issues = result
         return issues
 
+    @staticmethod
+    def jira_custom_field_ids_by_name() -> dict[str, str]:
+        """Map a Jira custom field's display name to its real ``customfield_<id>``.
+
+        Every tenant numbers its custom fields differently, and guessing the
+        Cloud sample ids has cost this project twice: ``sprint_epic`` shipped with
+        ``customfield_10020``/``customfield_10008`` when this instance uses
+        ``10104``/``10100``, and ``story_points`` looked for ``customfield_10016``
+        when the field here is ``customfield_10106`` — losing all 81 values in
+        silence, since its own fallback scans *attribute* names for "story" and
+        "point" and ``customfield_10106`` contains neither.
+
+        ``CustomFieldMigration`` populates the ``custom_field`` mapping earlier in
+        the pipeline, so the name is already resolvable and nothing needs to be
+        guessed. Lives here because three components need it.
+        """
+        cf_mapping = config.mappings.get_mapping("custom_field") or {}
+        index: dict[str, str] = {}
+        for jira_id, entry in cf_mapping.items():
+            name = entry.get("jira_name") if isinstance(entry, dict) else None
+            if name:
+                index[str(name)] = str(jira_id)
+        return index
+
     # Pattern that all valid Jira issue keys must match: e.g. "TEST-123", "ABC_DEF-1"
     _JIRA_KEY_RE: ClassVar[re.Pattern[str]] = re.compile(r"^[A-Z][A-Z0-9_]*-\d+$")
 

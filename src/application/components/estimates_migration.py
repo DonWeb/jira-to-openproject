@@ -89,11 +89,26 @@ class EstimatesMigration(BaseMigration):  # noqa: D101
             return ComponentResult(success=True, data={"updates": []})
 
         wp_map = self.mappings.get_mapping("work_package") or {}
+
+        # ``issues`` is keyed by the human Jira key ("ES-76"), but the production
+        # ``wp_map`` is keyed by the numeric Jira id with the human key nested
+        # under ``jira_key``. Looking the human key up directly returned None for
+        # every issue, so the loop below skipped all of them and the component
+        # reported ``updated=0`` with ``success=True`` — a silent no-op measured
+        # on 2026-09-01. ``story_points`` and ``customfields_generic`` already
+        # build this index; ``_extract`` here does too, via
+        # ``_jira_keys_from_wp_map``. Only ``_map`` was left reading the raw dict.
+        entry_by_jira_key: dict[str, Any] = {}
+        for outer_key, raw_entry in wp_map.items():
+            inner_key = self._inner_jira_key(outer_key, raw_entry)
+            if inner_key is not None:
+                entry_by_jira_key[inner_key] = raw_entry
+
         updates: list[dict[str, Any]] = []
 
         for key, issue in issues.items():
             try:
-                wp_entry = wp_map.get(key)
+                wp_entry = entry_by_jira_key.get(key)
                 if wp_entry is None:
                     continue
                 try:

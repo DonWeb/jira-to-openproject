@@ -177,6 +177,13 @@ class EnhancedAuditTrailMigrator:
                     "created": history.created,
                     "author": {
                         "name": (getattr(history.author, "name", None) if history.author else None),
+                        # ``key`` is the Jira user key (``JIRAUSER10800``) and is
+                        # the *primary* index of user_mapping.json, yet it was the
+                        # one field not being carried — consumers probe
+                        # accountId/name/key/emailAddress/displayName in that
+                        # order, so the rows keyed only by user key never matched.
+                        "key": (getattr(history.author, "key", None) if history.author else None),
+                        "accountId": (getattr(history.author, "accountId", None) if history.author else None),
                         "displayName": (getattr(history.author, "displayName", None) if history.author else None),
                         "emailAddress": (getattr(history.author, "emailAddress", None) if history.author else None),
                     },
@@ -213,7 +220,13 @@ class EnhancedAuditTrailMigrator:
     def extract_comments_from_issue(self, jira_issue: Any) -> list[dict[str, Any]]:
         """Extract issue comments from Jira issue if present.
 
-        Returns list of dicts: {id, created, author:{name,displayName,emailAddress}, body}
+        Returns list of dicts: {id, created,
+        author:{name,key,accountId,displayName,emailAddress}, body}
+
+        ``key`` and ``accountId`` were missing here for the same reason they were
+        missing from :meth:`extract_changelog_from_issue`: ``key`` is the Jira
+        user key, which is the *primary* index of ``user_mapping.json``, so a
+        comment by a user mapped only under that key resolved to nobody.
         """
         comments: list[dict[str, Any]] = []
         try:
@@ -230,15 +243,10 @@ class EnhancedAuditTrailMigrator:
                         "id": getattr(c, "id", None),
                         "created": getattr(c, "created", None),
                         "author": {
-                            "name": getattr(getattr(c, "author", None), "name", None)
+                            field: getattr(getattr(c, "author", None), field, None)
                             if getattr(c, "author", None)
-                            else None,
-                            "displayName": getattr(getattr(c, "author", None), "displayName", None)
-                            if getattr(c, "author", None)
-                            else None,
-                            "emailAddress": getattr(getattr(c, "author", None), "emailAddress", None)
-                            if getattr(c, "author", None)
-                            else None,
+                            else None
+                            for field in ("name", "key", "accountId", "displayName", "emailAddress")
                         },
                         "body": getattr(c, "body", ""),
                     }

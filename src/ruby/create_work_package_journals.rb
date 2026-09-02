@@ -31,6 +31,10 @@ if rails_ops && rails_ops.respond_to?(:each)
       v2_plus_ids = v2_plus_journals.pluck(:id)
       if v2_plus_ids.any?
         Journal::CustomizableJournal.where(journal_id: v2_plus_ids).delete_all
+        # Same omission the batch template had: ``delete_all`` skips
+        # ``dependent: :destroy``, so without this the attachment rows of the
+        # deleted journals are stranded.
+        Journal::AttachableJournal.where(journal_id: v2_plus_ids).delete_all
         # Get data_ids before deleting journals
         data_ids = v2_plus_journals.pluck(:data_id).compact
         v2_plus_journals.delete_all
@@ -61,17 +65,56 @@ if rails_ops && rails_ops.respond_to?(:each)
     ].freeze
 
     # Lambda: Apply field_changes to state hash
-    apply_field_changes_to_state = lambda do |current_state, field_changes|
+    # Same project-scoped name resolution as the batch template: Python sends
+    # ``category_id`` / ``version_id`` as names, because Jira's own component and
+    # version ids are meaningless as OpenProject foreign keys.
+    scoped_name_caches = { 'categories' => {}, 'versions' => {} }
+    resolve_scoped_name = lambda do |table, project_id, value|
+      return nil if project_id.nil? || value.nil?
+      text = value.to_s.strip
+      return nil if text.empty?
+      cache = scoped_name_caches[table]
+      cache[project_id] ||= conn.select_rows(
+        "SELECT LOWER(name), id FROM #{table} WHERE project_id = #{project_id.to_i}",
+      ).map { |name, id| [name.to_s, id.to_i] }.to_h
+      # Whole string first, then the last comma-separated segment — a Jira issue
+      # can hold several components or fix versions while the column is scalar.
+      by_name = cache[project_id]
+      found = by_name[text.downcase]
+      return found if found
+      return nil unless text.include?(',')
+      last = text.split(',').map(&:strip).reject(&:empty?).last
+      last ? by_name[last.downcase] : nil
+    end
+
+    apply_field_changes_to_state = lambda do |current_state, field_changes, field_clears|
       return current_state unless field_changes && field_changes.is_a?(Hash)
+      clears = Array(field_clears).map(&:to_sym)
 
       field_changes.each do |k, v|
         field_sym = k.to_sym
         next unless valid_journal_attributes.include?(field_sym)
 
         new_value = v.is_a?(Array) ? v[1] : v
-        next if new_value.nil?
-        next if new_value.is_a?(String) && new_value.empty?
         next if new_value.is_a?(Array)
+
+        # Same distinction as the batch template: an empty value is a clear only
+        # when Python said so, otherwise it is a value we could not resolve and
+        # the previous one stands.
+        if new_value.nil? || (new_value.is_a?(String) && new_value.empty?)
+          next unless clears.include?(field_sym)
+          current_state[field_sym] = nil
+          next
+        end
+        # Unresolvable name: skip rather than write a foreign key that points at
+        # an unrelated row.
+        if field_sym == :category_id || field_sym == :version_id
+          table = field_sym == :category_id ? 'categories' : 'versions'
+          resolved = resolve_scoped_name.call(table, rec.project_id, new_value)
+          next if resolved.nil?
+          new_value = resolved
+        end
+
         next unless new_value.is_a?(Integer) || new_value.is_a?(String) ||
                     new_value.is_a?(TrueClass) || new_value.is_a?(FalseClass) ||
                     new_value.is_a?(Float) || new_value.is_a?(Date) ||
@@ -148,10 +191,19 @@ if rails_ops && rails_ops.respond_to?(:each)
       schedule_manually: rec.schedule_manually, ignore_non_working_days: rec.ignore_non_working_days
     }
 
-    # Lookup J2O CF IDs for CF journal entries
-    workflow_cf = CustomField.find_by(name: "J2O Jira Workflow")
-    resolution_cf = CustomField.find_by(name: "J2O Jira Resolution")
-    j2o_cf_ids = [workflow_cf&.id, resolution_cf&.id].compact
+    # Custom field ids resolved from the names Python sent, matching
+    # ``create_work_package_journals_batch.rb``. This used to look up
+    # "J2O Jira Workflow" / "J2O Jira Resolution", which the ``work_packages``
+    # component creates and which therefore do not exist on an instance migrated
+    # through the default sequence — and then read the snapshot as if it were
+    # already keyed by id, so a name would have been inserted as
+    # ``custom_field_id = 0``. Both halves are name-based now.
+    requested_cf_names = ops.flat_map { |op|
+      snapshot = op['cf_state_snapshot'] || op[:cf_state_snapshot]
+      snapshot.is_a?(Hash) ? snapshot.keys.map(&:to_s) : []
+    }.uniq
+    cf_ids_by_name = requested_cf_names.any? ? CustomField.where(name: requested_cf_names).pluck(:name, :id).to_h : {}
+    j2o_cf_ids = cf_ids_by_name.values
 
     # Build priority name->ID cache for resolving string priority values
     priority_cache = {}
@@ -218,12 +270,24 @@ if rails_ops && rails_ops.respond_to?(:each)
         state_snapshot = op["state_snapshot"] || op[:state_snapshot]
         sanitized_state = ensure_required_fields.call(state_snapshot)
       else
-        current_state = apply_field_changes_to_state.call(current_state, field_changes)
+        current_state = apply_field_changes_to_state.call(
+          current_state, field_changes, op['field_clears'] || op[:field_clears],
+        )
         sanitized_state = current_state.dup
       end
 
-      # Get CF state snapshot
-      cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
+      # CF state snapshot, resolved from names to ids so the inserts below can
+      # keep treating it as {cf_id => value}.
+      raw_cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
+      cf_snapshot = nil
+      if raw_cf_snapshot.is_a?(Hash)
+        cf_snapshot = {}
+        raw_cf_snapshot.each do |cf_name, cf_value|
+          cf_id = cf_ids_by_name[cf_name.to_s]
+          next if cf_id.nil? || cf_value.nil?
+          cf_snapshot[cf_id] = cf_value
+        end
+      end
 
       if op_idx == 0
         # V1: will update existing journal

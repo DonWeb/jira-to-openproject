@@ -39,8 +39,10 @@ writer closes the *highest-id* journal when it creates the next one — leaving
 two journals open at once and tripping
 ``non_overlapping_journals_validity_periods`` on the following native save.
 
-Rebuilding also reattributes v1 to the real Jira author, which is why no
-separate v1-reattribution step is needed.
+Rebuilding also gives v1 a creation journal of its own — the issue's state as
+Jira created it, attributed to the work package's author — so no separate
+v1-reattribution step is needed for a work package that has history. The
+``_reattribute_lone_creation_journals`` pass still covers the ones that do not.
 """
 
 from __future__ import annotations
@@ -88,16 +90,23 @@ class WpJournalHistoryMigration(BaseMigration):
     def _load_attachment_mapping(self) -> dict[str, dict[str, int]]:
         """Load ``attachment_mapping.json``, or ``{}`` when absent.
 
-        Without it the markdown converter cannot turn ``!image.png!`` into
-        ``/api/v3/attachments/{id}/content``, so recreated comments would lose
-        their inline images. Missing mapping is a warning, not an error: the
-        history is still worth rebuilding without resolved attachments.
+        Two things depend on it. The markdown converter needs it to turn
+        ``!image.png!`` into ``/api/v3/attachments/{id}/content``, or recreated
+        comments lose their inline images. And the attachment snapshots need it
+        to resolve a Jira filename to an OpenProject attachment id, or the
+        ``Attachment`` changelog entries produce no "File added" change at all —
+        the rebuild will still delete the attachment rows of the journals it
+        replaces, so that history goes from wrong to absent.
+
+        Missing mapping is a warning, not an error: the rest of the history is
+        still worth rebuilding.
         """
         path = self.data_dir / self.ATTACHMENT_MAPPING_FILE
         if not path.exists():
             self.logger.warning(
                 "Attachment mapping %s not found — inline attachment references"
-                " in rebuilt comments will not resolve to OpenProject URLs",
+                " in rebuilt comments will not resolve to OpenProject URLs, and"
+                " no attachment changes will be journaled",
                 path,
             )
             return {}
@@ -125,8 +134,26 @@ class WpJournalHistoryMigration(BaseMigration):
 
         builder = WorkPackageMigration(jira_client=self.jira_client, op_client=self.op_client)
         builder.user_mapping = config.mappings.get_mapping("user") or {}
+        # ``user_mapping.json`` is keyed by Jira user key (``JIRAUSER10800``);
+        # on this instance 8 of its 22 rows are, and the other 14 by login.
+        # Changelog and comment payloads carry ``name`` and ``displayName``, so
+        # without the secondary indices this builds, almost nothing resolved:
+        # every journal author fell back to the work package's own author, and
+        # every assignee change came out as a no-op. ``WorkPackageMigration``
+        # calls this from its own mapping load, which this component never runs.
+        builder._augment_user_mapping_indices()
         builder.status_mapping = config.mappings.get_mapping("status") or {}
         builder.issue_type_mapping = config.mappings.get_mapping("issue_type") or {}
+        # Keyed by Jira type id, where ``issue_type_mapping`` is keyed by name.
+        # A changelog item carries the id, so without this one every issue type
+        # change resolved to nothing and became a comment.
+        builder.issue_type_id_mapping = config.mappings.get_mapping("issue_type_id") or {}
+        # Needed to turn a project move into a ``project_id`` change.
+        builder.project_mapping = config.mappings.get_mapping("project") or {}
+        # Needed by ``_resolve_sprint_id``: a Sprint changelog entry becomes a
+        # native ``sprint_id`` change, and without this mapping it resolves to
+        # nothing and the sprint history is dropped.
+        builder.sprint_mapping = config.mappings.get_mapping("sprint") or {}
         builder.work_package_mapping = wp_map
         builder.attachment_mapping = self._load_attachment_mapping()
         # Rebuilds ``markdown_converter`` with the user/WP/attachment mappings;
@@ -134,10 +161,14 @@ class WpJournalHistoryMigration(BaseMigration):
         builder._update_markdown_converter_mappings()
 
         self.logger.info(
-            "Journal builder mappings: users=%d statuses=%d issue_types=%d attachments=%d",
+            "Journal builder mappings: users=%d statuses=%d issue_types=%d/%d"
+            " projects=%d sprints=%d attachments=%d",
             len(builder.user_mapping),
             len(builder.status_mapping),
             len(builder.issue_type_mapping),
+            len(builder.issue_type_id_mapping),
+            len(builder.project_mapping),
+            len(builder.sprint_mapping),
             len(builder.attachment_mapping),
         )
         self._builder = builder
@@ -302,6 +333,7 @@ class WpJournalHistoryMigration(BaseMigration):
         skip_reasons: Counter[str] = Counter()
         wp_errors: list[str] = []
         no_history: list[int] = []
+        missing_cfs: set[str] = set()
 
         for i in range(0, len(records), self.BATCH_SIZE):
             batch = records[i : i + self.BATCH_SIZE]
@@ -378,6 +410,34 @@ class WpJournalHistoryMigration(BaseMigration):
             for row in results:
                 if not isinstance(row, dict):
                     continue
+                if row.get("diagnostics"):
+                    # Not a work package: the template's report of custom field
+                    # names it could not resolve. Warned about rather than
+                    # counted, because a missing custom field silently drops
+                    # that field's whole history — which is how the three
+                    # ``J2O …`` fields went unnoticed for the entire migration.
+                    missing = row.get("missing_cf_names") or []
+                    if missing:
+                        self.logger.warning(
+                            "Custom fields not found in OpenProject, their change"
+                            " history was not journaled: %s",
+                            ", ".join(str(name) for name in missing),
+                        )
+                        for name in missing:
+                            missing_cfs.add(str(name))
+                    # Component / Fix Version names the target project does not
+                    # have. The field is left at its previous value rather than
+                    # pointed at an unrelated row, so the activity shows no
+                    # change — worth knowing about, not worth failing over.
+                    unresolved = row.get("unresolved_scoped_names")
+                    if isinstance(unresolved, int) and unresolved:
+                        self.logger.warning(
+                            "%d component/version name(s) did not resolve in their"
+                            " project; those changes were skipped",
+                            unresolved,
+                        )
+                        totals["unresolved_scoped_names"] += unresolved
+                    continue
                 error = row.get("error")
                 if error:
                     totals["wp_failed"] += 1
@@ -405,6 +465,10 @@ class WpJournalHistoryMigration(BaseMigration):
             details["skipped"] = dict(skip_reasons)
         if wp_errors:
             details["wp_errors"] = wp_errors
+        if missing_cfs:
+            details["missing_custom_fields"] = sorted(missing_cfs)
+        if totals.get("unresolved_scoped_names"):
+            details["unresolved_scoped_names"] = totals["unresolved_scoped_names"]
 
         # Surface the rest of the reattribution counters only when they carry
         # information, so a clean run's details stay readable.
