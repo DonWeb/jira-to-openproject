@@ -319,6 +319,11 @@ class ConfigLoader:
                     self.config["migration"]["sprint_strategy"] = strategy
                     config_logger.debug("Applied sprint strategy: %s", strategy)
 
+                case ["J2O", "BOARD", "STRATEGY"]:
+                    board_strategy = str(env_value).lower()
+                    self.config["migration"]["board_strategy"] = board_strategy
+                    config_logger.debug("Applied board strategy: %s", board_strategy)
+
                 case ["J2O", "MIGRATION", "JOURNAL", "USER"]:
                     # Login or numeric id of the OpenProject user every journal
                     # the migration creates should be attributed to. Left empty

@@ -38,11 +38,21 @@ class DummyJira:
 
 
 class DummyOp:
-    def __init__(self, *, report_as_created: bool = True, native_sprints: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        report_as_created: bool = True,
+        native_sprints: bool = True,
+        native_boards: bool = False,
+    ) -> None:
         self.created_queries: list[dict] = []
         self.created_versions: list[dict] = []
         self._report_as_created = report_as_created
         self._native_sprints = native_sprints
+        # Defaults to False: these tests cover the saved-view path, which is
+        # what a target without ``Boards::Grid`` gets. ``BoardMigration`` owns
+        # boards everywhere else.
+        self._native_boards = native_boards
 
     def detect_native_sprint_support(self):
         """Whether this instance can hold native sprints (OpenProject 17.6+).
@@ -57,6 +67,24 @@ class DummyOp:
             "missing_required": [] if self._native_sprints else ["finish_date"],
             "wp_fk": True,
             "goals": True,
+        }
+
+    def detect_native_board_support(self):
+        """Whether this instance can hold native boards (``Boards::Grid``).
+
+        This component asks the same question ``BoardMigration`` does, so the
+        two cannot disagree about who creates the boards.
+        """
+        return {
+            "supported": self._native_boards,
+            "op_version": "17.6.0",
+            "grid_columns": ["name", "project_id", "row_count", "column_count", "options", "type"]
+            if self._native_boards
+            else [],
+            "widget_columns": ["grid_id", "identifier", "options"],
+            "missing_required": [] if self._native_boards else ["name"],
+            "module_available": self._native_boards,
+            "ee_board_view": False,
         }
 
     def create_or_update_query(self, **payload):
@@ -349,3 +377,37 @@ def test_agile_board_migration_handles_jira_failure_gracefully(
     # then _extract wraps that in a successful empty payload.
     assert extracted.success is True
     assert extracted.data == {"boards": [], "sprints": []}
+
+
+def test_agile_board_migration_creates_no_queries_when_native_boards_take_over(
+    _mock_mappings: None,
+    _legacy_version_strategy: None,
+) -> None:
+    """On a target with ``Boards::Grid`` this component's board half stands aside.
+
+    ``BoardMigration`` owns boards there, and building a saved view per board
+    on top would give every Jira board two competing representations — the
+    same double-representation the sprint pair had to be fixed for. The
+    sprint half is unaffected: it is pinned to the legacy Version strategy
+    here and must still run.
+    """
+    boards = [
+        {"id": 1, "name": "Sprint Board", "type": "scrum", "location": {"projectKey": "PROJ"}},
+    ]
+    configs = {1: {"columnConfig": {"columns": []}, "filter": {}}}
+    sprints = {1: [{"id": 42, "name": "Sprint 1", "state": "active"}]}
+    op = DummyOp(native_boards=True)
+    mig = AgileBoardMigration(
+        jira_client=DummyJira(boards=boards, sprints_by_board=sprints, configurations_by_board=configs),
+        op_client=op,
+    )  # type: ignore[arg-type]
+
+    mapped = mig._map(mig._extract())
+    result = mig._load(mapped)
+
+    assert result.success is True
+    assert mapped.details["board_strategy"] == "basic"
+    assert op.created_queries == []
+    assert result.details["queries_created"] == 0
+    # The sprint half is untouched by the board strategy.
+    assert result.details["versions_created"] == 1

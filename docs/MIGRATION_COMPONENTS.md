@@ -48,8 +48,9 @@ The j2o migration tool consists of 40+ specialized migration components, each ha
 | WatcherMigration | `watchers` | Stable | Yes | Notifications |
 | **Agile** |
 | SprintMigration | `sprints` | Stable | Yes | Native OpenProject sprints (**17.6+**) |
+| BoardMigration | `boards` | Stable | Yes | Native OpenProject boards (`Boards::Grid`) |
 | SprintEpicMigration | `sprint_epic` | Stable | Yes | Sprint/Epic links on WPs |
-| AgileBoardMigration | `agile_boards` | Stable | Yes | Board saved-queries |
+| AgileBoardMigration | `agile_boards` | Stable | Yes | Sprint→Version and board→saved-query fallbacks |
 | VersionsMigration | `versions` | Stable | Yes | Release tracking |
 | AffectsVersionsMigration | `affects_versions` | Stable | Yes | Version links |
 | **Labels & Tags** |
@@ -608,6 +609,86 @@ repeating failure is systemic rather than per-sprint.
 
 ---
 
+### BoardMigration
+
+**Location**: `src/application/components/board_migration.py`
+
+Creates OpenProject's **native** boards from Jira Software boards. Handles the
+entity type `native_boards`.
+
+An OpenProject board is not its own table: it is a `grids` row with
+`type = 'Boards::Grid'` plus one `grids_widgets` row per column, each widget
+pointing at a `Query` that supplies that column's cards. `board_type` reads
+`options['type']` and defaults to `:free`, so a Basic board is the *absence* of
+the key and a Kanban board is `options = {type: 'action', attribute: 'status'}`.
+
+**Features**:
+- Board → `Boards::Grid` row, persisted in the `board` mapping as
+  `openproject_board_id` together with the ids of its column queries
+- Jira board column → one board column, backed by a `Query` filtered on the
+  column's mapped statuses (`sort_criteria` `manual_sorting, id`, so cards keep
+  a dragged order). Those queries are `hidden` — attached to no `View` — so they
+  do not clutter the saved-views list
+- A column with **no** statuses (a Jira kanban backlog column — both kanban
+  boards on this instance open with one) becomes a manually curated list, the
+  `manual_sort`/`ow` shape OpenProject's own Basic board uses
+- A column whose statuses are *all* unmapped is dropped rather than emitted
+  without a filter, which would show the project's whole backlog under a column
+  name meaning something much narrower. The Jira status ids are reported in
+  `details.unresolved_jira_statuses`
+- Enables the `board_view` module on the target project when it is off, since a
+  board in a project without it saves fine and then 404s
+- Idempotent on `(project_id, name)`, rewriting the existing board's column
+  queries in place instead of stranding them. Column names repeat freely — one
+  board here has two columns both called "Backlog" — so the board, not the
+  query, is the identity
+- Stops after `MAX_CONSECUTIVE_FAILURES` (5) consecutive errors, since a
+  repeating failure is systemic rather than per-board
+
+**Version and edition tolerance**: the component probes the live instance once,
+logs `OpenProject <version> | native boards: ... | Enterprise board_view: ...`
+before writing anything, and picks the representation that instance can hold:
+
+| Target | Boards become | Built by |
+|--------|---------------|----------|
+| `Boards::Grid` + Enterprise `board_view` | Kanban (status action board) | `BoardMigration` |
+| `Boards::Grid`, Community | Basic board | `BoardMigration` |
+| no `Boards::Grid` | starred saved query | `AgileBoardMigration` |
+
+The edition row is the one that bites. Action boards are the **"Advanced
+Boards" Enterprise add-on**, and *nothing in the Rails backend refuses to save
+one without a token* — confirmed by a rollback-only dry run where an
+`options.type = 'action'` grid saved cleanly on a Community instance. The
+frontend then renders an Enterprise upsell where the board should be. So
+`kanban` on a Community target resolves to `basic` rather than reporting
+success over a board nobody can open.
+
+`J2O_BOARD_STRATEGY` overrides the choice but cannot conjure a missing model or
+a missing token. Both `boards` and `agile_boards` read the decision from the
+same helper (`effective_board_strategy`) so they cannot disagree about which one
+owns the boards — the mistake the sprint pair had to be fixed for.
+
+**Jira mismatches resolved here**:
+- **A Jira column can hold several statuses** (four of the nine boards on this
+  instance group two or three). A Basic board keeps that grouping, because its
+  columns are just filters. A Kanban column *is* a status — the frontend writes
+  it onto a dropped card — so a grouped column is expanded into one column per
+  status, named `<column> · <status>`; the count lands in
+  `details.columns_added_by_kanban_expansion`
+- **A Jira board can span several projects, an OpenProject board cannot**
+  (`Boards::Grid belongs_to :project`; two boards here reach four Jira projects
+  each). The board is created in the first mapped project and the rest are
+  reported in `details.multi_project_boards`
+
+**Configuration**: `J2O_BOARD_STRATEGY` = `kanban` (default) | `basic` | `query`
+
+**Dependencies**: ProjectMigration, StatusMigration (the `status` mapping supplies
+the column filters)
+
+**Related**: AgileBoardMigration, [Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration)
+
+---
+
 ### SprintEpicMigration
 
 **Location**: `src/application/components/sprint_epic_migration.py`
@@ -636,20 +717,23 @@ since it can only attach to work packages that already exist.
 
 **Location**: `src/application/components/agile_board_migration.py`
 
-Creates one OpenProject saved query per Jira board. Handles the entity types
-`agile_boards` and `sprints`.
+The **older-release fallback** for both halves of the agile migration. Handles
+the entity types `agile_boards` and `sprints`.
 
 **Features**:
-- Board → public saved query named `[Board] <name>`; board type, original JQL and
-  column/status list go into the query **description** only — filters and columns
-  are left empty
+- Board → public, starred saved query named `[Board] <name>`; board type,
+  original JQL and column/status list go into the query **description** only —
+  filters and columns are left empty. Built **only** when the target has no
+  `Boards::Grid`; on any instance that has one, `BoardMigration` owns boards and
+  this half builds nothing
 - Sprint → project version — **only** under `J2O_SPRINT_STRATEGY=version`/`both`.
   On the default `native` strategy `SprintMigration` owns sprint creation and
   this component builds no version payloads
 
-**Not** mapped to OpenProject's native boards — see
-[Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration) for the reasoning and
-the remaining planned change.
+Both halves resolve their strategy against the **live instance**
+(`effective_board_strategy` / `effective_sprint_strategy`), never off the raw
+config flag, so neither can step aside expecting a native component that then
+also steps aside. See [Entity Mapping §11](ENTITY_MAPPING.md#11-agile-migration).
 
 **Dependencies**: ProjectMigration
 

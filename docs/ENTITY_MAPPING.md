@@ -33,7 +33,7 @@ This document provides a comprehensive mapping of how Jira entities are transfor
 | **Link Type** | Relation Type | `link_types` | Relation taxonomy |
 | **Watcher** | Watcher | `watchers` | Notification |
 | **Vote** | Custom Field Value | `votes_reactions` | On "Votes" CF |
-| **Board** | Saved Query | `agile_boards` | Filters/columns not reproduced — see [§11](#11-agile-migration) |
+| **Board** | Board (native `Boards::Grid`) | `boards` | Kanban needs Enterprise; Community gets a Basic board, no boards module gets a saved query — see [§11](#11-agile-migration) |
 | **Filter** | Saved Query | `reporting` | Saved searches |
 | **Dashboard** | Wiki Page | `reporting` | Project overview |
 | **Role Membership** | Project Membership | `admin_schemes` | Access control |
@@ -489,7 +489,90 @@ falls back to `work_package.version_id`. The `sprint` mapping holds both ids
 (`openproject_sprint_id` and `openproject_id`), so the fallback survives even
 after a native run.
 
-#### Jira Board → OpenProject Saved Query
+#### Jira Board → OpenProject Board (native, default)
+
+`boards` (`BoardMigration`) writes OpenProject's own board model. A board is a
+`grids` row plus one widget per column, each widget pointing at the `Query` that
+supplies the column's cards:
+
+```
+Jira Board                        OpenProject Boards::Grid
+──────────────────────────────    ────────────────────────────────────
+name: "Pizarra ES"           ──→  name: "Pizarra ES"
+board project               ──→  project_id  (belongs_to :project)
+—                            ──→  row_count: 1, column_count: max(4, columns)
+kanban (Enterprise)          ──→  options: {type: 'action', attribute: 'status'}
+basic (Community)            ──→  options: {}     # board_type defaults to :free
+
+Jira board column                 Grids::Widget + Query
+──────────────────────────────    ────────────────────────────────────
+name: "In Progress"          ──→  Query#name
+statuses: [10105, 3]         ──→  Query filter status_id = [26, 7]
+  (via the `status` mapping)      widget.options = {queryId:, filters:}
+statuses: []  (kanban backlog)──→ Query filter manual_sort = ow  (manual list)
+```
+
+Live schema (OpenProject 17.6.0), confirmed with a read-only Rails probe:
+
+```
+grids(id, row_count, column_count, type, user_id, created_at, updated_at,
+      project_id, name, options, linked_type, linked_id)
+grids_widgets(id, start_row, end_row, start_column, end_column,
+              identifier, options, grid_id)
+
+Boards::Grid#board_type == options['type']&.to_sym || :free
+widget.options == { "queryId" => <Query#id>, "filters" => [...] }
+```
+
+> **Which kind of board you get depends on the edition, not the version.**
+> Action boards — status/Kanban, assignee, version, subproject, parent-child —
+> are the **"Advanced Boards" Enterprise add-on** (`en.ee.features.board_view`).
+> Basic boards are Community.
+>
+> Nothing in the Rails backend refuses to save an action board without a token:
+> a rollback-only dry run on this Community instance saved an
+> `options.type = 'action'` grid cleanly. The **frontend** then renders an
+> Enterprise upsell where the board should be. So the strategy is resolved
+> against `EnterpriseToken.allows_to?(:board_view)`, not against the save
+> succeeding:
+>
+> | Target | Boards become | Built by |
+> |--------|---------------|----------|
+> | `Boards::Grid` + Enterprise `board_view` | Kanban (status action board) | `boards` |
+> | `Boards::Grid`, Community | Basic board | `boards` |
+> | no `Boards::Grid` | starred saved query | `agile_boards` |
+>
+> No configuration required. `J2O_BOARD_STRATEGY` overrides the choice but
+> cannot conjure a missing model or a missing token. Both components read the
+> decision from the same helper (`effective_board_strategy`) so they cannot
+> disagree about which one owns the boards.
+
+Two mismatches with Jira are resolved before the write:
+
+- **A Jira column can hold several statuses.** Four of the nine boards on this
+  instance group two or three — "Done Produccion" is `10103, 10107, 10002`. A
+  Basic board keeps that grouping, because its columns are just filters. A
+  Kanban column *is* a status (the frontend writes it onto a dropped card), so a
+  grouped column is expanded into one column per status, named
+  `<column> · <status>`.
+- **A Jira board can span several projects, an OpenProject board cannot.**
+  `Boards::Grid belongs_to :project`; two boards here reach four Jira projects
+  each. The board is created in the first mapped project and the projects it
+  does not cover are listed in `details.multi_project_boards`.
+
+A column whose statuses are all absent from the `status` mapping is **dropped**
+rather than emitted without a filter — an unfiltered column would show the
+project's whole backlog under a column name meaning something much narrower.
+The unresolved Jira status ids land in `details.unresolved_jira_statuses`.
+
+The column queries are attached to no `View`, so `Query#hidden` is true and they
+do not appear in the saved-views list; they exist only to feed the board.
+`Boards::Grid` deletes them when the board is deleted.
+
+#### Jira Board → OpenProject Saved Query (legacy)
+
+The mapping for a target with no boards module. Selected automatically, or with
+`J2O_BOARD_STRATEGY=query`:
 
 ```
 Jira Board                        OpenProject Query
@@ -506,7 +589,7 @@ query description for reference only — they are **not** translated into query
 filters or column configuration. The resulting query lists the project's work
 packages with OpenProject's default filters.
 
-#### Why boards are not mapped 1:1
+#### Why the fallbacks exist
 
 **Sprint → Version** matched OpenProject's own data model when this mapping was
 written: in the Backlogs module a sprint *was* a version. OpenProject 17.3
@@ -514,29 +597,34 @@ written: in the Backlogs module a sprint *was* a version. OpenProject 17.3
 to versions" — and the `sprints` component now targets that model directly. The
 version-based mapping is kept only for older targets.
 
-**Board → Saved Query** is a lowest-common-denominator choice driven by
-OpenProject's Enterprise gating:
+**Board → Saved Query** was the lowest common denominator before `boards`
+existed, and is now the bottom rung of the ladder: it works on every edition and
+every release, so it is what a target with no `Boards::Grid` gets.
 
-- *Basic boards* are part of the Community edition since OpenProject 12.1, but a
-  basic board is only a set of manually ordered lists — moving a card there does
-  not change the work package.
-- *Action boards* (status/Kanban, assignee, version, subproject, parent-child) —
-  the ones that carry the semantics of a Jira board column — remain an Enterprise
-  add-on.
+What the two native kinds cost, relative to Jira:
 
-A saved query works on every edition; a faithful board → board migration needs an
-Enterprise target for anything beyond a basic board.
+- A *Basic board* (Community) reproduces the board's columns and their cards
+  faithfully — its columns are filters, so a Jira column grouping three statuses
+  stays one column. What it cannot do is act: dragging a card between columns
+  does not change the work package's status.
+- A *Kanban board* (Enterprise) does act on a drop, which is the semantics a
+  Jira board column actually carries. The price is that a column is exactly one
+  status, so Jira's grouped columns are expanded.
 
-**Remaining planned change** (from [#260](https://github.com/netresearch/jira-to-openproject/issues/260#issuecomment-5100423937)):
-the sprint half is done; mapping boards to native boards is still open, with
-board → saved query staying as the fallback for Community targets.
+Both are a closer match than a saved query, which reproduces neither the columns
+nor the cards — it records the board's shape in a description and lists the
+project's work packages with default filters.
+
+**Status** (from [#260](https://github.com/netresearch/jira-to-openproject/issues/260#issuecomment-5100423937)):
+both halves are done — `sprints` for sprints, `boards` for boards — with
+sprint → Version and board → saved query staying as the older-target fallbacks.
 
 **References**:
 - [OpenProject 17.3 release notes](https://www.openproject.org/docs/release-notes/17-3-0/) — sprints as independent objects
 - [Agile boards in the Community edition](https://www.openproject.org/blog/agile-boards-for-community/) — basic vs. action boards
 - [Boards user guide](https://www.openproject.org/docs/user-guide/agile-boards/)
 
-**Component**: `sprints` (`SprintMigration`), `agile_boards` (`AgileBoardMigration`), `sprint_epic` (`SprintEpicMigration`)
+**Component**: `sprints` (`SprintMigration`), `boards` (`BoardMigration`), `agile_boards` (`AgileBoardMigration`), `sprint_epic` (`SprintEpicMigration`)
 
 ---
 
@@ -547,8 +635,9 @@ executable order is `DEFAULT_COMPONENT_SEQUENCE` in
 `src/application/components/registry.py`; where the two differ, the registry
 wins.
 
-`sprints` and `agile_boards` create their objects early (they only need
-`projects`), while `sprint_epic` — which attaches sprints and Epic Links to
+`sprints`, `boards` and `agile_boards` create their objects early (`boards`
+also needs the `status` mapping, so it runs after `status_types`), while
+`sprint_epic` — which attaches sprints and Epic Links to
 work packages — runs after `work_packages_content`. Keeping the two apart is
 deliberate: `sprint_epic` used to sit next to `agile_boards`, ahead of
 `work_packages_skeleton`, where it found an empty `work_package` mapping and

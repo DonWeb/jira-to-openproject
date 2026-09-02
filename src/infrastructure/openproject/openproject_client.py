@@ -304,6 +304,7 @@ class OpenProjectClient:
         # OpenProjectClient delegate to the corresponding service.
         from src.infrastructure.openproject.openproject_admin_cleanup_service import OpenProjectAdminCleanupService
         from src.infrastructure.openproject.openproject_associations_service import OpenProjectAssociationsService
+        from src.infrastructure.openproject.openproject_board_service import OpenProjectBoardService
         from src.infrastructure.openproject.openproject_bulk_create_service import OpenProjectBulkCreateService
         from src.infrastructure.openproject.openproject_content_service import OpenProjectContentService
         from src.infrastructure.openproject.openproject_custom_field_service import OpenProjectCustomFieldService
@@ -351,6 +352,7 @@ class OpenProjectClient:
         self.content = OpenProjectContentService(self)
         self.bulk_create = OpenProjectBulkCreateService(self)
         self.sprints = OpenProjectSprintService(self)
+        self.boards = OpenProjectBoardService(self)
 
         logger.success(
             "OpenProjectClient initialized for host %s, container %s",
@@ -786,6 +788,34 @@ class OpenProjectClient:
             status=status,
             goal=goal,
         )
+
+    def detect_native_board_support(self) -> dict[str, Any]:
+        """Thin delegator over ``self.boards.detect_native_board_support``."""
+        return self.boards.detect_native_board_support()
+
+    def ensure_project_board(
+        self,
+        project_id: int,
+        *,
+        name: str,
+        columns: list[dict[str, Any]],
+        board_type: str = "free",
+        attribute: str | None = None,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        """Thin delegator over ``self.boards.ensure_project_board``."""
+        return self.boards.ensure_project_board(
+            project_id,
+            name=name,
+            columns=columns,
+            board_type=board_type,
+            attribute=attribute,
+            description=description,
+        )
+
+    def count_project_boards(self) -> int:
+        """Thin delegator over ``self.boards.count_project_boards``."""
+        return self.boards.count_project_boards()
 
     def create_or_update_query(
         self,

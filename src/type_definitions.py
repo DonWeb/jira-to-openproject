@@ -120,6 +120,10 @@ class MigrationConfig(TypedDict):
     reset_wp_checkpoints: NotRequired[bool]
     # "native" (default) | "version" | "both" — see SprintMigration.
     sprint_strategy: NotRequired[str]
+    # "kanban" (default) | "basic" | "query" — see BoardMigration. Resolved
+    # against the live instance: "kanban" needs an Enterprise token for
+    # ``board_view`` and falls back to "basic" without one.
+    board_strategy: NotRequired[str]
     # Login or numeric id of the OpenProject user every migration-created
     # journal is attributed to. Empty/unset falls back to ``User.system``
     # ("System"); without this the Rails console runs as ``User.anonymous``
@@ -163,6 +167,7 @@ type ComponentName = Literal[
     "resolutions",
     "workflows",
     "sprints",
+    "boards",
     "agile_boards",
     "work_packages",
     "work_packages_skeleton",

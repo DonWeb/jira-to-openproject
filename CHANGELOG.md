@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaulting to `native` and degrading to the Version path on older targets.
 - `OpenProjectSprintService` with native-sprint capability detection and an
   idempotent `ensure_project_sprint`.
+- `boards` component (`BoardMigration`) migrating Jira Software boards to
+  OpenProject's **native** boards (`Boards::Grid` plus one query-backed widget per
+  column) instead of a saved query per board. Selectable with `J2O_BOARD_STRATEGY`
+  (`kanban` | `basic` | `query`), defaulting to `kanban` and resolved against the
+  live instance: action boards are the "Advanced Boards" Enterprise add-on, so a
+  Community target gets a Basic board, and a target with no boards module keeps the
+  saved-query path. The distinction matters because nothing in OpenProject's backend
+  refuses to save an action board without an Enterprise token — the row saves and the
+  frontend renders an upsell where the board should be.
+- `OpenProjectBoardService` with native-board capability detection (including the
+  Enterprise token state) and an idempotent, transactional `ensure_project_board`.
 - `CHANGELOG.md` (this file) tracking release history.
 - `CONTRIBUTING.md` with branching, testing, and PR guidelines.
 - `.github/workflows/ci.yml` running `ruff`, `mypy`, `pytest`, and container tests on every push and pull request.
@@ -215,8 +226,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `work_packages_content` in the component sequence — it previously ran before
   `work_packages_skeleton`, where an empty work-package mapping made it apply
   nothing on every cold run.
-- `agile_boards` no longer creates Versions under the default sprint strategy; it
-  keeps the board → saved-query half.
+- `agile_boards` is now the older-release fallback for both halves: it creates
+  Versions only when the target has no native `Sprint`, and saved queries only when
+  the target has no `Boards::Grid`. Both halves resolve that against the live
+  instance through the same helper the native component uses
+  (`effective_sprint_strategy` / `effective_board_strategy`), so neither can step
+  aside expecting a component that also steps aside.
+- `boards` logs the OpenProject version, the grid columns it found and whether the
+  Enterprise token covers `board_view` before writing anything.
 - `Dockerfile.test` now includes OCI labels and a `HEALTHCHECK`.
 - All Python dependencies upgraded to their latest compatible releases (see commit history and `uv.lock`).
 
