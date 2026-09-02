@@ -15,16 +15,15 @@ straight off the config flag (``J2O_BOARD_STRATEGY``):
 ``kanban``
     A status **action board** — the one OpenProject itself labels
     "Kanban". Dragging a card between columns changes the work package's
-    status. Needs ``Boards::Grid`` *and* an Enterprise token covering
-    ``board_view``: action boards are the "Advanced Boards" Enterprise
-    add-on. Nothing in the Rails backend refuses to save one without the
-    token, so a run that ignored this would report success and leave an
-    Enterprise upsell where the board should be. Missing token ⇒ ``basic``.
+    status. This is the default, and on every release the toolset supports
+    it is also available in the Community edition: **17.3.0 released all
+    action board types to Community**. Only a pre-17.3 target without an
+    Enterprise token falls back — see :func:`action_boards_available`.
 
 ``basic``
     A **Basic board**: same columns, same cards, no drag-to-change-status.
-    Community-safe, and the automatic answer on an instance without an
-    Enterprise token.
+    Available wherever boards are at all, so it is the fallback for a
+    release that still gates action boards behind Enterprise.
 
 ``query``
     The pre-existing behaviour — one starred saved view per Jira board,
@@ -48,6 +47,7 @@ surfacing as a board that quietly looks wrong:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from src import config
@@ -85,6 +85,11 @@ NATIVE_BOARD_STRATEGIES: frozenset[str] = frozenset(
     {BOARD_STRATEGY_KANBAN, BOARD_STRATEGY_BASIC},
 )
 
+#: The release that made every action board type — Kanban included — part of
+#: the Community edition, per the 17.3.0 release notes. Before it they were the
+#: "Advanced Boards" Enterprise add-on. See :func:`action_boards_available`.
+ACTION_BOARDS_COMMUNITY_SINCE: tuple[int, int] = (17, 3)
+
 
 def board_strategy() -> str:
     """Return the configured board strategy, defaulting to ``kanban``."""
@@ -92,6 +97,38 @@ def board_strategy() -> str:
     if raw in VALID_BOARD_STRATEGIES:
         return raw
     return BOARD_STRATEGY_KANBAN
+
+
+def action_boards_available(support: dict[str, Any]) -> bool:
+    """Whether this instance can render an action (Kanban) board.
+
+    Action boards used to be the "Advanced Boards" Enterprise add-on, and
+    **OpenProject 17.3.0 released all of them to the Community edition**
+    ("all action board types are now available in the Community edition").
+    The release the toolset is supported against is 17.3+, so on every
+    supported target this is simply true.
+
+    The check is therefore on the **version**, not on the Enterprise token.
+    A token check would be wrong in both directions: it says nothing on a
+    17.3+ instance (the boards module has no ``EnterpriseToken`` reference
+    left anywhere, the leftover ``ee.upsell.board_view`` string is defined
+    in the frontend bundle and never rendered, and ``board_view`` does not
+    appear in the bundle at all), while on a pre-17.3 instance the token is
+    exactly what decides it. Hence: 17.3+ **or** a token that covers it.
+
+    An unparseable version is treated as new enough. Every release that
+    still gates action boards is old enough to have a plain ``MAJOR.MINOR``
+    version, so a string this cannot read is not one of them, and refusing
+    Kanban on an unrecognised future release would be the wrong default.
+    """
+    if support.get("ee_board_view"):
+        return True
+
+    raw = str(support.get("op_version") or "")
+    match = re.match(r"(\d+)\.(\d+)", raw)
+    if not match:
+        return True
+    return (int(match.group(1)), int(match.group(2))) >= ACTION_BOARDS_COMMUNITY_SINCE
 
 
 def effective_board_strategy(op_client: OpenProjectClient | None) -> str:
@@ -102,9 +139,9 @@ def effective_board_strategy(op_client: OpenProjectClient | None) -> str:
 
     * no ``Boards::Grid`` (or a schema missing a column this migration
       writes) ⇒ ``query``, the saved-view path that works on every release;
-    * ``Boards::Grid`` but no Enterprise token for ``board_view`` ⇒
-      ``basic``, because an action board on a Community instance saves
-      fine and then renders as an upsell.
+    * ``Boards::Grid`` but no action boards (pre-17.3 without an Enterprise
+      token — see :func:`action_boards_available`) ⇒ ``basic``, which is
+      Community on every release that has boards at all.
 
     **Both** ``boards`` and ``agile_boards`` must resolve this the same
     way, which is why it lives in one place — the sprint pair learned that
@@ -140,10 +177,11 @@ def effective_board_strategy(op_client: OpenProjectClient | None) -> str:
         )
         return BOARD_STRATEGY_QUERY
 
-    if configured == BOARD_STRATEGY_KANBAN and not support.get("ee_board_view"):
+    if configured == BOARD_STRATEGY_KANBAN and not action_boards_available(support):
         config.logger.info(
-            "OpenProject %s has no Enterprise token for 'board_view' (action boards are the "
-            "Advanced Boards add-on); migrating boards as Basic boards instead of Kanban",
+            "OpenProject %s predates 17.3 (which released action boards to the Community "
+            "edition) and has no Enterprise token for 'board_view'; migrating boards as "
+            "Basic boards instead of Kanban",
             support.get("op_version") or "unknown",
         )
         return BOARD_STRATEGY_BASIC

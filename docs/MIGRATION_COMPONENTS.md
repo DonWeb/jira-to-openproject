@@ -48,7 +48,7 @@ The j2o migration tool consists of 40+ specialized migration components, each ha
 | WatcherMigration | `watchers` | Stable | Yes | Notifications |
 | **Agile** |
 | SprintMigration | `sprints` | Stable | Yes | Native OpenProject sprints (**17.6+**) |
-| BoardMigration | `boards` | Stable | Yes | Native OpenProject boards (`Boards::Grid`) |
+| BoardMigration | `boards` | Stable | Yes | Native OpenProject Kanban boards (**17.3+**) |
 | SprintEpicMigration | `sprint_epic` | Stable | Yes | Sprint/Epic links on WPs |
 | AgileBoardMigration | `agile_boards` | Stable | Yes | Sprint→Version and board→saved-query fallbacks |
 | VersionsMigration | `versions` | Stable | Yes | Release tracking |
@@ -645,28 +645,37 @@ the key and a Kanban board is `options = {type: 'action', attribute: 'status'}`.
 - Stops after `MAX_CONSECUTIVE_FAILURES` (5) consecutive errors, since a
   repeating failure is systemic rather than per-board
 
-**Version and edition tolerance**: the component probes the live instance once,
-logs `OpenProject <version> | native boards: ... | Enterprise board_view: ...`
-before writing anything, and picks the representation that instance can hold:
+**Version tolerance**: the component probes the live instance once, logs
+`OpenProject <version> | native boards: ... | Enterprise board_view: ...` before
+writing anything, and picks the representation that instance can hold:
 
 | Target | Boards become | Built by |
 |--------|---------------|----------|
-| `Boards::Grid` + Enterprise `board_view` | Kanban (status action board) | `BoardMigration` |
-| `Boards::Grid`, Community | Basic board | `BoardMigration` |
+| **17.3+** | Kanban (status action board) | `BoardMigration` |
+| boards module, pre-17.3, no Enterprise token | Basic board | `BoardMigration` |
 | no `Boards::Grid` | starred saved query | `AgileBoardMigration` |
 
-The edition row is the one that bites. Action boards are the **"Advanced
-Boards" Enterprise add-on**, and *nothing in the Rails backend refuses to save
-one without a token* — confirmed by a rollback-only dry run where an
-`options.type = 'action'` grid saved cleanly on a Community instance. The
-frontend then renders an Enterprise upsell where the board should be. So
-`kanban` on a Community target resolves to `basic` rather than reporting
-success over a board nobody can open.
+Action boards *used* to be the "Advanced Boards" Enterprise add-on;
+**17.3.0 released all of them to the Community edition**, and the toolset is
+supported on 17.3+, so every supported target gets Kanban. The Basic-board row
+exists only for an older instance, which is also the only place the Enterprise
+token still decides anything (`action_boards_available` checks the version
+first, the token second).
 
-`J2O_BOARD_STRATEGY` overrides the choice but cannot conjure a missing model or
-a missing token. Both `boards` and `agile_boards` read the decision from the
-same helper (`effective_board_strategy`) so they cannot disagree about which one
-owns the boards — the mistake the sprint pair had to be fixed for.
+Gating on the token alone would be wrong: this Community instance answers
+`EnterpriseToken.allows_to?(:board_view) == false` and renders a Kanban board
+anyway — confirmed by creating one. Three leftovers of the old gating survive
+and mislead (`ee.features.board_view` = "Advanced Boards", the module's
+`ee.upsell.board_view` string, and an `upsellBoards` text in the frontend
+bundle); none is load-bearing — the boards module has no `EnterpriseToken`
+reference left, `upsellBoards` is never rendered, and `board_view` does not
+appear anywhere in the frontend bundle.
+
+`J2O_BOARD_STRATEGY` overrides the choice but cannot conjure a missing model,
+or a token a pre-17.3 target lacks. Both `boards` and `agile_boards` read the
+decision from the same helper (`effective_board_strategy`) so they cannot
+disagree about which one owns the boards — the mistake the sprint pair had to
+be fixed for.
 
 **Jira mismatches resolved here**:
 - **A Jira column can hold several statuses** (four of the nine boards on this

@@ -37,16 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `OpenProjectSprintService` with native-sprint capability detection and an
   idempotent `ensure_project_sprint`.
 - `boards` component (`BoardMigration`) migrating Jira Software boards to
-  OpenProject's **native** boards (`Boards::Grid` plus one query-backed widget per
-  column) instead of a saved query per board. Selectable with `J2O_BOARD_STRATEGY`
+  OpenProject's **native Kanban** boards (`Boards::Grid` with
+  `options.type = 'action'`, plus one query-backed widget per column) instead of a
+  saved query per board. Selectable with `J2O_BOARD_STRATEGY`
   (`kanban` | `basic` | `query`), defaulting to `kanban` and resolved against the
-  live instance: action boards are the "Advanced Boards" Enterprise add-on, so a
-  Community target gets a Basic board, and a target with no boards module keeps the
-  saved-query path. The distinction matters because nothing in OpenProject's backend
-  refuses to save an action board without an Enterprise token — the row saves and the
-  frontend renders an upsell where the board should be.
-- `OpenProjectBoardService` with native-board capability detection (including the
-  Enterprise token state) and an idempotent, transactional `ensure_project_board`.
+  live instance. Kanban needs **17.3+**, the release that made all action board
+  types part of the Community edition; an older instance without an Enterprise
+  token gets a Basic board, and a target with no boards module keeps the
+  saved-query path. The check is on the version rather than on
+  `EnterpriseToken.allows_to?(:board_view)`, which still answers `false` on a
+  Community instance that renders Kanban perfectly well.
+- `OpenProjectBoardService` with native-board capability detection (version, grid
+  schema and Enterprise token state) and an idempotent, transactional
+  `ensure_project_board`.
 - `CHANGELOG.md` (this file) tracking release history.
 - `CONTRIBUTING.md` with branching, testing, and PR guidelines.
 - `.github/workflows/ci.yml` running `ruff`, `mypy`, `pytest`, and container tests on every push and pull request.

@@ -3,7 +3,8 @@
 Every case here comes from the live pair this migration actually runs
 against: a Jira Server/DC instance whose boards group several statuses
 into one column and span several projects, and an OpenProject 17.6.0
-Community instance where action boards are Enterprise-gated.
+Community instance — which, since 17.3 released action boards to the
+Community edition, renders a Kanban board with no Enterprise token.
 """
 
 from __future__ import annotations
@@ -56,7 +57,10 @@ class DummyOp:
         self,
         *,
         supported: bool = True,
-        ee_board_view: bool = True,
+        # Matches the live target: Community, no Enterprise token. Since 17.3
+        # that costs nothing — action boards are Community — so the default
+        # here should be the awkward case, not the comfortable one.
+        ee_board_view: bool = False,
         grid_columns: list[str] | None = None,
         op_version: str = "17.6.0",
         fail_with: str | None = None,
@@ -152,17 +156,38 @@ def _config(columns):
 # --------------------------------------------------------------------- #
 
 
-def test_kanban_falls_back_to_basic_without_an_enterprise_token(_kanban_configured) -> None:
-    """Action boards are the "Advanced Boards" Enterprise add-on.
+def test_kanban_is_available_on_community_since_17_3(_kanban_configured) -> None:
+    """17.3.0 released every action board type to the Community edition.
 
-    Nothing in the Rails backend refuses to save one without a token —
-    confirmed by a rollback-only dry run, where an ``options.type=action``
-    grid saved cleanly on a Community instance. The frontend then renders
-    an Enterprise upsell instead of the board, so a run that trusted the
-    save would report success over a board nobody can open.
+    Verified live: an ``options.type = 'action'`` board created on this
+    Community instance (no Enterprise token) renders as a working Kanban.
+    Gating on ``EnterpriseToken.allows_to?(:board_view)`` — which is
+    ``false`` here — would downgrade every supported target to a Basic
+    board for no reason. The leftovers that suggest otherwise (the
+    ``ee.features.board_view`` locale key, the module's ``ee.upsell``
+    string) are not load-bearing: the boards module has no
+    ``EnterpriseToken`` reference left and ``board_view`` does not appear
+    in the compiled frontend at all.
     """
-    assert effective_board_strategy(DummyOp(ee_board_view=True)) == BOARD_STRATEGY_KANBAN
-    assert effective_board_strategy(DummyOp(ee_board_view=False)) == BOARD_STRATEGY_BASIC
+    assert effective_board_strategy(DummyOp(ee_board_view=False, op_version="17.6.0")) == BOARD_STRATEGY_KANBAN
+    assert effective_board_strategy(DummyOp(ee_board_view=False, op_version="17.3.0")) == BOARD_STRATEGY_KANBAN
+
+
+def test_kanban_falls_back_to_basic_only_before_17_3(_kanban_configured) -> None:
+    """Before 17.3 action boards really were Enterprise-only."""
+    assert effective_board_strategy(DummyOp(ee_board_view=False, op_version="17.2.4")) == BOARD_STRATEGY_BASIC
+    # ...unless that older instance does hold a token covering them.
+    assert effective_board_strategy(DummyOp(ee_board_view=True, op_version="17.2.4")) == BOARD_STRATEGY_KANBAN
+
+
+def test_an_unreadable_version_does_not_cost_the_kanban_board(_kanban_configured) -> None:
+    """Every release that still gates action boards has a plain MAJOR.MINOR.
+
+    So a version string this cannot parse is not one of them, and refusing
+    Kanban on an unrecognised future release would be the wrong default.
+    """
+    assert effective_board_strategy(DummyOp(ee_board_view=False, op_version="")) == BOARD_STRATEGY_KANBAN
+    assert effective_board_strategy(DummyOp(ee_board_view=False, op_version="next")) == BOARD_STRATEGY_KANBAN
 
 
 def test_a_target_without_the_board_schema_falls_back_to_saved_views(_kanban_configured) -> None:
@@ -205,7 +230,7 @@ def test_a_basic_board_keeps_jiras_column_grouping(_mock_mappings, monkeypatch) 
         configs={4: _config([("To Gitlab", ["10200", "10003"]), ("In Progress", ["10105", "3"])])},
         projects_by_board={4: [{"key": "ES"}]},
     )
-    op = DummyOp(ee_board_view=False)
+    op = DummyOp()
     result = BoardMigration(jira_client=jira, op_client=op).run()
 
     assert result.success
@@ -229,7 +254,7 @@ def test_a_kanban_board_expands_a_multi_status_column(_mock_mappings, _kanban_co
         configs={4: _config([("To Gitlab", ["10200", "10003"]), ("Done", ["10002"])])},
         projects_by_board={4: [{"key": "ES"}]},
     )
-    op = DummyOp(ee_board_view=True)
+    op = DummyOp()
     result = BoardMigration(jira_client=jira, op_client=op).run()
 
     assert result.success

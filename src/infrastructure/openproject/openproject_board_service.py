@@ -25,14 +25,18 @@ Four consequences shape this service:
   (including a missing key) is a Basic board — ``board_type`` defaults to
   ``:free``. The demo data on this instance has both, which is how the
   two shapes were confirmed.
-* **Action boards are Enterprise.** ``board_view`` is listed under
-  ``en.ee.features`` as "Advanced Boards" and the module ships an upsell
-  string; on this Community instance ``EnterpriseToken.allows_to?(
-  :board_view)`` is ``false``. The rows still save — nothing in the
-  backend gates them — but the frontend shows the upsell instead of the
-  board, so writing an action board to a Community instance produces a
-  board nobody can open. :func:`detect_native_board_support` reports the
-  token state so the caller can pick Basic instead.
+* **Action boards are Community since 17.3.** They used to be the
+  "Advanced Boards" Enterprise add-on and the leftovers of that are
+  misleading: ``board_view`` is still listed under ``en.ee.features``, the
+  module still ships an ``ee.upsell.board_view`` string, and on this
+  Community instance ``EnterpriseToken.allows_to?(:board_view)`` is
+  ``false``. None of it is load-bearing — the boards module has no
+  ``EnterpriseToken`` reference left, ``board_view`` does not appear in
+  the compiled frontend at all, and the one ``upsellBoards`` string in the
+  bundle is defined and never rendered. Confirmed by creating a live
+  action board on this Community instance.
+  :func:`detect_native_board_support` still reports the token because a
+  pre-17.3 target is where it does decide.
 * **The widget's query key is ``queryId``, not ``query_id``.**
   ``Boards::Grid#contained_query_ids`` reads ``queryId`` first and falls
   back to ``query_id``; the create services only ever write ``queryId``.
@@ -130,10 +134,11 @@ class OpenProjectBoardService:
         a registered project module) and ``ee_board_view`` — whether the
         Enterprise token covers action boards.
 
-        ``ee_board_view`` is the field that decides Kanban vs Basic. Nothing
-        in the backend refuses to save an action board without it, so a run
-        that ignored this would report success and leave the user staring at
-        an Enterprise upsell where the board should be.
+        ``op_version`` is what decides Kanban vs Basic, not ``ee_board_view``:
+        17.3 released every action board type to the Community edition. The
+        token is reported alongside it because on a pre-17.3 target it is
+        still the deciding field. See
+        ``board_migration.action_boards_available``.
 
         A failed probe degrades to ``supported: False`` rather than raising,
         so a target without the boards module falls back to the saved-query

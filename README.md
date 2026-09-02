@@ -20,7 +20,7 @@ A robust, modular migration toolset for transferring project management data fro
 - **Attachment Migration:** Issue attachments → Work package files
 - **Time Log Migration:** Tempo worklogs → OpenProject time entries
 - **Workflow Automation:** Jira workflow transitions → OpenProject workflow entries per type/role
-- **Agile Boards & Sprints:** Jira sprints → OpenProject's native sprints on **17.6+**, or Versions on 17.5 and earlier; Jira boards → OpenProject's native boards — Kanban on an Enterprise target, Basic boards on Community, saved queries where the boards module is absent. All chosen automatically from the live instance (see [Entity Mapping §11](docs/ENTITY_MAPPING.md#11-agile-migration))
+- **Agile Boards & Sprints:** Jira sprints → OpenProject's native sprints on **17.6+**, or Versions on 17.5 and earlier; Jira boards → OpenProject's native **Kanban** boards on **17.3+** (Community included), or saved queries where the boards module is absent. All chosen automatically from the live instance (see [Entity Mapping §11](docs/ENTITY_MAPPING.md#11-agile-migration))
 - **Admin Schemes:** Jira role memberships → OpenProject project memberships
 - **Reporting Artefacts:** Jira saved filters & dashboards → OpenProject queries and wiki summaries
 
@@ -67,34 +67,36 @@ cannot make a release hold a column it does not have, so `native` on an older
 target still resolves to Versions. See
 [Entity Mapping §11](docs/ENTITY_MAPPING.md#11-agile-migration).
 
-#### Boards by OpenProject version *and edition*
-
-How Jira boards land depends on the edition as much as the version:
+#### Boards by OpenProject version
 
 | Target | Boards become |
 |--------|---------------|
-| `Boards::Grid` + Enterprise `board_view` | **Kanban** (status action board) |
-| `Boards::Grid`, Community | **Basic board** |
-| no boards module | Starred saved query (the legacy mapping) |
+| **17.3+** | **Kanban** (status action board) |
+| Boards module, pre-17.3 without Enterprise | Basic board |
+| No boards module | Starred saved query (the legacy mapping) |
 
 No configuration required: the migration probes the live instance at startup.
 
-Action boards — the Kanban one included — are the **"Advanced Boards" Enterprise
-add-on**, and nothing in OpenProject's backend refuses to save one without a
-token: the row saves and the frontend then shows an upgrade prompt where the
-board should be. So the choice is made against the Enterprise token, not against
-the write succeeding. A Basic board reproduces the same columns and the same
-cards; what it cannot do is change a work package's status when you drag a card
-between columns.
+Action boards — Kanban among them — *used* to be an Enterprise add-on, and
+**17.3.0 released all of them to the Community edition**. Since the toolset is
+supported on 17.3+, every supported target gets Kanban; the Basic-board row is
+there only for an older instance. Verified on a Community instance with no
+Enterprise token at all.
+
+Watch out for the leftovers if you go looking: `board_view` is still listed
+under `ee.features` as "Advanced Boards", the module still ships an upsell
+string, and `EnterpriseToken.allows_to?(:board_view)` still answers `false` on
+Community. None of it is load-bearing — the boards module has no
+`EnterpriseToken` reference left and `board_view` does not appear in the
+compiled frontend at all.
 
 One difference worth knowing before you look at the result: a Jira column can
-group several statuses. A Basic board keeps that grouping, because its columns
-are filters. A Kanban column *is* a status, so a grouped column is expanded into
-one column per status.
+group several statuses. A Kanban column *is* a status (dropping a card there
+sets it), so a grouped column is expanded into one column per status. Under
+`basic` the grouping is kept, because a Basic board's columns are only filters.
 
 `J2O_BOARD_STRATEGY` overrides the choice (`kanban` / `basic` / `query`) — it
-cannot conjure a missing model or a missing Enterprise token, so `kanban` on a
-Community target still resolves to a Basic board. See
+cannot conjure a model or an Enterprise token that a pre-17.3 target lacks. See
 [Entity Mapping §11](docs/ENTITY_MAPPING.md#11-agile-migration).
 
 ### Installation

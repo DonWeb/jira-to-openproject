@@ -33,7 +33,7 @@ This document provides a comprehensive mapping of how Jira entities are transfor
 | **Link Type** | Relation Type | `link_types` | Relation taxonomy |
 | **Watcher** | Watcher | `watchers` | Notification |
 | **Vote** | Custom Field Value | `votes_reactions` | On "Votes" CF |
-| **Board** | Board (native `Boards::Grid`) | `boards` | Kanban needs Enterprise; Community gets a Basic board, no boards module gets a saved query — see [§11](#11-agile-migration) |
+| **Board** | Board (native `Boards::Grid`) | `boards` | Kanban on **17.3+** (Community included); no boards module gets a saved query — see [§11](#11-agile-migration) |
 | **Filter** | Saved Query | `reporting` | Saved searches |
 | **Dashboard** | Wiki Page | `reporting` | Project overview |
 | **Role Membership** | Project Membership | `admin_schemes` | Access control |
@@ -524,28 +524,34 @@ Boards::Grid#board_type == options['type']&.to_sym || :free
 widget.options == { "queryId" => <Query#id>, "filters" => [...] }
 ```
 
-> **Which kind of board you get depends on the edition, not the version.**
-> Action boards — status/Kanban, assignee, version, subproject, parent-child —
-> are the **"Advanced Boards" Enterprise add-on** (`en.ee.features.board_view`).
-> Basic boards are Community.
->
-> Nothing in the Rails backend refuses to save an action board without a token:
-> a rollback-only dry run on this Community instance saved an
-> `options.type = 'action'` grid cleanly. The **frontend** then renders an
-> Enterprise upsell where the board should be. So the strategy is resolved
-> against `EnterpriseToken.allows_to?(:board_view)`, not against the save
-> succeeding:
+> **Kanban is Community from 17.3 on.** Action boards — status/Kanban,
+> assignee, version, subproject, parent-child — *used* to be the "Advanced
+> Boards" Enterprise add-on, and the 17.3.0 release notes state that "all
+> action board types are now available in the Community edition". Since the
+> toolset is supported on 17.3+, every supported target gets Kanban.
 >
 > | Target | Boards become | Built by |
 > |--------|---------------|----------|
-> | `Boards::Grid` + Enterprise `board_view` | Kanban (status action board) | `boards` |
-> | `Boards::Grid`, Community | Basic board | `boards` |
+> | **17.3+** | Kanban (status action board) | `boards` |
+> | boards module, pre-17.3, no Enterprise token | Basic board | `boards` |
 > | no `Boards::Grid` | starred saved query | `agile_boards` |
 >
+> The strategy is therefore resolved against the **version**, falling back to
+> the Enterprise token only for a pre-17.3 target
+> (`action_boards_available`). Do not gate on the token alone: this Community
+> instance answers `EnterpriseToken.allows_to?(:board_view) == false` and still
+> renders a Kanban board — confirmed by creating one. Three leftovers of the
+> old gating survive and mislead: `board_view` is still listed under
+> `en.ee.features` as "Advanced Boards", `modules/boards` still ships an
+> `ee.upsell.board_view` string, and the compiled frontend still defines an
+> `upsellBoards` text. None is load-bearing — the boards module has no
+> `EnterpriseToken` reference left, `upsellBoards` is never rendered, and
+> `board_view` does not appear anywhere in the frontend bundle.
+>
 > No configuration required. `J2O_BOARD_STRATEGY` overrides the choice but
-> cannot conjure a missing model or a missing token. Both components read the
-> decision from the same helper (`effective_board_strategy`) so they cannot
-> disagree about which one owns the boards.
+> cannot conjure a model, or a token a pre-17.3 target lacks. Both components
+> read the decision from the same helper (`effective_board_strategy`) so they
+> cannot disagree about which one owns the boards.
 
 Two mismatches with Jira are resolved before the write:
 
@@ -603,13 +609,13 @@ every release, so it is what a target with no `Boards::Grid` gets.
 
 What the two native kinds cost, relative to Jira:
 
-- A *Basic board* (Community) reproduces the board's columns and their cards
-  faithfully — its columns are filters, so a Jira column grouping three statuses
-  stays one column. What it cannot do is act: dragging a card between columns
-  does not change the work package's status.
-- A *Kanban board* (Enterprise) does act on a drop, which is the semantics a
-  Jira board column actually carries. The price is that a column is exactly one
+- A *Kanban board* (the default) acts on a drop, which is the semantics a Jira
+  board column actually carries. The price is that a column is exactly one
   status, so Jira's grouped columns are expanded.
+- A *Basic board* reproduces the board's columns and their cards faithfully —
+  its columns are filters, so a Jira column grouping three statuses stays one
+  column. What it cannot do is act: dragging a card between columns does not
+  change the work package's status. It is the fallback for a pre-17.3 target.
 
 Both are a closer match than a saved query, which reproduces neither the columns
 nor the cards — it records the board's shape in a description and lists the

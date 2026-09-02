@@ -406,7 +406,7 @@ def test_agile_board_migration_creates_no_queries_when_native_boards_take_over(
     result = mig._load(mapped)
 
     assert result.success is True
-    assert mapped.details["board_strategy"] == "basic"
+    assert mapped.details["board_strategy"] == "kanban"
     assert op.created_queries == []
     assert result.details["queries_created"] == 0
     # The sprint half is untouched by the board strategy.
