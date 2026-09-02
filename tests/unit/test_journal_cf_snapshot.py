@@ -1501,7 +1501,12 @@ def test_the_template_numbers_the_journals_it_actually_keeps() -> None:
 
 TIPOS_POR_ID = {"10004": 7, "10005": 4}
 TIPOS_POR_NOMBRE = {"Bug": {"openproject_id": 7}, "Task": {"openproject_id": 4}}
-PROYECTOS = {"ES": {"openproject_id": 42}, "ESUX": {"openproject_id": 47}}
+# La forma real de ``project_mapping``: indexado por clave de proyecto, con el
+# nombre de Jira adentro. El id numerico de Jira no se guarda en ningun lado.
+PROYECTOS = {
+    "ES": {"jira_key": "ES", "jira_name": "EnvialoSimple", "openproject_id": 42},
+    "ESUX": {"jira_key": "ESUX", "jira_name": "EnvialoSimple UX", "openproject_id": 46},
+}
 
 
 def test_issuetype_resolves_by_id_where_it_used_to_fall_through_to_a_note(
@@ -1573,20 +1578,53 @@ def test_an_unresolvable_issue_type_leaves_the_previous_one(
 def test_a_project_move_becomes_a_project_id_change(
     component: WorkPackageMigration,
 ) -> None:
-    """``from``/``to`` carry Jira project ids; ``project_mapping`` is keyed by key."""
+    """The item shape is taken from the live Jira, not invented.
+
+    ``from``/``to`` carry the Jira project *id* and ``fromString``/``toString``
+    the project *name* — verified on ESUX-4: ``from='10001',
+    fromString='EnvialoSimple', to='10202', toString='EnvialoSimple UX'``.
+    ``project_mapping`` is keyed by project *key* and stores the numeric Jira id
+    nowhere, so the name is the only resolvable side.
+
+    The first version of this test fabricated the item with a project key in
+    ``toString``, which "passed" against a resolver that could not handle real
+    data: all 27 project moves stayed comments in the live run.
+    """
     component.project_mapping = PROYECTOS
     component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
         (
             "2026-02-03T10:00:00.000-0300",
-            [{"field": "project", "fieldId": "", "from": "10000", "fromString": "ES",
-              "to": "10100", "toString": "ESUX"}],
+            [{"field": "project", "fieldId": "", "from": "10001",
+              "fromString": "EnvialoSimple", "to": "10202",
+              "toString": "EnvialoSimple UX"}],
         ),
     )
 
     ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
 
-    assert _real(ops)[0]["field_changes"]["project_id"] == [42, 47]
+    assert _real(ops)[0]["field_changes"]["project_id"] == [42, 46]
     assert _real(ops)[0]["notes"] == ""
+
+
+def test_a_project_name_that_is_not_mapped_is_not_forced(
+    component: WorkPackageMigration,
+) -> None:
+    """``project_id`` is NOT NULL, so an unknown project leaves the work package
+    where it is and the note carries the names."""
+    component.project_mapping = PROYECTOS
+    component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
+        (
+            "2026-02-03T10:00:00.000-0300",
+            [{"field": "project", "fieldId": "", "from": "10001",
+              "fromString": "EnvialoSimple", "to": "99999",
+              "toString": "Proyecto Desconocido"}],
+        ),
+    )
+
+    ops = component._build_rails_ops_for_issue(_issue(), {"id": 1552, "jira_key": JIRA_KEY})
+
+    assert "field_changes" not in _real(ops)[0]
+    assert "Proyecto Desconocido" in _real(ops)[0]["notes"]
 
 
 def test_an_epic_link_becomes_a_parent_change(
@@ -1674,7 +1712,7 @@ def test_none_of_the_six_produces_a_comment_with_the_mappings_wired(
     component.work_package_mapping = {"10126": {"jira_key": "EF-38", "openproject_id": 1583}}
     valores = {
         "issuetype": ("10004", "Bug", "10005", "Task"),
-        "project": ("10100", "ESUX", "10000", "ES"),
+        "project": ("10202", "EnvialoSimple UX", "10001", "EnvialoSimple"),
         "Epic Link": ("", "EF-38", "", ""),
         "timeestimate": ("7200", "7200", "3600", "3600"),
     }.get(jira_field, ("", "algo", "", "otra cosa"))

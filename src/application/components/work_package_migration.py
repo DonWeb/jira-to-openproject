@@ -1436,17 +1436,51 @@ class WorkPackageMigration(BaseMigration):
                 return resolved
         return None
 
-    def _resolve_project_id(self, raw_key: str | None) -> int | None:
-        """Resolve a Jira project key to an OpenProject project id.
+    def _resolve_project_id(self, raw: str | None) -> int | None:
+        """Resolve a Jira project to an OpenProject project id.
 
-        A ``project`` changelog item reports the project *id* in ``from``/``to``
-        and the *key* in ``fromString``/``toString``; ``project_mapping`` is keyed
-        by key, so only the latter is usable.
+        A ``project`` changelog item reports the Jira project *id* in
+        ``from``/``to`` and the project *name* in ``fromString``/``toString``.
+        Checked against the live Jira on ESUX-4: ``from='10001',
+        fromString='EnvialoSimple', to='10202', toString='EnvialoSimple UX'``.
+
+        ``project_mapping`` is keyed by project **key** ("ESUX") and stores the
+        numeric Jira id nowhere, so neither half of the changelog item matches the
+        key. What each entry does carry is ``jira_name`` — exactly the
+        ``toString`` — so the name is the only usable side, and it needs an index
+        built over the values.
+
+        The first version of this looked ``toString`` up against the keys and
+        never matched, leaving all 27 project moves as comments in the live run.
+        It passed a local check because that check fabricated the changelog item
+        with a project key in ``toString`` instead of taking the shape from Jira.
         """
-        project_mapping = getattr(self, "project_mapping", None) or {}
-        if not raw_key:
+        if not raw:
             return None
-        return self._mapped_openproject_id(project_mapping.get(str(raw_key).strip()))
+        project_mapping = getattr(self, "project_mapping", None) or {}
+        candidate = str(raw).strip()
+
+        # Direct hit on the key, which is how a fixture or a legacy mapping may
+        # phrase it.
+        resolved = self._mapped_openproject_id(project_mapping.get(candidate))
+        if resolved:
+            return resolved
+
+        by_name = getattr(self, "_project_id_by_name", None)
+        if by_name is None:
+            by_name = {}
+            for entry in project_mapping.values():
+                if not isinstance(entry, dict):
+                    continue
+                op_id = self._mapped_openproject_id(entry)
+                if not op_id:
+                    continue
+                for name_field in ("jira_name", "openproject_name", "jira_key"):
+                    name = entry.get(name_field)
+                    if name:
+                        by_name.setdefault(str(name), op_id)
+            self._project_id_by_name = by_name
+        return by_name.get(candidate)
 
     def _resolve_work_package_id(self, raw_key: str | None) -> int | None:
         """Resolve a Jira issue key to the work package it became.
