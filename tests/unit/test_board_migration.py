@@ -64,8 +64,10 @@ class DummyOp:
         grid_columns: list[str] | None = None,
         op_version: str = "17.6.0",
         fail_with: str | None = None,
+        active_sprints: dict[int, int] | None = None,
     ) -> None:
         self.created_boards: list[dict] = []
+        self._active_sprints = active_sprints or {}
         self._supported = supported
         self._ee = ee_board_view
         self._grid_columns = GRID_COLUMNS if grid_columns is None else grid_columns
@@ -96,8 +98,18 @@ class DummyOp:
             "board_type": payload.get("board_type"),
             "columns_written": len(payload.get("columns") or []),
             "query_ids": list(range(len(payload.get("columns") or []))),
+            "linked_sprint_id": payload.get("sprint_id"),
             "module_enabled": True,
         }
+
+    # ``BoardMigration`` reaches the sprint lookup through ``op_client.boards``,
+    # mirroring the real client's service composition.
+    @property
+    def boards(self):
+        return self
+
+    def active_sprint_by_project(self):
+        return dict(self._active_sprints)
 
 
 @pytest.fixture
@@ -136,8 +148,9 @@ def _kanban_configured(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(cfg.migration_config, "board_strategy", BOARD_STRATEGY_KANBAN)
 
 
-def _board(board_id=4, name="Desarrollo", columns=None):
-    return {"id": board_id, "name": name, "type": "scrum"}
+def _board(board_id=4, name="Desarrollo", board_type="kanban"):
+    """A kanban board by default: no sprint scope, so column shaping stands alone."""
+    return {"id": board_id, "name": name, "type": board_type}
 
 
 def _config(columns):
@@ -243,11 +256,13 @@ def test_a_basic_board_keeps_jiras_column_grouping(_mock_mappings, monkeypatch) 
 
 
 def test_a_kanban_board_expands_a_multi_status_column(_mock_mappings, _kanban_configured) -> None:
-    """A Kanban column *is* a status — the frontend writes it onto a dropped card.
+    """OpenProject honours only the FIRST value of an action column's filter.
 
-    Two statuses behind one column would leave the drop target ambiguous, so
-    the column is expanded into one column per status and the Jira column it
-    came from is kept in the name.
+    Verified on the live instance: a column filtered on "Testing failed +
+    To Do" rendered as "Estado / Testing failed" and showed only that
+    status's cards — the second status was silently dropped from view. So a
+    grouped Jira column has to become one column per status, in Jira's
+    order, or the board quietly lies about what is on it.
     """
     jira = DummyJira(
         boards=[_board()],
@@ -261,23 +276,60 @@ def test_a_kanban_board_expands_a_multi_status_column(_mock_mappings, _kanban_co
     written = op.created_boards[0]
     assert written["board_type"] == BOARD_TYPE_ACTION
     assert written["attribute"] == BOARD_ATTRIBUTE_STATUS
-    assert [c["name"] for c in written["columns"]] == [
-        "To Gitlab · Migrado a GitLab",
-        "To Gitlab · To Do",
-        "Done",
-    ]
     assert [c["status_ids"] for c in written["columns"]] == [[25], [18], [28]]
     assert result.details["columns_added_by_kanban_expansion"] == 1
 
 
-def test_a_column_with_no_statuses_survives_as_a_manual_list(_mock_mappings, _kanban_configured) -> None:
-    """A Jira kanban backlog column has no status of its own.
+def test_a_kanban_column_is_named_after_its_status(_mock_mappings, _kanban_configured) -> None:
+    """An action board renders its header from the status, not the query name.
 
-    Both live kanban boards here open with an empty "Backlog" column. It is
-    a real column, not a mapping failure, so it must reach OpenProject — as
-    a manually curated list, which is what an empty ``status_ids`` means to
-    ``ensure_project_board``.
+    The live board showed "Estado / Testing failed" over a column whose
+    query was called something else entirely, so a "<column> · <status>"
+    name would be invisible while making the query list harder to read.
+    ``StatusBoardCreateService`` names its queries after the status too.
     """
+    jira = DummyJira(
+        boards=[_board()],
+        configs={4: _config([("To Gitlab", ["10200", "10003"]), ("Done", ["10002"])])},
+        projects_by_board={4: [{"key": "ES"}]},
+    )
+    op = DummyOp()
+    BoardMigration(jira_client=jira, op_client=op).run()
+
+    assert [c["name"] for c in op.created_boards[0]["columns"]] == [
+        "Migrado a GitLab",
+        "To Do",
+        "HECHO",
+    ]
+
+
+def test_a_statusless_column_is_dropped_from_a_kanban_board(_mock_mappings, _kanban_configured) -> None:
+    """An action board cannot render a column with no status behind it.
+
+    Both live kanban boards open with an empty "Backlog" column. On the
+    action board it came out as an unnamed empty box — no header, since the
+    header is the status name, and nothing droppable, since there is no
+    status to set. Carrying it across buys a broken column, so it goes.
+    """
+    jira = DummyJira(
+        boards=[_board(board_id=13, name="Soporte")],
+        configs={13: _config([("Backlog", []), ("Por Hacer", ["10003"])])},
+        projects_by_board={13: [{"key": "ES"}]},
+    )
+    op = DummyOp()
+    result = BoardMigration(jira_client=jira, op_client=op).run()
+
+    assert result.success
+    assert [c["name"] for c in op.created_boards[0]["columns"]] == ["To Do"]
+    assert result.details["columns_dropped_statusless"] == 1
+
+
+def test_a_statusless_column_survives_on_a_basic_board(_mock_mappings, monkeypatch) -> None:
+    """A Basic board's list needs no status, so the backlog column keeps its place."""
+    import src.config as cfg
+
+    monkeypatch.setitem(cfg.migration_config, "board_strategy", BOARD_STRATEGY_BASIC)
+
     jira = DummyJira(
         boards=[_board(board_id=13, name="Soporte")],
         configs={13: _config([("Backlog", []), ("Por Hacer", ["10003"])])},
@@ -290,6 +342,7 @@ def test_a_column_with_no_statuses_survives_as_a_manual_list(_mock_mappings, _ka
     written = op.created_boards[0]
     assert [c["name"] for c in written["columns"]] == ["Backlog", "Por Hacer"]
     assert written["columns"][0]["status_ids"] == []
+    assert result.details["columns_dropped_statusless"] == 0
 
 
 def test_a_column_whose_statuses_are_all_unmapped_is_dropped_not_emptied(
@@ -313,7 +366,8 @@ def test_a_column_whose_statuses_are_all_unmapped_is_dropped_not_emptied(
 
     assert result.success
     written = op.created_boards[0]
-    assert [c["name"] for c in written["columns"]] == ["Done"]
+    # One column left, named after the status the way an action board reads it.
+    assert [c["name"] for c in written["columns"]] == ["HECHO"]
     assert result.details["columns_dropped_unmapped_status"] == 1
     assert result.details["unresolved_jira_statuses"] == ["10300"]
 
@@ -445,3 +499,93 @@ def test_the_query_strategy_writes_no_boards(_mock_mappings, monkeypatch) -> Non
     assert result.success
     assert op.created_boards == []
     assert result.details["skipped_by_strategy"] is True
+
+
+# --------------------------------------------------------------------- #
+# sprint scoping                                                        #
+# --------------------------------------------------------------------- #
+
+
+def test_a_scrum_board_is_scoped_to_the_projects_active_sprint(
+    _mock_mappings,
+    _kanban_configured,
+) -> None:
+    """A Jira scrum board is a view of the active sprint, not of the project.
+
+    This is the difference between a faithful board and a wrong one, not a
+    refinement: side by side, Jira's 'Desarrollo' board showed the twelve
+    cards of Sprint v0.0.262 while the unscoped migrated board showed 122
+    in a single column — the project's entire backlog in that status.
+    """
+    jira = DummyJira(
+        boards=[_board(board_type="scrum")],
+        configs={4: _config([("Done", ["10002"])])},
+        projects_by_board={4: [{"key": "ES"}]},
+    )
+    op = DummyOp(active_sprints={42: 130})
+    result = BoardMigration(jira_client=jira, op_client=op).run()
+
+    assert result.success
+    assert op.created_boards[0]["sprint_id"] == 130
+    assert result.details["boards_scoped_to_a_sprint"] == 1
+
+
+def test_a_kanban_board_is_not_scoped_to_a_sprint(_mock_mappings, _kanban_configured) -> None:
+    """A Jira kanban board really is a view of the whole project."""
+    jira = DummyJira(
+        boards=[_board(board_id=14, name="Pizarra UX/UI", board_type="kanban")],
+        configs={14: _config([("Done", ["10002"])])},
+        projects_by_board={14: [{"key": "ES"}]},
+    )
+    op = DummyOp(active_sprints={42: 130})
+    result = BoardMigration(jira_client=jira, op_client=op).run()
+
+    assert result.success
+    assert op.created_boards[0]["sprint_id"] is None
+    assert result.details["boards_scoped_to_a_sprint"] == 0
+
+
+def test_a_scrum_board_without_an_active_sprint_is_reported_not_dropped(
+    _mock_mappings,
+    _kanban_configured,
+) -> None:
+    """Two of the target projects have no active sprint at all.
+
+    An unscoped board is still worth having — it is what this component
+    produced before sprint scoping existed — but the user has to be told
+    which boards show more than Jira would.
+    """
+    jira = DummyJira(
+        boards=[_board(board_type="scrum")],
+        configs={4: _config([("Done", ["10002"])])},
+        projects_by_board={4: [{"key": "ES"}]},
+    )
+    op = DummyOp(active_sprints={})
+    result = BoardMigration(jira_client=jira, op_client=op).run()
+
+    assert result.success
+    assert op.created_boards[0]["sprint_id"] is None
+    assert result.details["scrum_boards_without_active_sprint"] == [
+        {"board_id": 4, "board_name": "Desarrollo", "project_key": "ES"},
+    ]
+
+
+def test_an_unreadable_sprint_list_still_produces_boards(_mock_mappings, _kanban_configured) -> None:
+    """A target with no Sprint model must get unscoped boards, not no boards."""
+
+    class NoSprints(DummyOp):
+        def active_sprint_by_project(self):
+            msg = "no Sprint model"
+            raise RuntimeError(msg)
+
+    jira = DummyJira(
+        boards=[_board(board_type="scrum")],
+        configs={4: _config([("Done", ["10002"])])},
+        projects_by_board={4: [{"key": "ES"}]},
+    )
+    op = NoSprints()
+    result = BoardMigration(jira_client=jira, op_client=op).run()
+
+    assert result.success
+    assert len(op.created_boards) == 1
+    assert op.created_boards[0]["sprint_id"] is None

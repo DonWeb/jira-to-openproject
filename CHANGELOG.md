@@ -237,6 +237,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aside expecting a component that also steps aside.
 - `boards` logs the OpenProject version, the grid columns it found and whether the
   Enterprise token covers `board_view` before writing anything.
+- `boards` scopes a Jira **scrum** board to its project's active sprint, through a
+  board-level `sprint_id` filter plus `linked_type`/`linked_id`, the way
+  `Boards::SprintTaskBoardCreateService` does. A scrum board in Jira is a view of
+  the active sprint, not of the project: unscoped, the migrated `Desarrollo` board
+  showed 122 cards in a column where Jira showed one. Scoped, all six of its
+  columns reconcile card for card. Kanban boards get no scope — they really are a
+  view of the project.
+- A Kanban column is named after its **status** and carries exactly one. An action
+  board renders its header from the status and honours only the first value of the
+  column's filter, so a column filtered on two statuses appeared under the first
+  one's name and silently hid the other's cards. A column with no status at all is
+  dropped under `kanban` (it rendered as an unnamed, undroppable empty box) and
+  kept as a manual list under `basic`.
 - `Dockerfile.test` now includes OCI labels and a `HEALTHCHECK`.
 - All Python dependencies upgraded to their latest compatible releases (see commit history and `uv.lock`).
 

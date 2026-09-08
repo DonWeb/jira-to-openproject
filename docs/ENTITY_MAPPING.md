@@ -553,18 +553,43 @@ widget.options == { "queryId" => <Query#id>, "filters" => [...] }
 > read the decision from the same helper (`effective_board_strategy`) so they
 > cannot disagree about which one owns the boards.
 
-Two mismatches with Jira are resolved before the write:
+Three mismatches with Jira are resolved before the write:
 
+- **A Jira scrum board shows the active sprint, not the project.** This is the
+  difference between a faithful board and a wrong one. Side by side, Jira's
+  `Desarrollo` board showed the twelve cards of Sprint v0.0.262 while the
+  unscoped migrated board showed 122 in a single column — the project's whole
+  backlog in that status. A scrum board is therefore scoped the way
+  `SprintTaskBoardCreateService` scopes its own: a `sprint_id` filter in
+  `grid.options['filters']` plus `linked_type`/`linked_id` pointing at the
+  sprint. The column queries stay status-only; the board-level filter is what
+  narrows them. A kanban board *is* a view of the project, so it gets no scope.
+  Rebuilt that way, all six Jira columns reconcile card for card — 12 and 12.
 - **A Jira column can hold several statuses.** Four of the nine boards on this
   instance group two or three — "Done Produccion" is `10103, 10107, 10002`. A
-  Basic board keeps that grouping, because its columns are just filters. A
-  Kanban column *is* a status (the frontend writes it onto a dropped card), so a
-  grouped column is expanded into one column per status, named
-  `<column> · <status>`.
+  Basic board keeps that grouping, because its columns are just filters. On an
+  action board OpenProject honours only the **first** value of a column's
+  filter: a column filtered on "Testing failed + To Do" rendered as
+  "Estado / Testing failed" and silently hid the other status's cards. So a
+  grouped column is expanded into one column per status, in Jira's order.
+  Each column is named after its **status**, because an action board renders
+  its header from the status and ignores the query name — the same thing
+  `StatusBoardCreateService` does. A column with no statuses at all is dropped
+  under Kanban (it rendered as an unnamed, undroppable empty box) and kept as a
+  manual list under Basic.
 - **A Jira board can span several projects, an OpenProject board cannot.**
   `Boards::Grid belongs_to :project`; two boards here reach four Jira projects
   each. The board is created in the first mapped project and the projects it
   does not cover are listed in `details.multi_project_boards`.
+
+Two Jira board settings are deliberately **not** translated, having been checked
+rather than assumed. Every board's saved filter resolves to a bare
+`project = X ORDER BY Rank` (fetched through `/rest/api/2/filter/{id}`; the
+board configuration endpoint returns only the filter's id, not its JQL), so it
+restricts nothing the project scope does not already cover. And the kanban
+sub-filter `fixVersion in unreleasedVersions() OR fixVersion is EMPTY` is a
+no-op here: no migrated work package carries a version at all, so every one
+satisfies it.
 
 A column whose statuses are all absent from the `status` mapping is **dropped**
 rather than emitted without a filter — an unfiltered column would show the

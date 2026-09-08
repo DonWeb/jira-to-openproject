@@ -201,3 +201,67 @@ def test_ensure_project_board_never_escapes_an_exception() -> None:
 
     result = service.ensure_project_board(42, name="Desarrollo", columns=[])
     assert result == {"success": False, "error": "boom"}
+
+
+def test_a_sprint_scopes_the_board_not_its_columns(service) -> None:
+    """``SprintTaskBoardCreateService`` puts the sprint filter on the grid.
+
+    The column queries stay status-only; ``options['filters']`` is what
+    narrows the board. Filtering each column by sprint instead would be
+    ignored, because an action column honours only its status filter.
+    """
+    service.ensure_project_board(
+        42,
+        name="Desarrollo",
+        columns=[{"name": "HECHO", "status_ids": [28]}],
+        board_type=BOARD_TYPE_ACTION,
+        attribute=BOARD_ATTRIBUTE_STATUS,
+        sprint_id=130,
+    )
+    script = _script(service)
+    assert _payload(service)["sprint_id"] == 130
+    assert "'sprint_id' => { 'operator' => '=', 'values' => [sprint_id.to_s] }" in script
+    # Linked as well as filtered, so the board shows up as the sprint's board.
+    assert "board.linked_type = 'Sprint'" in script
+    assert "board.linked_id = sprint_id" in script
+
+
+def test_no_sprint_clears_a_stale_scope(service) -> None:
+    """A re-run after the sprint completed must not keep pointing at it."""
+    service.ensure_project_board(
+        42,
+        name="Desarrollo",
+        columns=[{"name": "HECHO", "status_ids": [28]}],
+        board_type=BOARD_TYPE_ACTION,
+        attribute=BOARD_ATTRIBUTE_STATUS,
+    )
+    script = _script(service)
+    assert _payload(service)["sprint_id"] is None
+    assert "options.delete('filters')" in script
+    assert "board.linked_type = nil" in script
+
+
+def test_the_sprint_must_belong_to_the_board_s_project(service) -> None:
+    """Scoping a board to another project's sprint would empty it silently."""
+    service.ensure_project_board(
+        42,
+        name="Desarrollo",
+        columns=[{"name": "HECHO", "status_ids": [28]}],
+        sprint_id=130,
+    )
+    assert "Sprint.exists?(id: sprint_id, project_id: project.id)" in _script(service)
+
+
+def test_active_sprint_lookup_degrades_to_an_empty_map() -> None:
+    """No Sprint model means unscoped boards, not a failed run."""
+    client = MagicMock()
+    client.logger = MagicMock()
+    client.execute_query_to_json_file = MagicMock(side_effect=RuntimeError("boom"))
+    assert OpenProjectBoardService(client).active_sprint_by_project() == {}
+
+
+def test_active_sprint_lookup_keys_by_project() -> None:
+    client = MagicMock()
+    client.logger = MagicMock()
+    client.execute_query_to_json_file = MagicMock(return_value={"sprints": [[42, 130], [48, 264]]})
+    assert OpenProjectBoardService(client).active_sprint_by_project() == {42: 130, 48: 264}

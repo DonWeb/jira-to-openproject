@@ -801,6 +801,7 @@ class OpenProjectClient:
         columns: list[dict[str, Any]],
         board_type: str = "free",
         attribute: str | None = None,
+        sprint_id: int | None = None,
         description: str | None = None,
     ) -> dict[str, Any]:
         """Thin delegator over ``self.boards.ensure_project_board``."""
@@ -810,6 +811,7 @@ class OpenProjectClient:
             columns=columns,
             board_type=board_type,
             attribute=attribute,
+            sprint_id=sprint_id,
             description=description,
         )
 

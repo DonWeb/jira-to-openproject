@@ -48,6 +48,22 @@ Four consequences shape this service:
   values"), which is a validation failure rather than an exception and so
   would otherwise be swallowed into a board with no columns. Confirmed by
   a rollback-only dry run against the live instance.
+* **An action board's column is one status, and its own filter is
+  ignored.** The frontend renders the column header from the *status*, not
+  from the ``Query`` name, and honours only the **first** value of the
+  column's ``status_id`` filter. Confirmed on the live instance: a column
+  filtered on ``[35, 18]`` rendered as "Estado / Testing failed" and showed
+  only that status's cards. So a column must carry exactly one status, and
+  naming its query anything but the status name is invisible — which is
+  why :data:`BOARD_QUERY_SORT_CRITERIA`'s neighbours here mirror
+  ``StatusBoardCreateService`` exactly.
+* **A board is scoped by ``options['filters']``, not by its columns.**
+  ``SprintTaskBoardCreateService`` writes
+  ``filters: [{sprint_id: {operator: '=', values: [id]}}]`` at the grid
+  level and links the grid to the sprint through ``linked_type``/
+  ``linked_id``. That is the mechanism a migrated Jira scrum board needs:
+  without it the board shows the project's whole backlog instead of the
+  active sprint — 122 cards where Jira showed 13.
 
 Idempotency is anchored on the **board**, not on its queries. Column
 names repeat freely — one Jira board here has two columns both called
@@ -204,6 +220,7 @@ class OpenProjectBoardService:
         columns: list[dict[str, Any]],
         board_type: str = BOARD_TYPE_FREE,
         attribute: str | None = None,
+        sprint_id: int | None = None,
         description: str | None = None,
     ) -> dict[str, Any]:
         """Create or update a board, idempotently on ``(project_id, name)``.
@@ -211,8 +228,17 @@ class OpenProjectBoardService:
         ``columns`` is an ordered list of ``{"name": str, "status_ids":
         [int, ...]}``. A column with no ``status_ids`` becomes a manually
         curated list (the ``manual_sort`` filter OpenProject's own Basic
-        board uses) — that is the faithful rendering of a Jira kanban
-        backlog column, which has no status of its own.
+        board uses).
+
+        ``sprint_id`` scopes the **whole board** to one sprint, the way
+        OpenProject's own ``SprintTaskBoardCreateService`` does it: a
+        ``sprint_id`` filter in ``grid.options['filters']`` plus
+        ``linked_type``/``linked_id`` pointing at the sprint. The per-column
+        queries stay status-only — the board-level filter is what narrows
+        them, and it is the only thing that makes a migrated Jira scrum
+        board show the sprint's cards rather than the project's whole
+        backlog. Passing ``None`` clears both on a re-run, so a board whose
+        sprint has since been completed does not keep pointing at it.
 
         Returns ``{success, id, created, updated, columns_written,
         query_ids, ...}`` on success or a ``{success: False, error: ...}``
@@ -234,6 +260,7 @@ class OpenProjectBoardService:
                 "name": name,
                 "board_type": board_type,
                 "attribute": attribute,
+                "sprint_id": int(sprint_id) if sprint_id else None,
                 "description": description,
                 "columns": [
                     {
@@ -306,6 +333,27 @@ JSON_DATA
                         options.delete('attribute')
                       end
                       options['highlightingMode'] ||= 'priority'
+
+                      # Board-level filter, the shape SprintTaskBoardCreateService
+                      # writes. This is what scopes the board to a sprint; the
+                      # column queries stay status-only. Cleared when no sprint
+                      # is given so a re-run cannot leave a board pointing at a
+                      # sprint it no longer belongs to.
+                      sprint_id = input['sprint_id']
+                      if sprint_id && Sprint.exists?(id: sprint_id, project_id: project.id)
+                        options['filters'] = [
+                          {{ 'sprint_id' => {{ 'operator' => '=', 'values' => [sprint_id.to_s] }} }}
+                        ]
+                        board.linked_type = 'Sprint'
+                        board.linked_id = sprint_id
+                        linked_sprint = sprint_id
+                      else
+                        options.delete('filters')
+                        board.linked_type = nil
+                        board.linked_id = nil
+                        linked_sprint = nil
+                      end
+
                       board.options = options
                       board.row_count = 1
                       board.column_count = [input['min_column_count'].to_i, columns.length].max
@@ -386,6 +434,8 @@ JSON_DATA
                                   column_count: board.column_count,
                                   query_ids: query_ids,
                                   orphaned_queries_removed: orphaned.length,
+                                  linked_sprint_id: linked_sprint,
+                                  sprint_requested: sprint_id,
                                   module_enabled: module_enabled }}
                     end
 
@@ -414,6 +464,47 @@ JSON_DATA
             return {"success": False, "error": str(exc)}
 
     # ── reads ────────────────────────────────────────────────────────────
+
+    def active_sprint_by_project(self) -> dict[int, int]:
+        """Return ``{project_id: sprint_id}`` for every project's active sprint.
+
+        A Jira scrum board shows the **active sprint**, not the project's
+        backlog, so this is what a migrated scrum board has to be scoped to.
+        Read from OpenProject rather than from the ``sprint`` mapping on
+        purpose: the mapping records no status, and ``SprintMigration`` may
+        have demoted a sprint to ``in_planning`` to satisfy OpenProject's
+        one-active-per-project rule. Asking the instance means the board
+        agrees with what the sprint migration actually wrote.
+
+        That rule also makes the result unambiguous — at most one active
+        sprint per project — so a plain dict is the right shape.
+
+        Returns an empty dict if the instance has no ``Sprint`` model or the
+        probe fails; the caller then builds an unscoped board, which is the
+        pre-sprint behaviour rather than a failure.
+        """
+        script = """
+        begin
+          if defined?(Sprint)
+            { sprints: Sprint.where(status: 'active').pluck(:project_id, :id) }
+          else
+            { sprints: [], error: 'no Sprint model on this instance' }
+          end
+        rescue => e
+          { sprints: [], error: "#{e.class}: #{e.message}" }
+        end
+        """
+        try:
+            result = self._client.execute_query_to_json_file(script, timeout=60)
+        except Exception as exc:
+            self._logger.warning("Failed to read active sprints: %s", exc)
+            return {}
+
+        if not isinstance(result, dict):
+            return {}
+        if result.get("error"):
+            self._logger.warning("Could not read active sprints: %s", result["error"])
+        return {int(project_id): int(sprint_id) for project_id, sprint_id in result.get("sprints") or []}
 
     def count_project_boards(self) -> int:
         """Return how many ``Boards::Grid`` rows exist, for post-run verification.

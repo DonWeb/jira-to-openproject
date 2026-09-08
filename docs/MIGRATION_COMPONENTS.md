@@ -630,8 +630,11 @@ the key and a Kanban board is `options = {type: 'action', attribute: 'status'}`.
   a dragged order). Those queries are `hidden` — attached to no `View` — so they
   do not clutter the saved-views list
 - A column with **no** statuses (a Jira kanban backlog column — both kanban
-  boards on this instance open with one) becomes a manually curated list, the
-  `manual_sort`/`ow` shape OpenProject's own Basic board uses
+  boards on this instance open with one) becomes a manually curated list under
+  `basic`, the `manual_sort`/`ow` shape OpenProject's own Basic board uses. It
+  is dropped under `kanban`, where it rendered as an unnamed empty box with no
+  status to head it or to drop a card into; counted in
+  `details.columns_dropped_statusless`
 - A column whose statuses are *all* unmapped is dropped rather than emitted
   without a filter, which would show the project's whole backlog under a column
   name meaning something much narrower. The Jira status ids are reported in
@@ -678,12 +681,24 @@ disagree about which one owns the boards — the mistake the sprint pair had to
 be fixed for.
 
 **Jira mismatches resolved here**:
+- **A Jira scrum board shows the active sprint, not the project.** Scoped with a
+  board-level `sprint_id` filter plus `linked_type`/`linked_id`, exactly as
+  `SprintTaskBoardCreateService` does; the column queries stay status-only.
+  Unscoped, the migrated `Desarrollo` board showed 122 cards in a column where
+  Jira showed one; scoped, all six columns reconcile card for card. A kanban
+  board gets no scope — it really is a view of the project. Counted in
+  `details.boards_scoped_to_a_sprint`, and a scrum board whose project has no
+  active sprint is built unscoped and named in
+  `details.scrum_boards_without_active_sprint`
 - **A Jira column can hold several statuses** (four of the nine boards on this
   instance group two or three). A Basic board keeps that grouping, because its
-  columns are just filters. A Kanban column *is* a status — the frontend writes
-  it onto a dropped card — so a grouped column is expanded into one column per
-  status, named `<column> · <status>`; the count lands in
-  `details.columns_added_by_kanban_expansion`
+  columns are just filters. On an action board OpenProject honours only the
+  **first** value of a column's filter — a column filtered on two statuses
+  rendered under the first one's name and hid the other's cards — so a grouped
+  column is expanded into one column per status; the count lands in
+  `details.columns_added_by_kanban_expansion`. Columns are named after their
+  status, since an action board renders its header from the status and ignores
+  the query name
 - **A Jira board can span several projects, an OpenProject board cannot**
   (`Boards::Grid belongs_to :project`; two boards here reach four Jira projects
   each). The board is created in the first mapped project and the rest are

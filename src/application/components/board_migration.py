@@ -36,9 +36,18 @@ surfacing as a board that quietly looks wrong:
 * **A Jira column can hold several statuses.** Four of this instance's
   nine boards group two or three Jira statuses into one column. A Basic
   board keeps that grouping (its columns are just filters). A Kanban
-  column *is* a status — the frontend sets that status on drop — so a
-  grouped column is expanded into one column per status. See
+  column *is* a status, and OpenProject honours only the **first** value
+  of a column's filter — a column filtered on two statuses rendered under
+  the first one's name and silently hid the other's cards — so a grouped
+  column is expanded into one column per status. See
   :meth:`BoardMigration._columns_for_strategy`.
+* **A Jira scrum board shows the active sprint, not the project.** This is
+  the difference between a faithful board and a wrong one: unscoped, the
+  migrated 'Desarrollo' board showed 122 cards in a column where Jira
+  showed one. A scrum board is therefore scoped with a board-level
+  ``sprint_id`` filter and linked to the sprint, exactly as OpenProject's
+  own ``SprintTaskBoardCreateService`` does. A kanban board *is* a view of
+  the project, so it gets no sprint scope.
 * **A Jira board can span several projects, an OpenProject board cannot.**
   ``Boards::Grid belongs_to :project``. Two boards here reach four Jira
   projects each. The board is created in the first mapped project and the
@@ -89,6 +98,10 @@ NATIVE_BOARD_STRATEGIES: frozenset[str] = frozenset(
 #: the Community edition, per the 17.3.0 release notes. Before it they were the
 #: "Advanced Boards" Enterprise add-on. See :func:`action_boards_available`.
 ACTION_BOARDS_COMMUNITY_SINCE: tuple[int, int] = (17, 3)
+
+#: Jira's ``board.type``. A scrum board is a view of the **active sprint**; a
+#: kanban board is a view of the project. Only the first gets a sprint scope.
+JIRA_BOARD_TYPE_SCRUM = "scrum"
 
 
 def board_strategy() -> str:
@@ -259,6 +272,22 @@ class BoardMigration(BaseMigration):
             return 0
         return int(entry.get("openproject_id", 0) or 0)
 
+    def _active_sprints(self) -> dict[int, int]:
+        """Return ``{op_project_id: active sprint id}``, empty if unavailable.
+
+        Degrades to an empty dict rather than raising: a target without
+        native sprints (or a probe that fails) then builds unscoped boards,
+        which is what this component did before sprint scoping existed.
+        """
+        try:
+            return self.op_client.boards.active_sprint_by_project()
+        except Exception as exc:
+            self.logger.warning(
+                "Could not read active sprints; scrum boards will show their whole project: %s",
+                exc,
+            )
+            return {}
+
     def _op_status_id(self, jira_status_id: Any) -> int:
         """Translate a Jira status id into an OpenProject status id, or 0.
 
@@ -276,36 +305,60 @@ class BoardMigration(BaseMigration):
     def _columns_for_strategy(
         columns: list[dict[str, Any]],
         strategy: str,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int, int]:
         """Shape a Jira board's columns for the target board kind.
 
         A Basic board's column is a filter, so a Jira column holding three
-        statuses stays one column with a three-valued filter. A Kanban
-        column *is* a status — the frontend writes that status onto a card
-        dropped into it — so a grouped column is expanded into one column
-        per status, named ``"<column> · <status>"`` to keep the Jira column
-        it came from visible. Returns the columns and how many extra ones
-        the expansion produced.
+        statuses stays one column with a three-valued filter, keeping Jira's
+        grouping intact.
+
+        A Kanban column *is* a status, and OpenProject honours only the
+        **first** value of the column's filter — verified on the live
+        instance, where a column filtered on "Testing failed + To Do"
+        rendered as "Estado / Testing failed" and showed only that status's
+        cards, silently hiding the rest. So a grouped column is expanded
+        into one column per status, in Jira's order.
+
+        Each expanded column is named after its **status**, not after the
+        Jira column, because the action board renders its header from the
+        status and ignores the query name entirely — a "<column> · <status>"
+        name would be invisible while making the query list harder to read.
+        This is also what ``StatusBoardCreateService`` does.
+
+        A column with no statuses is dropped under Kanban: an action board
+        renders it as an unnamed empty box that can do nothing, since there
+        is no status to head it with or to drop a card into. Under Basic it
+        survives as a manual list.
+
+        Returns the columns, how many extra ones the expansion produced, and
+        how many statusless columns were dropped.
         """
         if strategy != BOARD_STRATEGY_KANBAN:
-            return list(columns), 0
+            return list(columns), 0, 0
 
         expanded: list[dict[str, Any]] = []
         added = 0
+        dropped = 0
         for column in columns:
             status_ids = column.get("status_ids") or []
-            if len(status_ids) <= 1:
-                expanded.append(column)
+            status_names = column.get("status_names") or []
+
+            if not status_ids:
+                dropped += 1
                 continue
-            added += len(status_ids) - 1
-            for status_id, status_name in zip(status_ids, column.get("status_names") or [], strict=False):
+
+            if len(status_ids) > 1:
+                added += len(status_ids) - 1
+
+            for index, status_id in enumerate(status_ids):
+                status_name = status_names[index] if index < len(status_names) else ""
                 expanded.append(
                     {
-                        "name": f"{column['name']} · {status_name}" if status_name else column["name"],
+                        "name": status_name or column["name"],
                         "status_ids": [status_id],
                     },
                 )
-        return expanded, added
+        return expanded, added, dropped
 
     def _fetch_boards(self) -> list[dict[str, Any]]:
         """Fetch every Jira board with its column configuration.
@@ -405,8 +458,16 @@ class BoardMigration(BaseMigration):
         skipped: list[dict[str, Any]] = []
         unresolved_statuses: set[str] = set()
         dropped_columns = 0
+        dropped_statusless = 0
         extra_columns = 0
         multi_project: list[dict[str, Any]] = []
+        unscoped_scrum: list[dict[str, Any]] = []
+
+        # A Jira scrum board shows the active sprint, not the project. Read
+        # once — the answer is the same for every board in a project, and
+        # asking OpenProject rather than the ``sprint`` mapping means the
+        # board agrees with whichever sprint ``SprintMigration`` left active.
+        active_sprints = self._active_sprints()
 
         for board in boards:
             project_keys = board.get("project_keys") or []
@@ -476,8 +537,36 @@ class BoardMigration(BaseMigration):
                 )
                 continue
 
-            shaped, added = self._columns_for_strategy(columns, strategy)
+            shaped, added, statusless = self._columns_for_strategy(columns, strategy)
             extra_columns += added
+            dropped_statusless += statusless
+
+            if not shaped:
+                skipped.append(
+                    {
+                        "reason": "no_mappable_columns",
+                        "board_id": board.get("id"),
+                        "board_name": board.get("name"),
+                        "project_key": project_key,
+                    },
+                )
+                continue
+
+            # A Jira scrum board is a view of the active sprint; a kanban
+            # board is a view of the project. Scoping the wrong one is not a
+            # cosmetic difference: unscoped, the migrated 'Desarrollo' board
+            # showed 122 cards in a column where Jira showed one.
+            sprint_id = None
+            if str(board.get("type") or "").lower() == JIRA_BOARD_TYPE_SCRUM:
+                sprint_id = active_sprints.get(op_project_id)
+                if not sprint_id:
+                    unscoped_scrum.append(
+                        {
+                            "board_id": board.get("id"),
+                            "board_name": board.get("name"),
+                            "project_key": project_key,
+                        },
+                    )
 
             payloads.append(
                 {
@@ -488,6 +577,7 @@ class BoardMigration(BaseMigration):
                     "jira_board_type": board.get("type"),
                     "board_type": BOARD_TYPE_ACTION if strategy == BOARD_STRATEGY_KANBAN else BOARD_TYPE_FREE,
                     "attribute": BOARD_ATTRIBUTE_STATUS if strategy == BOARD_STRATEGY_KANBAN else None,
+                    "sprint_id": sprint_id,
                     "columns": [{"name": c["name"], "status_ids": c["status_ids"]} for c in shaped],
                 },
             )
@@ -510,6 +600,14 @@ class BoardMigration(BaseMigration):
                 ", ".join(sorted(unresolved_statuses)),
             )
 
+        for entry in unscoped_scrum:
+            self.logger.warning(
+                "Jira scrum board '%s' shows its project's active sprint, but %s has none in "
+                "OpenProject; the board was created unscoped and shows the whole project",
+                entry["board_name"],
+                entry["project_key"],
+            )
+
         if skipped:
             self.logger.warning("%s board(s) skipped; see details", len(skipped))
 
@@ -522,9 +620,11 @@ class BoardMigration(BaseMigration):
                 "boards": len(payloads),
                 "skipped": len(skipped),
                 "columns_dropped_unmapped_status": dropped_columns,
+                "columns_dropped_statusless": dropped_statusless,
                 "columns_added_by_kanban_expansion": extra_columns,
                 "unresolved_jira_statuses": sorted(unresolved_statuses),
                 "multi_project_boards": multi_project,
+                "scrum_boards_without_active_sprint": unscoped_scrum,
             },
         )
 
@@ -567,6 +667,7 @@ class BoardMigration(BaseMigration):
         errors = 0
         columns_written = 0
         modules_enabled = 0
+        sprint_scoped = 0
         mapping_updates: dict[str, Any] = {}
         consecutive_failures = 0
         aborted_after: int | None = None
@@ -580,6 +681,7 @@ class BoardMigration(BaseMigration):
                     columns=payload["columns"],
                     board_type=payload["board_type"],
                     attribute=payload.get("attribute"),
+                    sprint_id=payload.get("sprint_id"),
                 )
             except Exception as exc:
                 errors += 1
@@ -627,12 +729,16 @@ class BoardMigration(BaseMigration):
                     payload.get("name"),
                 )
 
+            if result.get("linked_sprint_id"):
+                sprint_scoped += 1
+
             if jira_board_id:
                 entry = {
                     "openproject_board_id": result.get("id"),
                     "project_id": payload["project_id"],
                     "name": payload.get("name"),
                     "board_type": result.get("board_type"),
+                    "sprint_id": result.get("linked_sprint_id"),
                     "query_ids": result.get("query_ids") or [],
                 }
                 mapping_updates[str(jira_board_id)] = entry
@@ -665,10 +771,15 @@ class BoardMigration(BaseMigration):
                 "boards_total": len(boards),
                 "aborted_after_consecutive_failures": aborted_after,
                 "columns_written": columns_written,
+                "boards_scoped_to_a_sprint": sprint_scoped,
                 "board_modules_enabled": modules_enabled,
                 "errors": errors,
                 "skipped": len(mapped.data.get("skipped", [])),
-                **{k: v for k, v in mapped.details.items() if k.startswith(("columns_", "unresolved_", "multi_"))},
+                **{
+                    k: v
+                    for k, v in mapped.details.items()
+                    if k.startswith(("columns_", "unresolved_", "multi_", "scrum_"))
+                },
             },
         )
 
@@ -695,11 +806,13 @@ class BoardMigration(BaseMigration):
         result = self._load(mapped)
         if result.success:
             self.logger.info(
-                "Native board migration complete (strategy=%s, created=%s, updated=%s, columns=%s, skipped=%s)",
+                "Native board migration complete (strategy=%s, created=%s, updated=%s, columns=%s, "
+                "sprint-scoped=%s, skipped=%s)",
                 result.details.get("strategy"),
                 result.details.get("boards_created", 0),
                 result.details.get("boards_updated", 0),
                 result.details.get("columns_written", 0),
+                result.details.get("boards_scoped_to_a_sprint", 0),
                 result.details.get("skipped", 0),
             )
         else:
