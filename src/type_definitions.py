@@ -118,6 +118,12 @@ class MigrationConfig(TypedDict):
     log_retention_count: NotRequired[int]
     enable_rails_meta_writes: NotRequired[bool]
     reset_wp_checkpoints: NotRequired[bool]
+    # OpenProject role names the workflow transitions are written for.
+    # Empty/unset selects every role holding ``edit_work_packages`` — see
+    # WorkflowMigration. Selecting by name is a deliberate override only:
+    # the builtin member role is called "Member", and defaulting to a name
+    # is what left ordinary members unable to move a work package.
+    workflow_roles: NotRequired[list[str]]
     # "native" (default) | "version" | "both" — see SprintMigration.
     sprint_strategy: NotRequired[str]
     # Login or numeric id of the OpenProject user every migration-created

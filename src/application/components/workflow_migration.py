@@ -1,5 +1,46 @@
 """Workflow migration: aligns Jira workflows with OpenProject transitions.
 
+An OpenProject ``Workflow`` row is ``(type, old status, new status,
+role)``, and it is the only thing that lets a user move a work package:
+with no row for a status, its dropdown offers nothing but the status it
+is already in. Getting these wrong is therefore not a partial migration,
+it is an unusable instance.
+
+Where the transitions come from
+-------------------------------
+**Jira Server/DC does not expose a workflow's transition graph over
+REST** — see ``JiraWorkflowService.get_observed_transitions`` for the
+endpoints tried and what each returns. The graph is recovered instead
+from the **issue changelogs**: every status change ever made is recorded
+there, so the transitions an issue type permits are readable from what
+its issues actually did.
+
+That makes this a *sample*, and the limit is worth stating: a transition
+Jira allows but nobody ever used leaves no trace and cannot be
+recovered. Those gaps are reported (``unresolved_jira_statuses``,
+``skipped``) rather than filled by inventing transitions — an invented
+one is indistinguishable from a real one afterwards, and it would grant
+moves the source system forbade.
+
+Two defects this replaced, both of which reported success
+---------------------------------------------------------
+* The transition source was ``/rest/api/2/workflow/search``, a Jira
+  **Cloud** endpoint that 404s on Server/DC. Every workflow came back
+  with zero transitions, so nothing was mapped, nothing was skipped, and
+  "0 planned, 0 skipped" read exactly like "this Jira has no
+  transitions". The component stayed green across every run while the
+  target instance had no workflow for any migrated status — 26 statuses
+  holding 286 of its 289 work packages.
+* Roles were selected **by name**, defaulting to ``["Project admin",
+  "Project member"]``. OpenProject's builtin member role is called
+  "Member", so ordinary members would have got no transitions even once
+  the source was fixed. Selection is now by the ``edit_work_packages``
+  permission — the property that actually decides whether a workflow row
+  for a role means anything, and what OpenProject's own seeder keys on.
+
+Both are now failures rather than green zeroes: a run that maps no
+transition returns ``success=False`` and says so.
+
 Phase 7d note
 -------------
 This migration is intentionally left unchanged in the typed-pipeline
@@ -146,15 +187,102 @@ class WorkflowMigration(BaseMigration):
                 statuses = []
             workflow_statuses[workflow_name] = statuses if isinstance(statuses, list) else []
 
+        # The real transition source (API call 6+, one page per 100 issues).
+        #
+        # ``workflow_transitions`` above is empty on every Jira Server/DC
+        # target: the endpoint behind it is Cloud-only. Rather than infer a
+        # workflow's graph from an API that does not expose it, read what the
+        # issues actually did — see ``get_observed_transitions``.
+        observed_transitions: dict[str, list[dict[str, Any]]] = {}
+        try:
+            observed_transitions = self.jira_client.get_observed_transitions(
+                self._migrated_project_keys(),
+            )
+        except Exception as exc:
+            self.logger.exception("Failed to observe status transitions from issue changelogs: %s", exc)
+
         # Return aggregated data structure
         return [
             {
                 "issue_type_to_workflow": issue_type_to_workflow,
                 "workflow_transitions": workflow_transitions,
                 "workflow_statuses": workflow_statuses,
+                "observed_transitions": observed_transitions,
                 "roles": roles,
             },
         ]
+
+    def _workflow_role_ids(self, roles: list[dict[str, Any]]) -> list[int]:
+        """Return the roles a workflow row should be written for.
+
+        A workflow row is ``(type, old status, new status, role)``: a user
+        may make a transition only when a row exists for a role they hold.
+        So the roles that matter are exactly the ones that may edit work
+        packages — which is what OpenProject's own seeder keys on, and it
+        shows: on the target instance the seeded rows cover precisely
+        ``Work package editor``, ``Member`` and ``Project admin``, the three
+        roles holding ``edit_work_packages``, 586 rows each.
+
+        Selecting by **name** — which this did, with the default
+        ``["Project admin", "Project member"]`` — is the trap. The builtin
+        member role is called "Member"; nothing has been called "Project
+        member" for several major versions, and a renamed or localised role
+        would miss too. That left ``role_ids = [Project admin]``: every
+        ordinary member would have been unable to move a work package even
+        once transitions existed. ``J2O_WORKFLOW_ROLES`` still overrides by
+        name for an instance that wants a narrower set.
+
+        The old fallback — "if no role matched, use every role" — is gone.
+        It would have swept in ``Anonymous``, ``Non member`` and the global
+        roles, granting transitions to roles that cannot edit a work package
+        at all.
+        """
+        configured = config.migration_config.get("workflow_roles") or []
+        if configured:
+            selected = [role for role in roles if role.get("name") in configured]
+            if not selected:
+                self.logger.warning(
+                    "J2O_WORKFLOW_ROLES names %s, none of which exist on this instance (roles: %s); "
+                    "falling back to every role that may edit work packages",
+                    ", ".join(str(name) for name in configured),
+                    ", ".join(str(role.get("name")) for role in roles),
+                )
+        else:
+            selected = []
+
+        if not selected:
+            selected = [role for role in roles if role.get("edit_work_packages")]
+
+        if not selected:
+            # An instance that reports no such role is either very old or the
+            # probe lost the field. Say so instead of writing rows against a
+            # guessed role id, which would look successful and change nothing.
+            self.logger.error(
+                "No OpenProject role reports the 'edit_work_packages' permission; "
+                "no workflow transitions can be written. Roles seen: %s",
+                ", ".join(str(role.get("name")) for role in roles) or "none",
+            )
+            return []
+
+        role_ids = sorted({int(role["id"]) for role in selected if int(role.get("id", 0) or 0) > 0})
+        self.logger.info(
+            "Writing workflow transitions for role(s): %s",
+            ", ".join(f"{role.get('name')} (#{role.get('id')})" for role in selected),
+        )
+        return role_ids
+
+    def _migrated_project_keys(self) -> list[str]:
+        """Return the Jira project keys this migration covers.
+
+        Scoped to the ``project`` mapping rather than the whole instance:
+        transitions for projects nobody migrated would add workflow rows for
+        statuses no work package here can reach.
+        """
+        try:
+            project_mapping = self.mappings.get_mapping("project") or {}
+        except Exception:
+            return []
+        return [str(key) for key in project_mapping if str(key).strip()]
 
     def _extract(self) -> ComponentResult:
         """Gather workflow schemes, transitions, and OpenProject roles."""
@@ -183,8 +311,8 @@ class WorkflowMigration(BaseMigration):
             )
 
         issue_type_to_workflow: dict[str, str] = extracted.data.get("issue_type_to_workflow", {})
-        workflow_transitions: dict[str, list[dict[str, Any]]] = extracted.data.get(
-            "workflow_transitions",
+        observed_transitions: dict[str, list[dict[str, Any]]] = extracted.data.get(
+            "observed_transitions",
             {},
         )
         roles: list[dict[str, Any]] = extracted.data.get("roles", [])
@@ -203,26 +331,21 @@ class WorkflowMigration(BaseMigration):
             if isinstance(entry, dict) and entry.get("jira_name")
         }
 
-        desired_role_names = config.migration_config.get(
-            "workflow_roles",
-            ["Project admin", "Project member"],
-        )
-        role_ids = [
-            int(role["id"]) for role in roles if int(role.get("id", 0)) > 0 and role.get("name") in desired_role_names
-        ]
-        if not role_ids:
-            role_ids = [int(role["id"]) for role in roles if int(role.get("id", 0)) > 0]
+        role_ids = self._workflow_role_ids(roles)
 
         dedup_transitions: dict[tuple[int, int, int], dict[str, Any]] = {}
         skipped: list[dict[str, Any]] = []
+        unresolved_statuses: set[str] = set()
+        collapsed = 0
 
-        for issue_type_name, workflow_name in issue_type_to_workflow.items():
+        for issue_type_name, transitions in observed_transitions.items():
             mapping_entry = issue_type_mapping.get(issue_type_name)
             if not isinstance(mapping_entry, dict):
                 skipped.append(
                     {
                         "reason": "missing_issue_type_mapping",
                         "issue_type": issue_type_name,
+                        "transitions": len(transitions),
                     },
                 )
                 continue
@@ -233,94 +356,145 @@ class WorkflowMigration(BaseMigration):
                     {
                         "reason": "invalid_openproject_type",
                         "issue_type": issue_type_name,
+                        "transitions": len(transitions),
                     },
                 )
                 continue
 
-            for transition in workflow_transitions.get(workflow_name, []):
-                # ``to`` is a plain status id string on ``/rest/api/2/workflow/search``
-                # (the endpoint this migration now uses), but keep the dict shape
-                # handled too in case a different Jira version nests it as
-                # ``{"id": ..., "name": ...}`` like the old per-name endpoint did.
-                to_field = transition.get("to")
-                if isinstance(to_field, dict):
-                    to_status_id = str(to_field.get("id") or "").strip()
-                    to_name = str(to_field.get("name", "")).lower()
-                elif isinstance(to_field, str):
-                    to_status_id = to_field.strip()
-                    to_name = ""
-                else:
-                    to_status_id = ""
-                    to_name = ""
-                to_entry = status_by_id.get(to_status_id) or status_by_name.get(to_name)
-                if not to_entry:
+            for transition in transitions:
+                # ``status`` is keyed by the Jira status **id as a string**;
+                # the name fallback covers a mapping written by an older run
+                # that keyed on names.
+                from_id = str(transition.get("from") or "")
+                to_id = str(transition.get("to") or "")
+                from_entry = status_by_id.get(from_id) or status_by_name.get(from_id.lower())
+                to_entry = status_by_id.get(to_id) or status_by_name.get(to_id.lower())
+
+                missing = [
+                    jira_id
+                    for jira_id, entry in ((from_id, from_entry), (to_id, to_entry))
+                    if not isinstance(entry, dict)
+                ]
+                if missing:
                     skipped.append(
                         {
                             "reason": "missing_status_mapping",
                             "issue_type": issue_type_name,
-                            "workflow": workflow_name,
-                            "status_id": to_status_id,
+                            "status_ids": missing,
                         },
                     )
+                    unresolved_statuses.update(missing)
                     continue
 
+                op_from = int(from_entry.get("openproject_id", 0) or 0)
                 op_to = int(to_entry.get("openproject_id", 0) or 0)
-                if op_to <= 0:
+                if op_from <= 0 or op_to <= 0:
+                    continue
+                if op_from == op_to:
+                    # Two Jira statuses that collapsed onto one OpenProject
+                    # status. A self-transition is not a move and OpenProject
+                    # has no row shape for it.
+                    collapsed += 1
                     continue
 
-                from_status_ids = transition.get("from")
-                if isinstance(from_status_ids, str):
-                    from_status_list = [from_status_ids]
-                elif isinstance(from_status_ids, list):
-                    from_status_list = from_status_ids
-                else:
-                    from_status_list = []
+                key = (type_id, op_from, op_to)
+                existing = dedup_transitions.get(key)
+                if existing:
+                    # Two Jira issue types can map onto one OpenProject type
+                    # (Improvement and New Feature both become Feature here).
+                    # Keep the one row and add up what each contributed.
+                    existing["observed_count"] += int(transition.get("count", 0) or 0)
+                    continue
 
-                for from_status_id in from_status_list:
-                    from_entry = status_by_id.get(str(from_status_id)) or status_by_name.get(
-                        str(transition.get("name", "")).lower(),
-                    )
-                    if not from_entry:
-                        skipped.append(
-                            {
-                                "reason": "missing_status_mapping",
-                                "issue_type": issue_type_name,
-                                "workflow": workflow_name,
-                                "status_id": str(from_status_id),
-                            },
-                        )
-                        continue
+                dedup_transitions[key] = {
+                    "type_id": type_id,
+                    "from_status_id": op_from,
+                    "to_status_id": op_to,
+                    "jira_issue_type": issue_type_name,
+                    "jira_workflow": issue_type_to_workflow.get(issue_type_name),
+                    "observed_count": int(transition.get("count", 0) or 0),
+                }
 
-                    op_from = int(from_entry.get("openproject_id", 0) or 0)
-                    if op_from <= 0:
-                        continue
+        observed_total = sum(len(entries) for entries in observed_transitions.values())
 
-                    key = (type_id, op_from, op_to)
-                    dedup_transitions.setdefault(
-                        key,
-                        {
-                            "type_id": type_id,
-                            "from_status_id": op_from,
-                            "to_status_id": op_to,
-                            "jira_issue_type": issue_type_name,
-                            "jira_workflow": workflow_name,
-                        },
-                    )
+        if unresolved_statuses:
+            self.logger.warning(
+                "%s Jira status(es) referenced by an observed transition are absent from the status "
+                "mapping, so those transitions were not created: %s",
+                len(unresolved_statuses),
+                ", ".join(sorted(unresolved_statuses)),
+            )
+        if collapsed:
+            self.logger.info(
+                "%s transition(s) had the same OpenProject status on both ends (two Jira statuses "
+                "mapped onto one) and were dropped",
+                collapsed,
+            )
 
+        # A component that migrates nothing must not report success.
+        #
+        # This is the failure that hid the whole defect: the transition source
+        # was a Cloud-only endpoint that 404s on Server, so every workflow came
+        # back with zero transitions, nothing was mapped, nothing was skipped —
+        # and "0 planned, 0 skipped, success" is indistinguishable from "this
+        # Jira has no transitions". It stayed green through every run while the
+        # target instance had no usable workflow at all.
         mapped = {
             "transitions": list(dedup_transitions.values()),
             "role_ids": role_ids,
             "skipped": skipped,
         }
+        details = {
+            "transitions_planned": len(dedup_transitions),
+            "transitions_observed": observed_total,
+            "issue_types_observed": len(observed_transitions),
+            "skipped": len(skipped),
+            "unresolved_jira_statuses": sorted(unresolved_statuses),
+            "collapsed_self_transitions": collapsed,
+            "role_ids": role_ids,
+        }
+
+        if observed_total == 0:
+            return ComponentResult(
+                success=False,
+                data=mapped,
+                message=(
+                    "No status transitions could be read from Jira. Nothing was migrated, so no "
+                    "work package will be movable between statuses in OpenProject."
+                ),
+                error="no transitions observed",
+                total_count=0,
+                details=details,
+            )
+
+        if not dedup_transitions:
+            return ComponentResult(
+                success=False,
+                data=mapped,
+                message=(
+                    f"{observed_total} transition(s) were read from Jira but none could be mapped "
+                    f"to OpenProject; check the status and issue_type mappings"
+                ),
+                error="no transitions mappable",
+                total_count=0,
+                details=details,
+            )
+
+        if not role_ids:
+            return ComponentResult(
+                success=False,
+                data=mapped,
+                message="No role can hold the workflow transitions, so writing them would change nothing",
+                error="no eligible roles",
+                total_count=len(dedup_transitions),
+                details=details,
+            )
 
         return ComponentResult(
             success=True,
             data=mapped,
             total_count=len(dedup_transitions),
-            details={
-                "transitions_planned": len(dedup_transitions),
-                "skipped": len(skipped),
-            },
+            details=details,
         )
 
     def _load(self, mapped: ComponentResult) -> ComponentResult:
@@ -335,11 +509,16 @@ class WorkflowMigration(BaseMigration):
         transitions: list[dict[str, Any]] = mapped.data.get("transitions", [])
         role_ids: list[int] = mapped.data.get("role_ids", [])
 
-        if not transitions:
+        if not transitions or not role_ids:
+            # Reached only by a direct call — ``_map`` now fails on both of
+            # these — but it must not report success either way. "0 to
+            # synchronise" was the message this component produced on every
+            # run while the target had no usable workflow at all.
             return ComponentResult(
-                success=True,
-                message="No workflow transitions to synchronise",
-                details={"created": 0, "existing": 0},
+                success=False,
+                message="Nothing to synchronise: no transitions, or no role to hold them",
+                error="empty transition set",
+                details={"created": 0, "existing": 0, "transitions": len(transitions), "role_ids": role_ids},
             )
 
         summary = self.op_client.sync_workflow_transitions(transitions, role_ids)
@@ -358,6 +537,8 @@ class WorkflowMigration(BaseMigration):
                 "existing": existing,
                 "errors": errors,
                 "skipped": len(mapped.data.get("skipped", [])),
+                "roles": role_ids,
+                "transitions": len(transitions),
             },
         )
 

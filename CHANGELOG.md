@@ -57,6 +57,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method name, where escaping does not apply and only an allowlist works.
 
 ### Fixed
+- Jira workflow transitions are migrated at all. The transition source was
+  `/rest/api/2/workflow/search`, a Jira **Cloud** endpoint that 404s on Server/DC,
+  so every workflow came back with zero transitions and the component reported
+  "0 planned, 0 skipped" and success on every run. The target instance had no
+  workflow row for any migrated status — 26 statuses holding 286 of its 289 work
+  packages — so a work package's status dropdown offered only the status it was
+  already in, and no card could be dragged between board columns. Jira Server/DC
+  exposes no endpoint for a workflow's transition graph (four were tried), so the
+  transitions are now recovered from the **issue changelogs**, which record every
+  status change ever made: 435 issues yield 134 distinct transitions, 78 of them
+  mappable, restoring an outgoing transition to 264 of the 289 migrated work
+  packages. The remaining 25 sit in three (type, status) pairs nothing ever moved
+  out of in Jira; they are reported rather than filled with invented transitions.
+- Workflow transitions are written for every role that may edit work packages,
+  not for roles matched by name. The default was `["Project admin", "Project
+  member"]`, and OpenProject's builtin member role is called "Member" — so even
+  with a working transition source, ordinary members would have received none.
+  `edit_work_packages` is the property that decides whether a workflow row for a
+  role means anything, and selecting on it reproduces exactly the three roles
+  OpenProject's own seeder uses. The old "if no role matched, use every role"
+  fallback is gone: it would have granted transitions to `Anonymous`, `Non
+  member` and the global roles. `J2O_WORKFLOW_ROLES` overrides by name.
+- `workflows` fails instead of reporting success when it migrates nothing. A
+  component that maps no transition, or finds no role to hold one, now returns
+  `success=False` with the reason. "0 planned, 0 skipped, success" was
+  indistinguishable from "this Jira has no transitions" and is what kept the
+  defect above invisible across every run.
 - Attachment references in migrated comments resolve to the OpenProject API URL
   again. `MarkdownConverter.convert` takes a `jira_key` and needs it to scope the
   lookup, because the attachment mapping is keyed issue → filename → id; without

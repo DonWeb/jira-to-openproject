@@ -314,6 +314,15 @@ class ConfigLoader:
                     self.config["migration"]["no_confirm"] = no_confirm
                     config_logger.debug("Applied migration no_confirm: %s", no_confirm)
 
+                case ["J2O", "WORKFLOW", "ROLES"]:
+                    # Comma-separated OpenProject role names the workflow
+                    # transitions are written for. Unset, the migration picks
+                    # every role holding ``edit_work_packages`` — see
+                    # ``WorkflowMigration._workflow_role_ids``.
+                    names = [part.strip() for part in str(env_value).split(",") if part.strip()]
+                    self.config["migration"]["workflow_roles"] = names
+                    config_logger.debug("Applied workflow roles: %s", names)
+
                 case ["J2O", "SPRINT", "STRATEGY"]:
                     strategy = str(env_value).lower()
                     self.config["migration"]["sprint_strategy"] = strategy

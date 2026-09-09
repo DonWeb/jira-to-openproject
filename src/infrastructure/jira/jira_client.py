@@ -743,6 +743,15 @@ class JiraClient:
         """Thin delegator over ``self.workflows.get_workflow_transitions``."""
         return self.workflows.get_workflow_transitions(workflow_name)
 
+    def get_observed_transitions(
+        self,
+        project_keys: list[str],
+        *,
+        page_size: int = 100,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Thin delegator over ``self.workflows.get_observed_transitions``."""
+        return self.workflows.get_observed_transitions(project_keys, page_size=page_size)
+
     def get_workflow_statuses(self, workflow_name: str) -> list[dict[str, Any]]:
         """Thin delegator over ``self.workflows.get_workflow_statuses``."""
         return self.workflows.get_workflow_statuses(workflow_name)
