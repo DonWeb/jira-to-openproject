@@ -79,6 +79,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenProject's own seeder uses. The old "if no role matched, use every role"
   fallback is gone: it would have granted transitions to `Anonymous`, `Non
   member` and the global roles. `J2O_WORKFLOW_ROLES` overrides by name.
+- Every component reports its real duration. The orchestrator read the elapsed
+  time from `details["time"]`, which exactly one component of forty sets, so all
+  the others have always logged "took 0.00 seconds" — a `workflows` run whose own
+  log timestamps span six seconds reported 0.00. The wall clock was already being
+  measured (`component_start_time`); it was just only used on the interrupted and
+  exception paths. A component that times its own work still wins.
+- The `workflows` result carries its mapping numbers into
+  `migration_results_*.json`: how many transitions were read versus written,
+  which Jira statuses went unmapped, and how many collapsed. `run` returns the
+  load result, so these previously reached the log and nothing else — and for a
+  component whose failure mode was "the counts looked fine", they are the numbers
+  the archived record needs. Its item count is now workflow rows rather than
+  transitions, so 234 rows written for 78 transitions no longer reads "234/78".
 - `workflows` fails instead of reporting success when it migrates nothing. A
   component that maps no transition, or finds no role to hold one, now returns
   `success=False` with the reason. "0 planned, 0 skipped, success" was

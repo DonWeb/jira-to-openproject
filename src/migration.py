@@ -324,6 +324,30 @@ def _first_error_message(result: ComponentResult | None) -> str:
     return ""
 
 
+def _component_elapsed(result: ComponentResult, measured: float) -> float:
+    """Return the seconds to report for a component.
+
+    Prefers the component's own ``details["time"]`` — a component that
+    times its own work (``time_entries`` excludes its setup) knows better
+    than the wall clock around it — and falls back to *measured*.
+
+    That order used to be the other way round with no fallback: the
+    orchestrator read ``details.get("time", 0)``, and exactly one
+    component of forty sets it. Every other one has always reported "took
+    0.00 seconds", including a ``workflows`` run whose own log timestamps
+    span six. ``component_start_time`` was already being measured; it was
+    just only used on the interrupted and exception paths.
+    """
+    details = result.details or {}
+    reported = details.get("time", details.get("duration_seconds"))
+    if reported is None:
+        return measured
+    try:
+        return float(reported)
+    except (TypeError, ValueError):
+        return measured
+
+
 def _format_component_outcome(
     name: str,
     result: ComponentResult,
@@ -1056,8 +1080,10 @@ async def run_migration(
                             results.overall["status"] = "failed"
 
                         # Print component summary based on robust count extraction
-                        details = component_result.details or {}
-                        component_time = details.get("time", details.get("duration_seconds", 0))
+                        component_time = _component_elapsed(
+                            component_result,
+                            time.time() - component_start_time,
+                        )
 
                         level, summary_line = _format_component_outcome(
                             component_name,

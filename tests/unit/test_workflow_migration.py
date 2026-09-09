@@ -394,3 +394,49 @@ def test_every_eligible_role_gets_the_transition(_mock_mappings) -> None:
     assert len(transitions) == 1
     assert role_ids == [1, 9, 11]
     assert result.details["created"] == 3
+
+
+# --------------------------------------------------------------------- #
+# what the archived result records                                      #
+# --------------------------------------------------------------------- #
+
+
+def test_the_saved_result_carries_the_mapping_numbers(_mock_mappings) -> None:
+    """``run`` returns the load result, so the map's numbers must reach it.
+
+    For a component whose whole failure mode was "the counts looked
+    fine", how many transitions were *read* versus *written*, and which
+    statuses went unmapped, is exactly what the archived
+    ``migration_results_*.json`` needs to answer months later. Left in
+    the map phase they reach the log and nothing else.
+    """
+    jira = DummyJira(
+        observed={
+            "Improvement": [
+                {"from": "10003", "to": "10210", "count": 45},
+                {"from": "99999", "to": "10211", "count": 1},
+            ],
+        },
+    )
+    result = WorkflowMigration(jira_client=jira, op_client=DummyOp()).run()
+
+    assert result.success is True
+    assert result.details["transitions_observed"] == 2
+    assert result.details["transitions_planned"] == 1
+    assert result.details["issue_types_observed"] == 1
+    assert result.details["unresolved_jira_statuses"] == ["99999"]
+    assert result.details["created"] == 3
+
+
+def test_the_item_count_is_rows_not_transitions(_mock_mappings) -> None:
+    """One transition becomes one row per role; the unit written is the row.
+
+    Counting transitions instead would report the live run's 234 created
+    rows as "234/78 items migrated".
+    """
+    jira = DummyJira(observed={"Improvement": [{"from": "10003", "to": "10210", "count": 45}]})
+    result = WorkflowMigration(jira_client=jira, op_client=DummyOp()).run()
+
+    assert result.total_count == 3
+    assert result.success_count == 3
+    assert result.details["rows_attempted"] == 3

@@ -418,9 +418,13 @@ class WorkflowMigration(BaseMigration):
         observed_total = sum(len(entries) for entries in observed_transitions.values())
 
         if unresolved_statuses:
+            # Name the cost as well as the cause: "9 statuses missing" does not
+            # say whether that lost one transition or a third of them.
             self.logger.warning(
-                "%s Jira status(es) referenced by an observed transition are absent from the status "
-                "mapping, so those transitions were not created: %s",
+                "%s of %s observed transition(s) were not created because %s Jira status(es) are "
+                "absent from the status mapping: %s",
+                len(skipped),
+                observed_total,
                 len(unresolved_statuses),
                 ", ".join(sorted(unresolved_statuses)),
             )
@@ -526,20 +530,41 @@ class WorkflowMigration(BaseMigration):
         existing = int(summary.get("existing", 0))
         errors = int(summary.get("errors", 0))
 
-        success = errors == 0
-        return ComponentResult(
-            success=success,
-            message="Workflow transitions synchronised",
-            success_count=created,
-            failed_count=errors,
-            details={
+        # Carry the mapping numbers into the result the orchestrator archives.
+        #
+        # ``run`` returns this result, so anything left behind in the map
+        # phase's details reaches the log and nothing else — and for a
+        # component whose entire failure mode was "the numbers looked fine",
+        # the count of transitions *read* versus *written*, and the statuses
+        # that went unmapped, are exactly what the saved record needs to
+        # answer later.
+        details: dict[str, Any] = {
+            key: value
+            for key, value in (mapped.details or {}).items()
+            if key.startswith(("transitions_", "issue_types_", "unresolved_", "collapsed_"))
+        }
+        details.update(
+            {
                 "created": created,
                 "existing": existing,
                 "errors": errors,
                 "skipped": len(mapped.data.get("skipped", [])),
                 "roles": role_ids,
                 "transitions": len(transitions),
+                "rows_attempted": len(transitions) * len(role_ids),
             },
+        )
+
+        return ComponentResult(
+            success=errors == 0,
+            message="Workflow transitions synchronised",
+            success_count=created,
+            failed_count=errors,
+            # A workflow row is per (transition, role): the unit written is the
+            # row, so the "N/M items" summary has to count rows, not
+            # transitions, or 234 created reads as 234 out of 78.
+            total_count=len(transitions) * len(role_ids),
+            details=details,
         )
 
     def run(self) -> ComponentResult:

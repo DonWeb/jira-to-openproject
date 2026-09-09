@@ -164,3 +164,44 @@ class TestFormatComponentOutcome:
         level, msg = _format_component_outcome("priorities", r, 0.5)
         assert level == "warning"
         assert "partial failure cause" in msg
+
+
+class TestComponentElapsed:
+    """The seconds the orchestrator reports for a component.
+
+    This read ``details.get("time", 0)`` and nothing else. Exactly one
+    component of forty sets that key, so every other one has always
+    reported "took 0.00 seconds" — including a ``workflows`` run whose
+    own log timestamps span six.
+    """
+
+    def test_falls_back_to_the_measured_wall_clock(self) -> None:
+        from src.migration import _component_elapsed
+
+        result = ComponentResult(success=True, details={"created": 234})
+        assert _component_elapsed(result, 6.18) == 6.18
+
+    def test_a_component_that_times_itself_still_wins(self) -> None:
+        """``time_entries`` measures its own work, excluding its setup."""
+        from src.migration import _component_elapsed
+
+        result = ComponentResult(success=True, details={"time": 12.5})
+        assert _component_elapsed(result, 30.0) == 12.5
+
+    def test_a_reported_zero_is_kept(self) -> None:
+        """A genuine 0.0 is a measurement, not a missing value."""
+        from src.migration import _component_elapsed
+
+        result = ComponentResult(success=True, details={"time": 0.0})
+        assert _component_elapsed(result, 9.9) == 0.0
+
+    def test_details_may_be_absent_entirely(self) -> None:
+        from src.migration import _component_elapsed
+
+        assert _component_elapsed(ComponentResult(success=True), 3.5) == 3.5
+
+    def test_an_unparseable_report_falls_back(self) -> None:
+        from src.migration import _component_elapsed
+
+        result = ComponentResult(success=True, details={"time": "a while"})
+        assert _component_elapsed(result, 4.25) == 4.25
