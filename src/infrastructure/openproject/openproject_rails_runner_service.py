@@ -647,6 +647,18 @@ class OpenProjectRailsRunnerService:
                 target = client.rails_client._get_target()
                 tmux = shutil.which("tmux") or "tmux"
 
+                # Typing into a console that is still evaluating is exactly the
+                # input-during-eval that corrupts Reline's line buffer and
+                # wedges the prompt for the rest of the run. Every other sender
+                # goes through ``_send_command_to_tmux``, which waits first;
+                # this one wrote straight to the pane. It matters more as the
+                # data grows, because that is when the previous script is still
+                # running when the next batch is ready to go.
+                if not client.rails_client._wait_for_console_ready(target, timeout=30, reset_on_stall=True):
+                    pane = client.rails_client.capture_pane_tail()
+                    q_msg = f"Console not ready for execute_script_with_data; pane tail:\n{pane}"
+                    raise ConsoleNotReadyError(q_msg)
+
                 # Define the unique markers for this execution; the script
                 # uses these instead of hardcoded markers.
                 marker_setup = f"$j2o_start_marker = '{unique_start_marker}'; $j2o_end_marker = '{unique_end_marker}'"
@@ -671,6 +683,10 @@ class OpenProjectRailsRunnerService:
                 start_time = time.time()
                 output = ""
                 found_markers = False
+                # Backs off from 200ms: each poll captures 2000 pane lines, and
+                # at a 300s timeout a fixed 200ms cadence spends the whole wait
+                # re-reading the same buffer 1500 times.
+                poll_interval = 0.2
 
                 while time.time() - start_time < effective_timeout:
                     cap = subprocess.run(
@@ -700,11 +716,19 @@ class OpenProjectRailsRunnerService:
                                         output = normalized
                                         break
 
-                    time.sleep(0.2)  # Poll every 200ms
+                    time.sleep(poll_interval)
+                    poll_interval = min(poll_interval * 1.5, 2.0)
 
                 if not found_markers:
+                    # Say which way this failed. The script is very likely
+                    # still running — the marker is the last thing it prints —
+                    # so the next caller must not assume a free console, and
+                    # whoever reads the log should know the batch was not
+                    # necessarily rejected, just not waited out.
                     self._logger.warning(
-                        "JSON_OUTPUT_END_%s marker not found within %d seconds",
+                        "JSON_OUTPUT_END_%s marker not found within %ds; the script may still be "
+                        "running in the console. Raise the timeout for this call if batches of this "
+                        "size routinely take longer.",
                         exec_id,
                         effective_timeout,
                     )

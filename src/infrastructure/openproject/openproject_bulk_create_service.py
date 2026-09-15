@@ -438,6 +438,12 @@ class OpenProjectBulkCreateService:
         use_runner = (script_lines >= max_lines) or (len(full_script) >= char_threshold)
 
         output: str | None = None
+        # Which engine actually ran the script. The stall detector below can
+        # only act on a ``rails runner`` process; a script running inside the
+        # persistent console is not something ``pkill`` can reach, and killing
+        # the wrong thing while the real one keeps writing rows is how a
+        # "stalled" batch turned into a duplicated one.
+        executed_via_runner = False
         if use_runner:
             runner_script_path = f"/tmp/j2o_bulk_{os.urandom(4).hex()}.rb"
             local_tmp = Path(client.file_manager.data_dir) / "temp_scripts" / Path(runner_script_path).name
@@ -461,6 +467,7 @@ class OpenProjectBulkCreateService:
                             msg,
                         ) from e
                     runner_cmd = f"(cd /app || cd /opt/openproject) && bundle exec rails runner {runner_script_path}"
+                    executed_via_runner = True
                     try:
                         stdout, stderr, rc = client.docker_client.execute_command(
                             runner_cmd,
@@ -491,6 +498,7 @@ class OpenProjectBulkCreateService:
                         self._logger.info("runner stdout: %s", stdout[:500])
             else:
                 runner_cmd = f"(cd /app || cd /opt/openproject) && bundle exec rails runner {runner_script_path}"
+                executed_via_runner = True
                 try:
                     stdout, stderr, rc = client.docker_client.execute_command(
                         runner_cmd,
@@ -529,12 +537,21 @@ class OpenProjectBulkCreateService:
                 _msg = f"Rails execution failed for bulk_create_records: {e}"
                 raise QueryExecutionError(_msg) from e
 
-        # Poll-copy result back to local (allow slow writes on busy systems)
+        # Poll-copy result back to local (allow slow writes on busy systems).
+        #
+        # The floor scales with the caller's own budget. ``work_package_migration``
+        # asks for 900s per batch because a hundred work packages with their
+        # journals genuinely takes minutes; a fixed 180s window here silently
+        # overrode that, declared the batch lost, and handed control to the
+        # sub-batch retry — which re-created rows the first script was still
+        # writing. Whatever the caller is willing to wait for execution, we are
+        # willing to wait for its result.
         max_wait_seconds_env = os.environ.get("J2O_BULK_RESULT_WAIT_SECONDS")
+        default_wait_seconds = max(180, int(timeout or 0))
         try:
-            max_wait_seconds = int(max_wait_seconds_env) if max_wait_seconds_env else 180
+            max_wait_seconds = int(max_wait_seconds_env) if max_wait_seconds_env else default_wait_seconds
         except Exception:
-            max_wait_seconds = 180
+            max_wait_seconds = default_wait_seconds
         poll_interval = 1.0
         waited = 0.0
         copied = False
@@ -547,7 +564,6 @@ class OpenProjectBulkCreateService:
         last_progress_len = -1
         last_progress_change_at = 0.0
         last_heartbeat_logged = -10.0
-        runner_script_known = "runner_script_path" in locals()
         while waited < max_wait_seconds:
             # Avoid noisy SSH errors: first, check for existence using Docker API
             if client.docker_client.check_file_exists_in_container(container_result):
@@ -613,19 +629,32 @@ class OpenProjectBulkCreateService:
                                 last_progress_len = prog_len
                                 last_progress_change_at = waited
                             elif (waited - last_progress_change_at) >= stall_seconds:
-                                # Consider the run stalled; attempt to stop runner and error out
-                                try:
-                                    if runner_script_known:
+                                # A quiet progress file is not proof of a stall:
+                                # it advances once per ``J2O_BULK_PROGRESS_N``
+                                # records (50 by default), so a batch whose
+                                # records are individually slow — work packages
+                                # with long journals — goes quiet for minutes
+                                # while making perfectly good progress. Only
+                                # call it stalled when nothing is running.
+                                if not executed_via_runner:
+                                    self._logger.debug(
+                                        "Progress file quiet for %.0fs but the console is still "
+                                        "evaluating; continuing to wait",
+                                        waited - last_progress_change_at,
+                                    )
+                                    last_progress_change_at = waited
+                                else:
+                                    try:
                                         client.docker_client.execute_command(
                                             f'pkill -f "rails runner {runner_script_path}" || true',
                                             timeout=10,
                                         )
-                                except Exception:
-                                    pass
-                                msg = f"bulk_create_records stalled for {stall_seconds}s without progress"
-                                raise QueryExecutionError(
-                                    msg,
-                                )
+                                    except Exception:
+                                        pass
+                                    msg = f"bulk_create_records stalled for {stall_seconds}s without progress"
+                                    raise QueryExecutionError(
+                                        msg,
+                                    )
                             last_heartbeat_logged = waited
                         except Exception:
                             # Ignore progress read errors; continue polling

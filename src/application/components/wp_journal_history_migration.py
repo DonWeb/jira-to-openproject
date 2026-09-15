@@ -63,6 +63,14 @@ from src.models import ComponentResult
 # payload and a long-running single Rails call.
 _DEFAULT_BATCH_SIZE = 25
 
+# Rebuilding a journal chain writes one row per changelog entry per field, plus
+# the comments, for every work package in the batch — comfortably the slowest
+# Rails call in the migration. The client default (180s) is sized for ordinary
+# queries; a batch of issues with years of history behind them runs past it, and
+# a timeout here costs the whole batch's history. Explicit and generous beats
+# inherited and tight.
+_BATCH_TIMEOUT_SECONDS = 900
+
 _JOURNAL_TEMPLATE = "create_work_package_journals_batch.rb"
 
 
@@ -230,7 +238,7 @@ class WpJournalHistoryMigration(BaseMigration):
             batch = wp_ids[i : i + self.BATCH_SIZE]
             payload = [{"work_package_id": wp_id} for wp_id in batch]
             try:
-                envelope = self.op_client.execute_script_with_data(script, payload)
+                envelope = self.op_client.execute_script_with_data(script, payload, timeout=_BATCH_TIMEOUT_SECONDS)
             except Exception:
                 self.logger.exception(
                     "v1 reattribution failed for %d work packages without history",
@@ -346,7 +354,9 @@ class WpJournalHistoryMigration(BaseMigration):
                 continue
 
             try:
-                envelope = self.op_client.execute_script_with_data(rails_script, payload)
+                envelope = self.op_client.execute_script_with_data(
+                    rails_script, payload, timeout=_BATCH_TIMEOUT_SECONDS
+                )
             except Exception:
                 self.logger.exception(
                     "Rails journal rebuild failed for batch %d (%d work packages)",
