@@ -40,6 +40,20 @@ def session_exists(name: str) -> bool:
     return result.returncode == 0
 
 
+# tmux keeps 2000 lines per pane by default. The client reads the pane back
+# with ``capture-pane -S -1000`` to find its execution markers, so a single
+# verbose script — a bulk create logging per record, a long backtrace — can
+# push the start marker out of history before anyone reads it. The command then
+# fails with "Start marker not found" for a script that ran perfectly.
+HISTORY_LIMIT = 50000
+
+# The Rails console lives at the far end of an SSH connection that can sit idle
+# for minutes while a single Rails call runs. Without keepalives a NAT or
+# firewall idle timer silently drops it, and the migration discovers this only
+# on its next command — as a wedged console rather than a dead connection.
+SSH_KEEPALIVE_OPTS = "-o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes"
+
+
 def start_tmux_session(
     session: str,
     ssh_host: str,
@@ -47,22 +61,27 @@ def start_tmux_session(
     container: str,
     log_path: Path,
 ) -> None:
-    # 1) Create session detached
+    # 1) Raise scrollback *before* creating the session — a pane allocates its
+    #    history when it is created, so setting this afterwards would not reach
+    #    the pane the console runs in.
+    run(["tmux", "set-option", "-g", "history-limit", str(HISTORY_LIMIT)])
+
+    # 2) Create session detached
     run(["tmux", "new-session", "-d", "-s", session])
 
-    # 2) Pipe pane to log
+    # 3) Pipe pane to log
     run(["tmux", "pipe-pane", "-o", "-t", session, f"cat >>{log_path.as_posix()}"])
 
-    # 3) Build SSH + docker exec command
+    # 4) Build SSH + docker exec command
     ssh_target = ssh_host if not ssh_user else f"{ssh_user}@{ssh_host}"
     inner = (
         f"docker exec -e IRBRC=/app/.irbrc "
         f"-e RELINE_OUTPUT_ESCAPES=false -e RELINE_INPUTRC=/dev/null "
         f"-ti {container} bundle exec rails console"
     )
-    ssh_cmd = f'ssh -t {ssh_target} "{inner}"'
+    ssh_cmd = f'ssh -t {SSH_KEEPALIVE_OPTS} {ssh_target} "{inner}"'
 
-    # 4) Send command and press Enter
+    # 5) Send command and press Enter
     run(["tmux", "send-keys", "-t", session, ssh_cmd, "C-m"])
 
 

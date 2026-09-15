@@ -53,6 +53,16 @@ _FETCH_BATCH_CHUNK_SIZE: int = 25
 _CHUNK_TRANSIENT_RETRIES: int = 1
 _CHUNK_TRANSIENT_RETRY_BACKOFF_SECONDS: float = 2.0
 
+# A search page is the one Jira call whose cost grows with the project: 100
+# issues expanded with changelog and rendered fields is a large response to
+# assemble, and the bigger the project the likelier one page times out, hits a
+# proxy hiccup, or comes back 5xx. A single failed page used to abort the whole
+# project's extraction, discarding every page already fetched.
+_PAGE_RETRIES: int = 3
+_PAGE_RETRY_BACKOFF_SECONDS: float = 3.0
+# Floor for the halving below: past this, a smaller page is not the problem.
+_MIN_PAGE_SIZE: int = 10
+
 
 class JiraIssueService:
     """Issue-domain queries for ``JiraClient``."""
@@ -67,6 +77,73 @@ class JiraIssueService:
         self._logger = logger
 
     # ── reads ────────────────────────────────────────────────────────────
+
+    def _search_page_with_retry(
+        self,
+        jql: str,
+        *,
+        project_key: str,
+        start_at: int,
+        max_results: int,
+        fields: object,
+        expand: str,
+    ) -> tuple[list[Issue], int]:
+        """Fetch one page of search results, retrying transient failures.
+
+        Returns the page together with the page size that produced it — the
+        size shrinks after a failed attempt, and the caller's "was this the
+        last page?" test compares against it.
+
+        Raises:
+            JiraApiError: If every attempt for this page fails.
+
+        """
+        last_error: Exception | None = None
+
+        for attempt in range(_PAGE_RETRIES):
+            try:
+                page = self._client.jira.search_issues(
+                    jql,
+                    startAt=start_at,
+                    maxResults=max_results,
+                    fields=fields,
+                    expand=expand,
+                    json_result=False,  # Get jira.Issue objects
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt == _PAGE_RETRIES - 1:
+                    break
+
+                # Halve the page before retrying. A page that times out is
+                # usually a page Jira could not assemble in time rather than a
+                # server that is down, and asking for less of it is the one
+                # remedy available from this side.
+                previous = max_results
+                max_results = max(_MIN_PAGE_SIZE, max_results // 2)
+                backoff = _PAGE_RETRY_BACKOFF_SECONDS * (attempt + 1)
+                self._logger.warning(
+                    "Issue page failed for %s at startAt=%s (%s: %s); retrying in %.1fs "
+                    "with maxResults=%s (was %s), attempt %d/%d",
+                    project_key,
+                    start_at,
+                    type(exc).__name__,
+                    exc,
+                    backoff,
+                    max_results,
+                    previous,
+                    attempt + 2,
+                    _PAGE_RETRIES,
+                )
+                time.sleep(backoff)
+            else:
+                return list(page), max_results
+
+        error_msg = (
+            f"Failed to get issues page for project {project_key} at startAt={start_at} "
+            f"after {_PAGE_RETRIES} attempts: {last_error!s}"
+        )
+        raise JiraApiError(error_msg) from last_error
 
     def get_all_issues_for_project(
         self,
@@ -112,13 +189,13 @@ class JiraIssueService:
                     max_results,
                 )
 
-                issues_page = self._client.jira.search_issues(
+                issues_page, max_results = self._search_page_with_retry(
                     jql,
-                    startAt=start_at,
-                    maxResults=max_results,
+                    project_key=project_key,
+                    start_at=start_at,
+                    max_results=max_results,
                     fields=fields,
                     expand=expand,
-                    json_result=False,  # Get jira.Issue objects
                 )
 
                 if not issues_page:

@@ -749,6 +749,14 @@ class OpenProjectRailsRunnerService:
                     stdout, stderr, rc = client.docker_client.execute_command(
                         runner_cmd,
                         timeout=timeout or 120,
+                        # The caller's script is arbitrary and usually writes
+                        # (journal batches, attachment uploads). Returning the
+                        # exit code rather than raising also makes the ``rc !=
+                        # 0`` check below reachable — with the default
+                        # ``check=True`` it never was, and the failure surfaced
+                        # as a bare SSHCommandError with no mention of Rails.
+                        check=False,
+                        retry=False,
                     )
                     if rc != 0:
                         q_msg = f"rails runner failed (rc={rc}): {stderr[:500]}"

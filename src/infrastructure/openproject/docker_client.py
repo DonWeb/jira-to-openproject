@@ -111,6 +111,9 @@ class DockerClient:
         workdir: Path | str | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        *,
+        check: bool = True,
+        retry: bool = True,
     ) -> tuple[str, str, int]:
         """Execute a command in the Docker container.
 
@@ -120,6 +123,13 @@ class DockerClient:
             workdir: Working directory (default: container's default)
             timeout: Command timeout in seconds (default: self.command_timeout)
             env: Environment variables to set
+            check: Raise ``SSHCommandError`` on a non-zero exit instead of
+                returning the code. Default preserves existing behaviour.
+            retry: Re-run the command on failure or timeout. **Pass ``False``
+                for anything that writes.** The SSH layer retries three times
+                by default, so a creation script that merely ran long is sent
+                again — twice more — while the first copy is still committing
+                rows.
 
         Returns:
             Tuple of (stdout, stderr, returncode)
@@ -160,7 +170,12 @@ class DockerClient:
         docker_cmd_str = " ".join(docker_cmd)
 
         # Execute via SSH
-        return self.ssh_client.execute_command(docker_cmd_str, timeout=timeout)
+        return self.ssh_client.execute_command(
+            docker_cmd_str,
+            timeout=timeout,
+            check=check,
+            retry=retry,
+        )
 
     def copy_file_to_container(
         self,

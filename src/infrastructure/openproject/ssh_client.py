@@ -177,6 +177,17 @@ class SSHClient:
             f"ControlPath={self.SSH_CONTROL_PATH}",
             "-o",
             f"ControlPersist={self.SSH_CONTROL_PERSIST_SECONDS}",
+            # Long Rails operations keep the connection open and silent for
+            # minutes at a time. Without keepalives an idle NAT or firewall
+            # timer drops it mid-command, which surfaces as an unexplained
+            # failure of whatever batch was running rather than as a network
+            # event. Ten missed probes at 30s covers a five-minute quiet spell.
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=10",
+            "-o",
+            "TCPKeepAlive=yes",
         ]
 
         if self.key_file:

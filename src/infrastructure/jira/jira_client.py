@@ -229,6 +229,20 @@ class JiraClient:
         self.jira_token: str = config.jira_config.get("api_token", "")
         self.verify_ssl: bool = config.jira_config.get("verify_ssl", True)
 
+        # (connect, read) socket timeouts for every Jira request.
+        #
+        # ``requests`` defaults to *no* timeout, so a connection the server or
+        # an intermediate proxy drops without a FIN leaves the migration
+        # blocked on a socket read forever — not a failure anyone can see, just
+        # a run that stops making progress with no error and no traceback. The
+        # read budget is generous because the heavy calls are real: a page of
+        # 100 issues expanded with changelog and rendered fields is a large
+        # response for Jira to assemble.
+        self.request_timeout: tuple[float, float] = (
+            float(config.jira_config.get("connect_timeout", 15)),
+            float(config.jira_config.get("read_timeout", 180)),
+        )
+
         # Validate required configuration
         if not self.jira_url:
             msg = "Jira URL is required"
@@ -360,6 +374,7 @@ class JiraClient:
                 server=self.jira_url,
                 token_auth=self.jira_token,
                 options={"verify": self.verify_ssl},
+                timeout=self.request_timeout,
             )
             server_info = self.jira.server_info()
             logger.success(
@@ -395,6 +410,7 @@ class JiraClient:
                 server=self.jira_url,
                 basic_auth=(self.jira_username, self.jira_token),
                 options={"verify": self.verify_ssl},
+                timeout=self.request_timeout,
             )
             self._patch_jira_client()
             logger.debug(

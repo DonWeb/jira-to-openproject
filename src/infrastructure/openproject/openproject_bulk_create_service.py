@@ -472,6 +472,11 @@ class OpenProjectBulkCreateService:
                         stdout, stderr, rc = client.docker_client.execute_command(
                             runner_cmd,
                             timeout=timeout or 120,
+                            # This script creates rows. A retry after a timeout
+                            # re-runs it against a database the first attempt is
+                            # still writing to.
+                            check=False,
+                            retry=False,
                             env={
                                 "J2O_BULK_RUBY_VERBOSE": os.environ.get("J2O_BULK_RUBY_VERBOSE", "1"),
                                 "J2O_BULK_PROGRESS_FILE": container_progress.as_posix(),
@@ -503,6 +508,9 @@ class OpenProjectBulkCreateService:
                     stdout, stderr, rc = client.docker_client.execute_command(
                         runner_cmd,
                         timeout=timeout or 120,
+                        # Creates rows: never send it twice. See above.
+                        check=False,
+                        retry=False,
                         env={
                             "J2O_BULK_RUBY_VERBOSE": os.environ.get("J2O_BULK_RUBY_VERBOSE", "1"),
                             "J2O_BULK_PROGRESS_FILE": container_progress.as_posix(),
