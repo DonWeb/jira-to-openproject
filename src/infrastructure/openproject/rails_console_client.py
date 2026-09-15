@@ -542,6 +542,14 @@ class RailsConsoleClient:
         error_marker_cmd = f'puts "--EXEC_ERROR--{marker_id}"'
         error_marker_out = f"--EXEC_ERROR--{marker_id}"
 
+        # A completion marker the *source* cannot contain. tmux echoes every
+        # line we paste, so waiting for a marker that appears verbatim in the
+        # script matches the echo and reports the script finished before it
+        # started. Ruby joins the halves at run time; only the printed line is
+        # contiguous, so only real output can satisfy the wait.
+        done_marker_cmd = f'puts("--EXEC_" + "DONE--{marker_id}")'
+        done_marker_out = f"--EXEC_DONE--{marker_id}"
+
         # Script end comment to delimit the end of echoed input
         script_end_comment_out = f"--SCRIPT_END--{marker_id}"
 
@@ -651,7 +659,7 @@ class RailsConsoleClient:
                 start_marker_cmd,
                 command,
                 error_marker_cmd,
-                end_marker_cmd,
+                f"{end_marker_cmd}; {done_marker_cmd}",
                 end_with_comment,
             )
         else:
@@ -671,11 +679,14 @@ class RailsConsoleClient:
 
         # Execute in tmux
         if suppress_output:
-            # For suppressed multi-line scripts, avoid marker waits entirely to reduce fragility/noise
+            # Suppressed scripts skip *echo* matching (a wrapped multi-line
+            # paste makes the echo unreliable to match) but still wait for
+            # their end marker: it is what tells the caller the script
+            # finished rather than merely started.
             tmux_output = self._send_command_to_tmux(
                 wrapped_command,
                 timeout,
-                wait_for_line=None,
+                wait_for_line=done_marker_out,
                 script_end_marker=None,
             )
         else:
@@ -982,6 +993,9 @@ class RailsConsoleClient:
         start_time = time.time()
         poll_interval = 0.05
         max_interval = 0.5
+        # Bound to the first capture: a non-positive timeout would otherwise
+        # skip the loop and return a name that was never assigned.
+        current_output = ""
 
         if marker is None:
             logger.debug("Waiting for console output without specific marker (polling only)")
@@ -1097,7 +1111,11 @@ class RailsConsoleClient:
                     console_state["state"],
                 )
                 time.sleep(poll_interval)
-                poll_interval *= 2
+                # Capped: this wait now covers whole batches, and an uncapped
+                # doubling reaches minute-long sleeps that overshoot the
+                # deadline and bill the run for idle time after the console
+                # already came back.
+                poll_interval = min(poll_interval * 2, 2.0)
             except subprocess.SubprocessError as e:
                 logger.exception("Error checking console state")
                 msg = f"Error checking console state: {e}"
@@ -1231,8 +1249,48 @@ class RailsConsoleClient:
                     msg = "End marker not found in tail after post-script output"
                     raise CommandExecutionError(msg)
 
-            # Now ensure prompt is ready before final capture
-            self._wait_for_console_ready(target, timeout, reset_on_stall=False)
+            elif wait_for_line:
+                # No script-end echo to key off (the suppressed-output path,
+                # which skips echo matching because a wrapped multi-line paste
+                # makes it fragile). The end marker is still printed, and it is
+                # the only honest "the script is done" signal available here.
+                #
+                # Without this wait the call returned as soon as the pane
+                # showed a prompt — which, right after a paste, is the prompt
+                # on the *echoed* command line. Every bulk create therefore
+                # reported done the instant it was sent, and its caller fell
+                # through to a result-file poll with a much shorter window of
+                # its own. Batches that outran that window looked like
+                # failures and were re-submitted while the first copy was
+                # still writing rows: duplicate work packages, and the larger
+                # the project the likelier it got.
+                #
+                # Not fatal on timeout: the console may still be working, and
+                # the caller's result-file poll is better placed to judge. A
+                # warning beats a false success.
+                found_end, pane_output = self._wait_for_console_output(target, wait_for_line, timeout)
+                if not found_end:
+                    if self._has_fatal_console_error(pane_output):
+                        snippet = self._extract_error_summary(pane_output)
+                        msg = f"Rails console crashed while running the script: {snippet}"
+                        raise ConsoleNotReadyError(msg)
+                    logger.warning(
+                        "End marker %s not seen within %ss; the script may still be running",
+                        wait_for_line,
+                        timeout,
+                    )
+
+            # Now ensure prompt is ready before final capture. Not fatal when
+            # it times out: the console may legitimately still be working, and
+            # the callers that care (the result-file pollers) can tell a
+            # running script from a finished one via ``is_executing``. Say so
+            # loudly, though — a silent return here reads to the caller as a
+            # completed command.
+            if not self._wait_for_console_ready(target, timeout, reset_on_stall=False):
+                logger.warning(
+                    "Console still evaluating after %ss; returning what the pane holds so far",
+                    timeout,
+                )
 
             # After script completes, capture a compact tail; outer parser will locate markers
             tmux = self._tmux_path
