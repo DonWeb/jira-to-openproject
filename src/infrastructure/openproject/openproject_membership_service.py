@@ -47,8 +47,23 @@ class OpenProjectMembershipService:
     # ── reads ────────────────────────────────────────────────────────────
 
     def get_roles(self) -> list[dict[str, Any]]:
-        """Return OpenProject roles (id, name, builtin flag)."""
-        ruby = "Role.all.map { |r| r.as_json(only: [:id, :name, :builtin]) }"
+        """Return OpenProject roles (id, name, builtin flag, type, permissions).
+
+        ``type`` and ``edit_work_packages`` are additive: existing callers
+        read ``id``/``name`` and are unaffected. ``WorkflowMigration`` needs
+        both, because a role's *name* is the wrong thing to select on — it
+        is renameable and localised, and matching one cost this migration
+        every transition for ordinary members on an instance whose member
+        role is called "Member" rather than "Project member". Whether a role
+        may edit work packages is the property that actually decides whether
+        a workflow row for it means anything, and it is what OpenProject's
+        own seeder keys on.
+        """
+        ruby = (
+            "Role.all.map { |r| r.as_json(only: [:id, :name, :builtin])"
+            ".merge('type' => r.type, "
+            "'edit_work_packages' => (r.permissions.include?(:edit_work_packages) rescue false)) }"
+        )
         try:
             result = self._client.execute_json_query(ruby)
         except QueryExecutionError:

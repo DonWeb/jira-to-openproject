@@ -206,8 +206,139 @@ class JiraWorkflowService:
         )
         return list(schemes_by_id.values())
 
+    def get_observed_transitions(
+        self,
+        project_keys: list[str],
+        *,
+        page_size: int = 100,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return the status transitions issues have actually made, per issue type.
+
+        **Jira Server/DC does not expose a workflow's transition graph over
+        REST.** Every candidate was tried against this instance (Jira
+        Server 9.12.2) and none returns it:
+
+        =========================================== ======================
+        Endpoint                                    Result
+        =========================================== ======================
+        ``/rest/api/2/workflow/search``             404 (Cloud-only)
+        ``/rest/api/2/workflow?workflowName=…``     200, but only ``steps``
+                                                    as a count — no graph
+        ``/rest/workflowDesigner/1.0/workflows``    404
+        ``/rest/projectconfig/1/workflowscheme/…``  200, scheme only
+        =========================================== ======================
+
+        The changelog is the source that does exist. Every status change an
+        issue ever made is recorded there as a ``status`` field item with
+        ``from``/``to`` status ids, so the set of transitions Jira permits
+        for an issue type is recoverable from what its issues actually did.
+        On this instance 435 issues yield 134 distinct
+        ``(issue type, from, to)`` triples across 8 issue types.
+
+        The limitation is worth stating plainly, because it is the reason
+        this is a *sample* rather than a specification: a transition that
+        Jira allows but nobody ever used leaves no trace, so it cannot be
+        recovered. Callers should report the resulting gaps rather than
+        inventing transitions to fill them.
+
+        Returns ``{issue_type_name: [{"from": id, "to": id, "count": n}]}``
+        with ids as strings, matching the ``status`` mapping's key type.
+        """
+        client = self._client
+        if not client.jira:
+            msg = "Jira client is not initialized"
+            raise JiraConnectionError(msg)
+
+        keys = [str(key).strip() for key in project_keys if str(key).strip()]
+        if not keys:
+            self._logger.warning("No project keys given; cannot observe workflow transitions")
+            return {}
+
+        jql = f"project in ({','.join(keys)}) ORDER BY key ASC"
+        url = f"{client.base_url}/rest/api/2/search"
+        self._logger.info("Reading status transitions from the changelog of %s project(s)", len(keys))
+
+        # (issue type, from, to) → how many issues made that move. The count is
+        # not used to decide anything; it goes in the run summary so a single
+        # freak transition is distinguishable from the project's normal path.
+        counts: dict[tuple[str, str, str], int] = {}
+        start = 0
+        issues_seen = 0
+
+        while True:
+            try:
+                response = client.jira._session.get(
+                    url,
+                    params={
+                        "jql": jql,
+                        "startAt": start,
+                        "maxResults": page_size,
+                        "fields": "issuetype",
+                        "expand": "changelog",
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except Exception as exc:
+                error_msg = f"Failed to read issue changelogs for workflow transitions: {exc!s}"
+                self._logger.exception(error_msg)
+                raise JiraApiError(error_msg) from exc
+
+            issues = payload.get("issues") if isinstance(payload, dict) else None
+            if not isinstance(issues, list):
+                break
+
+            for issue in issues:
+                issues_seen += 1
+                fields = issue.get("fields") or {}
+                issue_type = (fields.get("issuetype") or {}).get("name")
+                if not issue_type:
+                    continue
+                histories = (issue.get("changelog") or {}).get("histories") or []
+                for history in histories:
+                    for item in history.get("items") or []:
+                        if item.get("field") != "status":
+                            continue
+                        from_id = item.get("from")
+                        to_id = item.get("to")
+                        # A creation entry has no ``from``; it is not a
+                        # transition, it is where the issue started.
+                        if not from_id or not to_id:
+                            continue
+                        key = (str(issue_type), str(from_id), str(to_id))
+                        counts[key] = counts.get(key, 0) + 1
+
+            total = payload.get("total", 0) if isinstance(payload, dict) else 0
+            start += page_size
+            if not issues or start >= int(total or 0):
+                break
+
+        observed: dict[str, list[dict[str, Any]]] = {}
+        for (issue_type, from_id, to_id), count in counts.items():
+            observed.setdefault(issue_type, []).append(
+                {"from": from_id, "to": to_id, "count": count},
+            )
+
+        self._logger.info(
+            "Observed %s distinct transition(s) across %s issue type(s) in %s issue(s)",
+            len(counts),
+            len(observed),
+            issues_seen,
+        )
+        return observed
+
     def get_workflow_transitions(self, workflow_name: str) -> list[dict[str, Any]]:
-        """Return transitions for a given Jira workflow name."""
+        """Return transitions for a given Jira workflow name.
+
+        .. deprecated::
+           ``/rest/api/2/workflow/search`` is a Jira **Cloud** endpoint and
+           404s on Server/DC, so on a Server target this always returned an
+           empty list — which read as "this workflow has no transitions"
+           and produced a migration that wrote nothing while reporting
+           success. :meth:`get_observed_transitions` is the Server-capable
+           replacement. This is kept for Cloud targets and for callers that
+           still address a workflow by name.
+        """
         client = self._client
         if not client.jira:
             msg = "Jira client is not initialized"
