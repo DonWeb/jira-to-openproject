@@ -1,24 +1,30 @@
-"""Migrate Jira Story Points to OpenProject via numeric CF fallback.
+"""Migrate Jira Story Points onto OpenProject's native ``story_points`` column.
 
-Creates/ensures a WorkPackage custom field "Story Points" (float) and writes the
-Jira story points value per issue.
+Detection strategy, in order:
 
-Detection strategy:
-- Prefer `fields.storyPoints` if present
-- Fallback to common custom field key `fields.customfield_10016`
-- As last resort, scan `fields` attributes for a numeric value where the
-  attribute name contains both 'story' and 'point' (case-insensitive)
+1. The tenant's real ``customfield_<id>``, resolved by display name through
+   :meth:`BaseMigration.jira_custom_field_ids_by_name`.
+2. ``fields.storyPoints`` / ``customfield_10016`` / ``story_points``.
+3. A scan of ``fields`` attributes whose *name* contains both "story" and
+   "point".
+
+Only the first does not guess, and it is the only one that works here: this Jira
+numbers the field ``customfield_10106``, which is not the Cloud sample id and
+whose attribute name contains neither "story" nor "point", so steps 2 and 3 both
+miss it. Every one of the 81 values was being dropped, with the component
+reporting ``success=True, updated=0``.
+
+The destination is the native column rather than a custom field (decision of
+2026-09-01): the "Story Points" custom field on this instance is a *text* one, so
+it neither sorts nor sums, while the native column is an integer and every value
+in this Jira is whole.
 
 Note on dict access patterns kept here
 --------------------------------------
-The story-points field is a tenant-specific Jira custom field whose
-attribute name varies per instance (``storyPoints``,
-``customfield_10016``, or any ``customfield_*`` whose name contains
-"story" and "point"). :class:`JiraIssueFields` does not model these
-dynamic attributes, so the boundary parse stays as direct ``getattr``
-on the raw fields object — same rationale as the
-``customfields_generic_migration`` carry-over from phase 7b. The
-work-package mapping ladder, on the other hand, is normalised through
+:class:`JiraIssueFields` does not model per-tenant custom fields, so the boundary
+parse stays as direct ``getattr`` on the raw fields object — same rationale as
+the ``customfields_generic_migration`` carry-over from phase 7b. The work-package
+mapping ladder, on the other hand, is normalised through
 :class:`WorkPackageMappingEntry.from_legacy`.
 """
 
@@ -29,7 +35,7 @@ from typing import Any
 from src.application.components.base_migration import BaseMigration, register_entity_types
 from src.config import logger
 from src.infrastructure.jira.jira_client import JiraClient
-from src.infrastructure.openproject.openproject_client import OpenProjectClient, escape_ruby_single_quoted
+from src.infrastructure.openproject.openproject_client import OpenProjectClient
 from src.models import ComponentResult, WorkPackageMappingEntry
 
 STORY_POINTS_CF_NAME = "Story Points"
@@ -71,7 +77,19 @@ class StoryPointsMigration(BaseMigration):  # noqa: D101
         return None
 
     @staticmethod
-    def _extract_story_points_from_fields(fields: Any) -> float | None:
+    def _extract_story_points_from_fields(fields: Any, resolved_attr: str | None = None) -> float | None:
+        # The tenant's real ``customfield_<id>``, resolved by display name from
+        # the mapping ``CustomFieldMigration`` populated. Tried first because it
+        # is the only strategy that does not guess: on this instance the field is
+        # ``customfield_10106``, which matches none of the fallbacks below — not
+        # the Cloud sample id, and not the ``dir()`` scan either, since that
+        # matches on the *attribute* name and "customfield_10106" contains
+        # neither "story" nor "point". All 81 values were being dropped.
+        if resolved_attr and hasattr(fields, resolved_attr):
+            num = StoryPointsMigration._coerce_number(getattr(fields, resolved_attr, None))
+            if num is not None:
+                return num
+
         # Preferred explicit attributes
         for attr in ("storyPoints", "customfield_10016", "story_points"):
             if hasattr(fields, attr):
@@ -108,11 +126,22 @@ class StoryPointsMigration(BaseMigration):  # noqa: D101
 
         issues = self._merge_batch_issues(keys)
 
+        # Resolve this tenant's real Story Points custom field id once.
+        resolved_attr = self.jira_custom_field_ids_by_name().get(STORY_POINTS_CF_NAME)
+        if resolved_attr:
+            logger.info("Story Points resolved to Jira field %s", resolved_attr)
+        else:
+            logger.warning(
+                "No Jira custom field named %r in the custom_field mapping —"
+                " falling back to guessed ids, which found nothing on this instance",
+                STORY_POINTS_CF_NAME,
+            )
+
         sp_by_key: dict[str, float] = {}
         for k, issue in issues.items():
             try:
                 fields = getattr(issue, "fields", None)
-                num = self._extract_story_points_from_fields(fields) if fields else None
+                num = self._extract_story_points_from_fields(fields, resolved_attr) if fields else None
                 if isinstance(num, (int, float)):
                     sp_by_key[k] = float(num)
             except Exception:
@@ -127,17 +156,22 @@ class StoryPointsMigration(BaseMigration):  # noqa: D101
         return ComponentResult(success=True, data={"sp_text": norm})
 
     def _load(self, mapped: ComponentResult) -> ComponentResult:
-        cf_id = self._ensure_wp_custom_field(STORY_POINTS_CF_NAME, "float")
-        if not cf_id:
-            return ComponentResult(success=False, failed=1)
+        """Write the story points onto the work packages' native column.
 
+        This used to write a WorkPackage custom field, one Rails round-trip per
+        issue. OpenProject 17.6 has a real ``work_packages.story_points`` column,
+        and by decision on 2026-09-01 that is where the value goes: the custom
+        field this instance has is a *text* one, so it neither sorts nor sums,
+        while the native column is an integer and every value in this Jira is
+        whole (1, 2, 3, 5, 8, 10, 13, 20, 40, 100).
+
+        Batching also replaces the per-work-package ``execute_query`` loop, and
+        ``batch_update_work_packages`` reports back the attributes it could not
+        apply rather than dropping them in silence.
+        """
         wp_map = self.mappings.get_mapping("work_package") or {}
         data = mapped.data or {}
         text_by_key: dict[str, str] = data.get("sp_text", {}) if isinstance(data, dict) else {}
-
-        updated = 0
-        failed = 0
-        projects_with_values: set[int] = set()
 
         # Build a fast jira_key → typed-entry lookup once. We walk
         # ``wp_map.items()`` and use the inner ``jira_key`` (production
@@ -153,37 +187,60 @@ class StoryPointsMigration(BaseMigration):  # noqa: D101
             except ValueError:
                 continue
 
+        updates: list[dict[str, Any]] = []
+        skipped_fractional = 0
         for jira_key, text in text_by_key.items():
             if text is None or text == "0":
                 continue
             entry = entries_by_jira_key.get(jira_key)
             if entry is None:
                 continue
-            wp_id = int(entry.openproject_id)
-            # Track project for selective enablement
-            if entry.openproject_project_id is not None:
-                projects_with_values.add(int(entry.openproject_project_id))
+            # Jira hands these over as floats ("13.0"); the column is an integer.
+            # A fractional value would be truncated, so it is reported instead —
+            # none exist on this instance, but silence would be the wrong default.
             try:
-                val = escape_ruby_single_quoted(str(text))
-                set_script = (
-                    "wp = WorkPackage.find(%d); cf = CustomField.find(%d); "
-                    "cv = wp.custom_value_for(cf); if cv; cv.value = '%s'; cv.save; else; wp.custom_field_values = { cf.id => '%s' }; end; wp.save!; true"
-                    % (wp_id, cf_id, val, val)
+                value = float(text)
+            except (TypeError, ValueError):
+                continue
+            if value != int(value):
+                logger.warning(
+                    "Story Points for %s is %s, which the integer column cannot"
+                    " hold without loss — skipped",
+                    jira_key,
+                    value,
                 )
-                ok = self.op_client.execute_query(set_script)
-                if ok:
-                    updated += 1
-                else:
-                    failed += 1
-            except Exception:
-                logger.exception("Failed to apply Story Points for %s", jira_key)
-                failed += 1
+                skipped_fractional += 1
+                continue
+            updates.append({"id": int(entry.openproject_id), "story_points": int(value)})
 
-        # Enable CF only for projects that have values
-        if projects_with_values:
-            self._enable_cf_for_projects(cf_id, projects_with_values, cf_name=STORY_POINTS_CF_NAME)
+        if not updates:
+            return ComponentResult(success=True, updated=0, failed=skipped_fractional)
 
-        return ComponentResult(success=failed == 0, updated=updated, failed=failed)
+        try:
+            result = self.op_client.batch_update_work_packages(updates)
+        except Exception:
+            logger.exception("Failed to apply Story Points to %d work packages", len(updates))
+            return ComponentResult(success=False, updated=0, failed=len(updates))
+
+        updated = int(result.get("updated", 0)) if isinstance(result, dict) else 0
+        failed = int(result.get("failed", 0)) if isinstance(result, dict) else len(updates)
+        # ``batch_update_work_packages`` names the attributes it could not set.
+        # An empty ``story_points`` setter would otherwise look like a clean run.
+        unapplied = (result or {}).get("unapplied") if isinstance(result, dict) else None
+        if unapplied:
+            logger.warning("OpenProject did not apply: %s", unapplied)
+
+        logger.info(
+            "Story Points: %d work packages updated, %d failed, %d skipped (fractional)",
+            updated,
+            failed,
+            skipped_fractional,
+        )
+        return ComponentResult(
+            success=failed == 0,
+            updated=updated,
+            failed=failed + skipped_fractional,
+        )
 
     def run(self) -> ComponentResult:
         """Run Story points migration."""
