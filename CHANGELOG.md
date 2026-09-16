@@ -36,6 +36,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaulting to `native` and degrading to the Version path on older targets.
 - `OpenProjectSprintService` with native-sprint capability detection and an
   idempotent `ensure_project_sprint`.
+- `boards` component (`BoardMigration`) migrating Jira Software boards to
+  OpenProject's **native Kanban** boards (`Boards::Grid` with
+  `options.type = 'action'`, plus one query-backed widget per column) instead of a
+  saved query per board. Selectable with `J2O_BOARD_STRATEGY`
+  (`kanban` | `basic` | `query`), defaulting to `kanban` and resolved against the
+  live instance. Kanban needs **17.3+**, the release that made all action board
+  types part of the Community edition; an older instance without an Enterprise
+  token gets a Basic board, and a target with no boards module keeps the
+  saved-query path. The check is on the version rather than on
+  `EnterpriseToken.allows_to?(:board_view)`, which still answers `false` on a
+  Community instance that renders Kanban perfectly well.
+- `OpenProjectBoardService` with native-board capability detection (version, grid
+  schema and Enterprise token state) and an idempotent, transactional
+  `ensure_project_board`.
 - `CHANGELOG.md` (this file) tracking release history.
 - `CONTRIBUTING.md` with branching, testing, and PR guidelines.
 - `.github/workflows/ci.yml` running `ruff`, `mypy`, `pytest`, and container tests on every push and pull request.
@@ -215,8 +229,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `work_packages_content` in the component sequence — it previously ran before
   `work_packages_skeleton`, where an empty work-package mapping made it apply
   nothing on every cold run.
-- `agile_boards` no longer creates Versions under the default sprint strategy; it
-  keeps the board → saved-query half.
+- `agile_boards` is now the older-release fallback for both halves: it creates
+  Versions only when the target has no native `Sprint`, and saved queries only when
+  the target has no `Boards::Grid`. Both halves resolve that against the live
+  instance through the same helper the native component uses
+  (`effective_sprint_strategy` / `effective_board_strategy`), so neither can step
+  aside expecting a component that also steps aside.
+- `boards` logs the OpenProject version, the grid columns it found and whether the
+  Enterprise token covers `board_view` before writing anything.
+- `boards` scopes a Jira **scrum** board to its project's active sprint, through a
+  board-level `sprint_id` filter plus `linked_type`/`linked_id`, the way
+  `Boards::SprintTaskBoardCreateService` does. A scrum board in Jira is a view of
+  the active sprint, not of the project: unscoped, the migrated `Desarrollo` board
+  showed 122 cards in a column where Jira showed one. Scoped, all six of its
+  columns reconcile card for card. Kanban boards get no scope — they really are a
+  view of the project.
+- A Kanban column is named after its **status** and carries exactly one. An action
+  board renders its header from the status and honours only the first value of the
+  column's filter, so a column filtered on two statuses appeared under the first
+  one's name and silently hid the other's cards. A column with no status at all is
+  dropped under `kanban` (it rendered as an unnamed, undroppable empty box) and
+  kept as a manual list under `basic`.
 - `Dockerfile.test` now includes OCI labels and a `HEALTHCHECK`.
 - All Python dependencies upgraded to their latest compatible releases (see commit history and `uv.lock`).
 

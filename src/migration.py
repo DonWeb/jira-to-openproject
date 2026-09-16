@@ -27,6 +27,7 @@ from src.application.components.attachment_provenance_migration import Attachmen
 from src.application.components.attachment_recovery_migration import AttachmentRecoveryMigration
 from src.application.components.attachments_migration import AttachmentsMigration
 from src.application.components.base_migration import BaseMigration
+from src.application.components.board_migration import BoardMigration
 from src.application.components.category_defaults_migration import CategoryDefaultsMigration
 from src.application.components.company_migration import CompanyMigration
 from src.application.components.components_migration import ComponentsMigration
@@ -533,6 +534,7 @@ def _build_component_factories(
         "workflows": lambda: WorkflowMigration(jira_client=jira_client, op_client=op_client),
         "agile_boards": lambda: AgileBoardMigration(jira_client=jira_client, op_client=op_client),
         "sprints": lambda: SprintMigration(jira_client=jira_client, op_client=op_client),
+        "boards": lambda: BoardMigration(jira_client=jira_client, op_client=op_client),
         "admin_schemes": lambda: AdminSchemeMigration(jira_client=jira_client, op_client=op_client),
         "reporting": lambda: ReportingMigration(jira_client=jira_client, op_client=op_client),
     }
@@ -1229,6 +1231,7 @@ async def run_migration(
         focus_components = [
             "workflows",
             "sprints",
+            "boards",
             "agile_boards",
             "sprint_epic",
             "admin_schemes",
