@@ -1158,6 +1158,9 @@ class RailsConsoleClient:
 
         """
         target = self._get_target()
+        # Budget for the readiness check after the command; trimmed when a
+        # completion wait has already spent it.
+        ready_timeout = timeout
 
         # ``reset_on_stall=True``: a console parked on a continuation prompt is
         # exactly the case worth recovering from, and Ctrl+C recovers it. With
@@ -1279,6 +1282,11 @@ class RailsConsoleClient:
                         wait_for_line,
                         timeout,
                     )
+                    # Already waited the full budget for a script that has not
+                    # finished; spending it a second time below on a prompt
+                    # that cannot appear until it does would double the wait
+                    # for no new information.
+                    ready_timeout = 5
 
             # Now ensure prompt is ready before final capture. Not fatal when
             # it times out: the console may legitimately still be working, and
@@ -1286,10 +1294,10 @@ class RailsConsoleClient:
             # running script from a finished one via ``is_executing``. Say so
             # loudly, though — a silent return here reads to the caller as a
             # completed command.
-            if not self._wait_for_console_ready(target, timeout, reset_on_stall=False):
+            if not self._wait_for_console_ready(target, ready_timeout, reset_on_stall=False):
                 logger.warning(
                     "Console still evaluating after %ss; returning what the pane holds so far",
-                    timeout,
+                    ready_timeout,
                 )
 
             # After script completes, capture a compact tail; outer parser will locate markers

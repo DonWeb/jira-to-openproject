@@ -111,9 +111,11 @@ class TestSSHClient(unittest.TestCase):
 
     def test_get_ssh_base_command(self) -> None:
         """Test generating the base SSH command."""
-        # Shared options injected by ``_get_common_ssh_options`` now also
-        # include SSH multiplexing settings (ControlMaster/ControlPath/
-        # ControlPersist). The test asserts on the full, current shape.
+        # Shared options injected by ``_get_common_ssh_options``: multiplexing
+        # (ControlMaster/ControlPath/ControlPersist) plus keepalives, which
+        # keep a connection that sits silent through a long Rails call from
+        # being collected by an idle NAT or firewall timer. The test asserts on
+        # the full, current shape.
         common_opts = [
             "-o",
             "ConnectTimeout=10",
@@ -123,6 +125,12 @@ class TestSSHClient(unittest.TestCase):
             f"ControlPath={SSHClient.SSH_CONTROL_PATH}",
             "-o",
             f"ControlPersist={SSHClient.SSH_CONTROL_PERSIST_SECONDS}",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=10",
+            "-o",
+            "TCPKeepAlive=yes",
         ]
 
         # Test with default settings
