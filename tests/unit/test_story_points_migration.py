@@ -112,7 +112,8 @@ def test_fractional_story_points_are_reported_not_truncated():
 
 def test_the_tenants_real_custom_field_is_tried_first(monkeypatch: pytest.MonkeyPatch):
     """The whole point of the fix: this Jira numbers the field customfield_10106,
-    which none of the guessed ids nor the attribute-name scan can find."""
+    which none of the guessed ids nor the attribute-name scan can find.
+    """
     import src.config as cfg
 
     class Fields:

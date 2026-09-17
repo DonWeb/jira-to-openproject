@@ -381,7 +381,8 @@ def test_fractional_story_points_are_not_silently_truncated(
     component: WorkPackageMigration,
 ) -> None:
     """The column is an integer. None of this Jira's values are fractional, but
-    rounding one away without saying so would be the wrong default."""
+    rounding one away without saying so would be the wrong default.
+    """
     component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
         ("2026-02-03T17:03:16.000-0300", [_item("Story Points", "2.5", from_string="3")]),
     )
@@ -407,7 +408,8 @@ def test_sprint_becomes_a_native_sprint_id_change(
     component: WorkPackageMigration,
 ) -> None:
     """``work_package_journals.sprint_id`` exists on 17.6 and ``sprint_epic``
-    writes ``work_packages.sprint_id``, so the snapshot is the right home."""
+    writes ``work_packages.sprint_id``, so the snapshot is the right home.
+    """
     component.sprint_mapping = SPRINT_MAPPING
     component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
         (
@@ -854,7 +856,7 @@ def test_assignee_falls_back_to_the_display_name(
 def test_display_names_alone_resolve_nothing_without_augmentation(
     component: WorkPackageMigration,
 ) -> None:
-    """This is the bug, pinned: the raw mapping has no display-name index.
+    """The bug itself, pinned: the raw mapping has no display-name index.
 
     Without ``_augment_user_mapping_indices`` the lookup fails, which is exactly
     what happened while ``wp_journal_history`` assigned the mapping directly.
@@ -1311,7 +1313,8 @@ def test_both_transitions_are_visible(
     component: WorkPackageMigration,
 ) -> None:
     """The point of the whole change: Open -> In Progress -> Closed is two
-    changes, and the activity used to show one."""
+    changes, and the activity used to show one.
+    """
     ops = _two_transitions(component)
 
     # Replay the way the template does: start from the work package's current
@@ -1418,7 +1421,8 @@ def test_a_not_null_column_created_empty_is_never_declared_as_a_clear(
     component: WorkPackageMigration,
 ) -> None:
     """``status_id`` cannot be NULL, so an unresolvable creation value has to
-    leave the template's base state standing."""
+    leave the template's base state standing.
+    """
     component.status_mapping = {"3": {"openproject_id": 8}}
     component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
         ("2026-02-03T10:00:00.000-0300", [_status_item("", "3", "", "In Progress")]),
@@ -1447,7 +1451,8 @@ def test_creation_journal_carries_the_attachments_present_at_creation(
     component: WorkPackageMigration,
 ) -> None:
     """The ones uploaded later must not already be on v1, or their upload
-    renders as nothing."""
+    renders as nothing.
+    """
     component.attachment_mapping = ATTACHMENTS
     component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
         ("2026-02-03T10:00:00.000-0300", [_attachment_item(added="informe.pdf")]),
@@ -1610,7 +1615,8 @@ def test_a_project_name_that_is_not_mapped_is_not_forced(
     component: WorkPackageMigration,
 ) -> None:
     """``project_id`` is NOT NULL, so an unknown project leaves the work package
-    where it is and the note carries the names."""
+    where it is and the note carries the names.
+    """
     component.project_mapping = PROYECTOS
     component.enhanced_audit_trail_migrator.extract_changelog_from_issue.return_value = _changelog(
         (

@@ -20,7 +20,7 @@ matches.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -47,7 +47,12 @@ def _capture_execute(client: RailsConsoleClient, *, suppress_output: bool) -> tu
     """Run ``execute`` against a stubbed tmux; return (sent script, awaited marker)."""
     recorded: dict[str, object] = {}
 
-    def fake_send(command: str, timeout: int, wait_for_line=None, script_end_marker=None) -> str:  # noqa: ANN001
+    def fake_send(
+        command: str,
+        timeout: int,
+        wait_for_line: str | None = None,
+        script_end_marker: str | None = None,
+    ) -> str:
         recorded["command"] = command
         recorded["wait_for_line"] = wait_for_line
         # Enough of a pane for the non-suppressed parser to find its markers.
@@ -73,7 +78,7 @@ def test_suppressed_execute_waits_for_a_completion_marker(client: RailsConsoleCl
 
 
 def test_completion_marker_never_appears_verbatim_in_the_script(client: RailsConsoleClient) -> None:
-    """tmux echoes the script into the pane the wait reads.
+    """The pane the wait reads also carries tmux's echo of the script.
 
     A marker spelled literally in the source is matched by its own echo, so the
     wait succeeds before Ruby has run a line of it.
@@ -82,8 +87,7 @@ def test_completion_marker_never_appears_verbatim_in_the_script(client: RailsCon
 
     assert wait_for_line is not None
     assert wait_for_line not in command, (
-        f"marker {wait_for_line!r} is spelled verbatim in the script; the echo "
-        "will satisfy the wait immediately"
+        f"marker {wait_for_line!r} is spelled verbatim in the script; the echo will satisfy the wait immediately"
     )
     # It is emitted, just split across a Ruby concatenation.
     marker_id = wait_for_line.removeprefix("--EXEC_DONE--")
