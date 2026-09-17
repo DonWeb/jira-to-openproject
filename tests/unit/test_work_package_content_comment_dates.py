@@ -170,7 +170,7 @@ class TestBulkCreateBackdatesJournal:
         mock_client.logger = MagicMock()
         captured: list[str] = []
 
-        def capture(script: str):
+        def capture(script: str, **_kwargs: object):
             captured.append(script)
             return {"created": 1, "skipped": 0, "failed": 0, "success": True}
 

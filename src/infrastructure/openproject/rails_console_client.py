@@ -363,13 +363,49 @@ class RailsConsoleClient:
         parked on a continuation prompt. Callers waiting on a side effect of a
         script (a result file, say) use this to tell "still working" from
         "finished, and never going to produce it".
+
+        An idle prompt is the *end* of its line: IRB printed it and is waiting
+        for someone to type. When source follows it on the same line, that
+        source is the command IRB echoed and is now evaluating —
+
+            open-project(prod):005> load '/tmp/j2o_bulk_ab12.rb'
+
+        — and calling that settled is how the 2026-09-16 run dropped 13893
+        comments. Five bulk-comment batches were declared lost 15 seconds in,
+        while the console was still writing them, because the only thing on the
+        pane was the echo of the ``load`` that started them.
+
+        The distinction lives here rather than in ``_get_console_state``
+        because it is only correct for this question. Readiness keys off the
+        same echoed line by design — 628 of 670 archived captures end on one —
+        and moving the rule there would make every command wait out its full
+        timeout before returning output it already had.
         """
         try:
-            state = self._get_console_state(self.capture_pane_tail(lines=10))
+            pane = self.capture_pane_tail(lines=10)
+            state = self._get_console_state(pane)
         except Exception:
             # Unknown beats a wrong answer: keep the caller waiting.
             return True
+
+        if state["state"] == "ready" and self._prompt_has_trailing_source(state["prompt"] or ""):
+            return True
+
         return state["state"] not in {"ready", "awaiting_input"}
+
+    @staticmethod
+    def _prompt_has_trailing_source(last_line: str) -> bool:
+        """Whether an echoed command follows the prompt on ``last_line``.
+
+        Empty for a prompt the console is genuinely parked at, which is what a
+        finished script leaves behind: IRB prints a fresh prompt and stops.
+        """
+        matches = list(_RE_IRB_PROMPT.finditer(last_line))
+        if not matches:
+            # A bare ``>>`` / ``pry>`` prompt matches only at end of line, so
+            # there is nothing after it by construction.
+            return False
+        return bool(last_line[matches[-1].end() :].strip())
 
     def last_ruby_error(self) -> str | None:
         """Return the most recent ``Ruby error:`` line in the pane, if any.

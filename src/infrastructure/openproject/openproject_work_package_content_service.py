@@ -44,6 +44,14 @@ from src.infrastructure.openproject.openproject_client import OpenProjectClient
 # column, making it grep-able inside Rails for idempotency checks.
 _COMMENT_PROVENANCE_MARKER = "<!-- j2o:jira-comment-id:{jira_comment_id} -->"
 
+# Budget for the two calls that write in bulk. Both are handed whatever a whole
+# content batch produced — on the 2026-09-16 run that was up to 4142 comments in
+# a single Rails call — and were inheriting the 90s default meant for reading a
+# query back. Writing thousands of journal rows is not a query, and when the
+# budget ran out the batch was recorded as lost rather than slow: five batches,
+# 13893 comments, all reported as failures the run then carried on past.
+_BULK_WRITE_TIMEOUT_SECONDS = 900
+
 
 def _normalize_comment_id(jcid: str | int | None) -> str | None:
     """Normalize a Jira comment id to a non-empty stripped string or ``None``.
@@ -247,7 +255,7 @@ J2O_DATA
         # ``.to_json`` to avoid double-encoding through
         # ``execute_query_to_json_file``.
         try:
-            result = self._client.execute_query_to_json_file(script)
+            result = self._client.execute_query_to_json_file(script, timeout=_BULK_WRITE_TIMEOUT_SECONDS)
             if isinstance(result, dict):
                 return result
             return {"success": False, "updated": 0, "failed": len(sections), "error": str(result)}
@@ -676,7 +684,7 @@ J2O_DATA
         # ``execute_query_to_json_file`` can serialise via ``as_json``
         # without double-encoding.
         try:
-            result = self._client.execute_query_to_json_file(script)
+            result = self._client.execute_query_to_json_file(script, timeout=_BULK_WRITE_TIMEOUT_SECONDS)
             if isinstance(result, dict):
                 return result
             return {"success": False, "created": 0, "skipped": 0, "failed": len(activities), "error": str(result)}

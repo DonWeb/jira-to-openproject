@@ -148,7 +148,7 @@ class TestBulkCreateActivitiesPayload:
         mock_client.logger = MagicMock()
         captured_scripts: list[str] = []
 
-        def capture_script(script: str):
+        def capture_script(script: str, **_kwargs: object):
             captured_scripts.append(script)
             return {"created": 1, "skipped": 0, "failed": 0, "success": True}
 
@@ -189,7 +189,7 @@ class TestBulkCreateActivitiesPayload:
         mock_client.logger = MagicMock()
         captured_scripts: list[str] = []
 
-        def capture_script(script: str):
+        def capture_script(script: str, **_kwargs: object):
             captured_scripts.append(script)
             return {"created": 1, "skipped": 0, "failed": 0, "success": True}
 
@@ -472,7 +472,7 @@ class TestSingleActivityRubyIdempotency:
         mock_client.logger = MagicMock()
         captured_scripts: list[str] = []
 
-        def capture_script(script: str):
+        def capture_script(script: str, **_kwargs: object):
             captured_scripts.append(script)
             return {"id": 1, "status": "created"}
 
@@ -503,7 +503,7 @@ class TestSingleActivityRubyIdempotency:
         mock_client.logger = MagicMock()
         captured_scripts: list[str] = []
 
-        def capture_script(script: str):
+        def capture_script(script: str, **_kwargs: object):
             captured_scripts.append(script)
             return {"id": 1, "status": "created"}
 
@@ -535,7 +535,7 @@ class TestSingleActivityRubyIdempotency:
         mock_client.logger = MagicMock()
         captured_scripts: list[str] = []
 
-        def capture_script(script: str):
+        def capture_script(script: str, **_kwargs: object):
             captured_scripts.append(script)
             return {"id": 1, "status": "created"}
 
@@ -640,7 +640,7 @@ class TestSingleActivityNoTopLevelReturn:
         mock_client = MagicMock()
         mock_client.logger = MagicMock()
         captured: list[str] = []
-        mock_client.execute_query_to_json_file.side_effect = lambda s: (
+        mock_client.execute_query_to_json_file.side_effect = lambda s, **_kwargs: (
             captured.append(s) or {"id": 1, "status": "created"}
         )
         svc = OpenProjectWorkPackageContentService(mock_client)
@@ -771,7 +771,7 @@ class TestCreateWorkPackageActivityNormalization:
         mock_client = MagicMock()
         mock_client.logger = MagicMock()
         captured: list[str] = []
-        mock_client.execute_query_to_json_file.side_effect = lambda s: (
+        mock_client.execute_query_to_json_file.side_effect = lambda s, **_kwargs: (
             captured.append(s) or {"id": 1, "status": "created"}
         )
         svc = OpenProjectWorkPackageContentService(mock_client)
@@ -810,7 +810,7 @@ class TestBulkPayloadNormalization:
         mock_client = MagicMock()
         mock_client.logger = MagicMock()
         captured: list[str] = []
-        mock_client.execute_query_to_json_file.side_effect = lambda s: (
+        mock_client.execute_query_to_json_file.side_effect = lambda s, **_kwargs: (
             captured.append(s) or {"created": 1, "skipped": 0, "failed": 0, "success": True}
         )
         svc = OpenProjectWorkPackageContentService(mock_client)

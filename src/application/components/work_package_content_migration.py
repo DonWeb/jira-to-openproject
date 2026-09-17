@@ -1088,12 +1088,32 @@ class WorkPackageContentMigration(BaseMigration):
             end_time = datetime.now(tz=UTC)
             duration_seconds = (end_time - start_time).total_seconds()
 
+            # Dropped comments are a failure, not a footnote. The 2026-09-16 run
+            # lost 13893 of 15622 comments and still reported this component
+            # green, so the only trace was a warning 400 lines up in a 19k-line
+            # log — precisely the silent data loss #260 exists to stop. Every
+            # other component with a partial-loss counter already reports
+            # ``success = failed == 0``; this one now does too.
+            comments_failed = migration_results.get("comments_failed", 0)
+            total_failed = migration_results.get("total_failed", 0)
+            failed = comments_failed + total_failed
+
             return ComponentResult(
-                status="success",
-                success=True,
+                status="success" if failed == 0 else "error",
+                success=failed == 0,
+                error=(
+                    None
+                    if failed == 0
+                    else (
+                        f"{comments_failed} comment(s) and {total_failed} work package(s) were not "
+                        f"migrated; re-run this component after checking the per-batch warnings"
+                    )
+                ),
                 timestamp=end_time.isoformat(),
                 start_time=start_time.isoformat(),
                 duration_seconds=duration_seconds,
+                updated=migration_results["total_updated"],
+                failed=failed,
                 data=migration_results,
                 details={
                     "total_updated": migration_results["total_updated"],
