@@ -695,10 +695,21 @@ class TestEnhancedAuditTrailMigrator:
         assert saved_results["total_issues_processed"] == 5
         assert saved_results["rails_execution_success"] is True
 
-    def test_save_migration_results_io_error(self, migrator_with_mocks) -> None:
-        """Test saving migration results with IO error."""
+    def test_save_migration_results_io_error(self, migrator_with_mocks, tmp_path) -> None:
+        """Saving reports False when the destination cannot be created.
+
+        The unwritable path is a directory *under a regular file*, so ``mkdir``
+        fails with ENOTDIR for every user. It used to be ``/invalid/path``, which
+        only fails for someone who cannot write to ``/`` — running the suite as
+        root (which is how it runs on openproject-lab) created the directory
+        instead, the save succeeded, and the test failed on an environment
+        difference rather than on the behaviour it is about. It also left
+        ``/invalid/path`` behind on that machine, dated 2026-07-07.
+        """
+        not_a_directory = tmp_path / "soy-un-archivo"
+        not_a_directory.write_text("", encoding="utf-8")
         migrator = migrator_with_mocks
-        migrator.data_dir = "/invalid/path"
+        migrator.data_dir = str(not_a_directory / "sub")
 
         result = migrator.save_migration_results()
 

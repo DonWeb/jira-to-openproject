@@ -19,14 +19,52 @@ results = []
 if input_data && input_data.respond_to?(:each)
   conn = ActiveRecord::Base.connection
 
-  # Cache lookups shared across all WPs (one-time cost)
-  workflow_cf = CustomField.find_by(name: "J2O Jira Workflow")
-  resolution_cf = CustomField.find_by(name: "J2O Jira Resolution")
-  affects_version_cf = CustomField.find_by(name: "J2O Affects Version")
-  j2o_cf_ids = [workflow_cf&.id, resolution_cf&.id, affects_version_cf&.id].compact
-  workflow_cf_id = workflow_cf&.id
-  resolution_cf_id = resolution_cf&.id
-  affects_version_cf_id = affects_version_cf&.id
+  # Custom fields are resolved by the names Python actually sent, once for the
+  # whole batch.
+  #
+  # This used to hardcode "J2O Jira Workflow" / "J2O Jira Resolution" /
+  # "J2O Affects Version". Those three are created by
+  # ``WorkPackageMigration._ensure_j2o_custom_fields`` — the ``work_packages``
+  # component, which is in neither DEFAULT_COMPONENT_SEQUENCE nor the ``full``
+  # profile — so on this instance none of them exist (probed 2026-08-26:
+  # ``j2o_legacy_cfs: {}``). ``j2o_cf_ids`` came out empty and the entire
+  # customizable_journals block below was a no-op: not one custom field change
+  # was ever journaled, including the resolution the code believed it was
+  # storing.
+  #
+  # Python now keys ``cf_state_snapshot`` by OpenProject custom field *name*
+  # and the ids are resolved here, because ids are not stable across installs
+  # while names are what the pipeline's own ``custom_fields`` component
+  # guarantees.
+  requested_cf_names = input_data.flat_map { |wp_data|
+    # Not named ``ops``: the per-WP loop below binds that name, and relying on
+    # parse-order to keep this one block-local is a trap for the next edit.
+    wp_ops = wp_data['rails_ops'] || wp_data[:rails_ops] || []
+    next [] unless wp_ops.respond_to?(:each)
+    wp_ops.flat_map { |op|
+      snapshot = op['cf_state_snapshot'] || op[:cf_state_snapshot]
+      snapshot.is_a?(Hash) ? snapshot.keys.map(&:to_s) : []
+    }
+  }.uniq
+  cf_ids_by_name = requested_cf_names.any? ? CustomField.where(name: requested_cf_names).pluck(:name, :id).to_h : {}
+  # Reported back so Python can warn instead of losing the history in silence —
+  # a missing custom field is exactly how the three J2O ones went unnoticed.
+  missing_cf_names = requested_cf_names - cf_ids_by_name.keys
+  j2o_cf_ids = cf_ids_by_name.values
+
+  # ``attachable_journals.filename`` is NOT NULL. The name is read from the
+  # Attachment rows rather than carried in the payload so it matches what
+  # OpenProject actually stores (it sanitises on upload) and so the payload does
+  # not repeat it once per journal per file. One query for the whole batch.
+  requested_attachment_ids = input_data.flat_map { |wp_data|
+    wp_ops = wp_data['rails_ops'] || wp_data[:rails_ops] || []
+    next [] unless wp_ops.respond_to?(:each)
+    wp_ops.flat_map { |op|
+      snapshot = op['attachment_snapshot'] || op[:attachment_snapshot]
+      snapshot.is_a?(Array) ? snapshot.map(&:to_i) : []
+    }
+  }.uniq
+  attachment_filenames = requested_attachment_ids.any? ? Attachment.where(id: requested_attachment_ids).pluck(:id, :filename).to_h : {}
 
   priority_cache = {}
   IssuePriority.all.each { |p| priority_cache[p.name.downcase] = p.id }
@@ -41,28 +79,106 @@ if input_data && input_data.respond_to?(:each)
   # hardcoded id. Per-WP the work package's own author still wins over this.
   j2o_fallback_user_id = User.find_by(admin: true)&.id || User.anonymous.id
 
-  valid_journal_attributes = [
-    :type_id, :project_id, :subject, :description, :due_date, :category_id,
-    :status_id, :assigned_to_id, :priority_id, :version_id, :author_id,
-    :done_ratio, :estimated_hours, :start_date, :parent_id,
-    :schedule_manually, :ignore_non_working_days
-  ].freeze
+  # Snapshot columns derived from the schema instead of hardcoded.
+  #
+  # This list, the ``current_state`` initialiser and the work_package_journals
+  # INSERT all used to spell out the same 17 columns by hand. OpenProject 17.6's
+  # work_package_journals has 28, so 11 were written NULL on every rebuilt
+  # journal — ``sprint_id``, ``story_points``, ``remaining_hours``,
+  # ``responsible_id``, ``budget_id``, ``duration``,
+  # ``project_phase_definition_id`` and the ``derived_*`` trio. Two costs: the
+  # newest journal no longer matched the work package, so the next native save
+  # rendered a diff that never happened in Jira ("Sprint removed"); and v1 lost
+  # them too, because its payload row is replaced wholesale rather than updated.
+  # It is also why Story Points changes vanished — the column exists, this list
+  # was filtering them out.
+  #
+  # Intersecting with WorkPackage's own columns keeps ``rec.attributes.slice``
+  # below well-defined and drops anything journal-only.
+  journal_columns = Journal::WorkPackageJournal.column_names - %w[id]
+  shared_columns = journal_columns & WorkPackage.column_names
+  valid_journal_attributes = shared_columns.map(&:to_sym).freeze
+
+  # Name -> id caches for the two foreign keys that are scoped to a project,
+  # filled lazily per project because one batch can span several.
+  #
+  # Python sends ``category_id`` and ``version_id`` as *names*. It used to send
+  # Jira's own component and version ids straight through, and those are foreign
+  # keys into OpenProject's ``categories`` and ``versions`` — so the journal ended
+  # up pointing at whatever OpenProject row happened to share that number, or at
+  # nothing. The name is the only part of a Jira changelog item that means the
+  # same thing on both sides, and resolving it needs the work package's project,
+  # which is why it happens here and not in Python.
+  #
+  # Queried through ``conn`` rather than through ``Category`` / ``Version`` so the
+  # template does not depend on those constants existing.
+  scoped_name_caches = { 'categories' => {}, 'versions' => {} }
+  unresolved_scoped_names = 0
+
+  resolve_scoped_name = lambda do |table, project_id, value|
+    return nil if project_id.nil? || value.nil?
+    text = value.to_s.strip
+    return nil if text.empty?
+    cache = scoped_name_caches[table]
+    cache[project_id] ||= conn.select_rows(
+      "SELECT LOWER(name), id FROM #{table} WHERE project_id = #{project_id.to_i}",
+    ).map { |name, id| [name.to_s, id.to_i] }.to_h
+    # Whole string first, so a name that legitimately contains a comma still
+    # resolves. Failing that, the last comma-separated segment: a Jira issue can
+    # carry several components or fix versions at once and reports them as a
+    # list, while ``category_id`` and ``version_id`` are scalar foreign keys —
+    # same constraint, and same "last one wins", as ``sprint_id``.
+    by_name = cache[project_id]
+    found = by_name[text.downcase]
+    return found if found
+    return nil unless text.include?(',')
+    last = text.split(',').map(&:strip).reject(&:empty?).last
+    last ? by_name[last.downcase] : nil
+  end
 
   # Lambda: Apply field_changes to state hash
-  apply_field_changes_to_state = lambda do |current_state, field_changes, priority_cache, rec|
+  apply_field_changes_to_state = lambda do |current_state, field_changes, priority_cache, rec, field_clears|
     return current_state unless field_changes && field_changes.is_a?(Hash)
+    clears = Array(field_clears).map(&:to_sym)
     field_changes.each do |k, v|
       field_sym = k.to_sym
       next unless valid_journal_attributes.include?(field_sym)
       new_value = v.is_a?(Array) ? v[1] : v
-      next if new_value.nil?
-      next if new_value.is_a?(String) && new_value.empty?
       next if new_value.is_a?(Array)
+
+      # An empty new value means one of two different things, and treating them
+      # the same is what made a real clear invisible: either Python could not
+      # resolve the value (keep what was there — the old behaviour, still right),
+      # or Jira emptied the field, which Python signals in ``field_clears``. Only
+      # the second is applied, so an unassignment, a removal from a sprint or a
+      # deleted due date finally renders as a change.
+      if new_value.nil? || (new_value.is_a?(String) && new_value.empty?)
+        next unless clears.include?(field_sym)
+        current_state[field_sym] = nil
+        next
+      end
 
       # Special handling for priority_id - resolve string name to ID
       if field_sym == :priority_id && new_value.is_a?(String) && !(new_value =~ /^\d+$/)
         resolved = priority_cache[new_value.downcase]
         new_value = resolved if resolved
+      end
+
+      # category_id and version_id arrive as names, scoped to the project.
+      #
+      # An unresolvable name is skipped rather than written: the alternative is a
+      # foreign key pointing at a row that has nothing to do with this issue,
+      # which is what the old code did with Jira's raw ids. Skipping leaves the
+      # previous value in place, so the activity shows no change instead of a
+      # wrong one — and the count comes back so it is not silent.
+      if field_sym == :category_id || field_sym == :version_id
+        table = field_sym == :category_id ? 'categories' : 'versions'
+        resolved = resolve_scoped_name.call(table, rec.project_id, new_value)
+        if resolved.nil?
+          unresolved_scoped_names += 1
+          next
+        end
+        new_value = resolved
       end
 
       next unless new_value.is_a?(Integer) || new_value.is_a?(String) ||
@@ -140,6 +256,14 @@ if input_data && input_data.respond_to?(:each)
           v2_plus_ids = v2_plus_journals.pluck(:id)
           if v2_plus_ids.any?
             Journal::CustomizableJournal.where(journal_id: v2_plus_ids).delete_all
+            # ``attachable_journals`` was missing from this list, and ``delete_all``
+            # skips the ``dependent: :destroy`` that would otherwise have covered
+            # it, so every rebuild stranded the attachment rows of the journals it
+            # deleted. Measured on 2026-08-26 before this line existed: 1399 of
+            # 3156 rows orphaned, 44.3%, and growing with each supposedly
+            # idempotent re-run. ``scripts/cleanup_orphan_journal_data.py`` now
+            # sweeps the table too, for the ones already there.
+            Journal::AttachableJournal.where(journal_id: v2_plus_ids).delete_all
             data_ids = v2_plus_journals.pluck(:data_id).compact
             v2_plus_journals.delete_all
             Journal::WorkPackageJournal.where(id: data_ids).delete_all if data_ids.any?
@@ -152,21 +276,22 @@ if input_data && input_data.respond_to?(:each)
         # Get base version for this WP
         base_version = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage').maximum(:version) || 0
 
-        # Initialize state from WP record (Ruby has DB access)
-        current_state = {
-          type_id: rec.type_id, project_id: rec.project_id, subject: rec.subject,
-          description: rec.description, due_date: rec.due_date, category_id: rec.category_id,
-          status_id: rec.status_id, assigned_to_id: rec.assigned_to_id, priority_id: rec.priority_id,
-          version_id: rec.version_id, author_id: rec.author_id, done_ratio: rec.done_ratio,
-          estimated_hours: rec.estimated_hours, start_date: rec.start_date, parent_id: rec.parent_id,
-          schedule_manually: rec.schedule_manually, ignore_non_working_days: rec.ignore_non_working_days
-        }
+        # Initialize state from WP record (Ruby has DB access). Every shared
+        # column, not a hand-picked subset — see ``shared_columns`` above.
+        current_state = rec.attributes.slice(*shared_columns).symbolize_keys
 
         # Collect journal data using pre-computed values from Python
         bulk_journals = []
         v1_journal = nil
         v1_cf_snapshot = nil
+        v1_attachment_snapshot = nil
         v1_target_time = nil
+
+        # State of the last op that actually became a journal, so the skip test
+        # below can ask "did anything change?" rather than "is this empty?".
+        # Seeded with nil so the first op always counts as a change.
+        prev_written_cf_snapshot = nil
+        prev_written_attachment_snapshot = nil
 
         ops.each_with_index do |op, op_idx|
           op_type = op['type'] || op[:type]
@@ -175,9 +300,53 @@ if input_data && input_data.respond_to?(:each)
           notes = op['notes'] || op[:notes] || ''
           field_changes = op['field_changes'] || op[:field_changes]
 
-          # Skip empty operations (except first which updates v1)
-          is_empty = (notes.nil? || notes.to_s.strip.empty?) && (field_changes.nil? || field_changes.empty?)
+          # cf_state_snapshot arrives keyed by OpenProject custom field name and
+          # is resolved to ids through ``cf_ids_by_name``. Any name is accepted,
+          # so adding a field is a Python-side change only — the two hardcoded
+          # keys this replaced ('workflow' / 'resolution') were the reason no
+          # custom field change ever reached the activity tab.
+          cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
+          resolved_cf_snapshot = nil
+          if cf_snapshot.is_a?(Hash)
+            resolved_cf_snapshot = {}
+            cf_snapshot.each do |cf_name, cf_value|
+              cf_id = cf_ids_by_name[cf_name.to_s]
+              next unless cf_id
+              next if cf_value.nil?
+              resolved_cf_snapshot[cf_id] = cf_value
+            end
+          end
+
+          # Absolute set of OpenProject attachment ids present at this journal,
+          # or nil when this work package has no resolved attachments — nil means
+          # "leave the rows alone", an empty array would mean "everything was
+          # removed".
+          raw_attachment_snapshot = op['attachment_snapshot'] || op[:attachment_snapshot]
+          attachment_snapshot = raw_attachment_snapshot.is_a?(Array) ? raw_attachment_snapshot.map(&:to_i).uniq : nil
+
+          # Skip an operation that contributes nothing (except the first, which
+          # updates v1).
+          #
+          # "Contributes nothing" is not the same as "is empty": the snapshots
+          # above are *absolute*, so on a work package that merely has
+          # attachments every single op carries a non-empty attachment set, and on
+          # one that ever set a tracked custom field every op after that carries
+          # its value. Testing those for emptiness would keep a journal for each
+          # of the 512 Link / RemoteIssueLink / WorklogId / timespent entries that
+          # this rebuild is supposed to drop — 512 activity entries showing
+          # nothing at all. So they are compared against the previous op instead.
+          cf_unchanged = resolved_cf_snapshot == prev_written_cf_snapshot
+          attachment_unchanged = attachment_snapshot == prev_written_attachment_snapshot
+          is_empty = (notes.nil? || notes.to_s.strip.empty?) &&
+                     (field_changes.nil? || field_changes.empty?) &&
+                     cf_unchanged && attachment_unchanged
           next if is_empty && op_idx != 0
+
+          # Only advanced for ops that actually become a journal: a skipped op
+          # writes nothing, so what the *next* one has to differ from is still
+          # the last journal written.
+          prev_written_cf_snapshot = resolved_cf_snapshot
+          prev_written_attachment_snapshot = attachment_snapshot
 
           # Use pre-computed user_id from Python
           raw_user_id = (op['user_id'] || op[:user_id]).to_i
@@ -205,29 +374,16 @@ if input_data && input_data.respond_to?(:each)
             state_snapshot = op["state_snapshot"] || op[:state_snapshot]
             sanitized_state = ensure_required_fields.call(state_snapshot, rec)
           else
-            current_state = apply_field_changes_to_state.call(current_state, field_changes, priority_cache, rec)
+            current_state = apply_field_changes_to_state.call(
+              current_state, field_changes, priority_cache, rec, op['field_clears'] || op[:field_clears],
+            )
             sanitized_state = current_state.dup
           end
-
-          # Get cf_state_snapshot (pre-computed by Python with field names, resolve to IDs here)
-          cf_snapshot = op["cf_state_snapshot"] || op[:cf_state_snapshot]
-          resolved_cf_snapshot = nil
-          if cf_snapshot.is_a?(Hash)
-            resolved_cf_snapshot = {}
-            if cf_snapshot['workflow'] && workflow_cf_id
-              resolved_cf_snapshot[workflow_cf_id] = cf_snapshot['workflow']
-            end
-            if cf_snapshot['resolution'] && resolution_cf_id
-              resolved_cf_snapshot[resolution_cf_id] = cf_snapshot['resolution']
-            end
-          end
-
-          # Use pre-computed version from Python, or calculate if not provided
-          pre_computed_version = op['version'] || op[:version]
 
           if op_idx == 0
             # First operation updates v1 journal
             v1_cf_snapshot = resolved_cf_snapshot
+            v1_attachment_snapshot = attachment_snapshot
             v1_journal = Journal.where(journable_id: rec.id, journable_type: 'WorkPackage', version: 1).first
             if v1_journal
               # Remember the payload row this journal currently points at.
@@ -253,12 +409,21 @@ if input_data && input_data.respond_to?(:each)
               v1_target_time = target_time
             end
           else
-            # v2+ journals: use pre-computed version or increment
-            version = pre_computed_version || (base_version + bulk_journals.size + 1)
+            # Numbered here, from the journals actually kept — not from the
+            # ``version`` Python sent.
+            #
+            # Python numbers one operation per Jira entry, but the skip test
+            # above drops the ones that contribute nothing, and every drop left
+            # a hole in the chain. Measured after the rebuild on 2026-08-28: 158
+            # work packages whose journal count did not match their highest
+            # version. Only Ruby knows which operations survived, so only Ruby
+            # can number them. Python's value stays in the payload as intent.
+            version = base_version + bulk_journals.size + 1
             bulk_journals << {
               version: version, user_id: user_id, notes: notes,
               created_at: target_time, validity_period: validity_period,
-              state: sanitized_state, cf_snapshot: resolved_cf_snapshot
+              state: sanitized_state, cf_snapshot: resolved_cf_snapshot,
+              attachment_snapshot: attachment_snapshot
             }
           end
         end
@@ -338,24 +503,27 @@ if input_data && input_data.respond_to?(:each)
 
         # Bulk INSERT work_package_journals first (to get data_id)
         if bulk_journals.any?
+          # Columns and values both come from ``shared_columns``, so a column
+          # added by a future OpenProject release is carried instead of silently
+          # NULLed. ``conn.quote`` covers nil -> NULL, Date/Time, booleans and
+          # numerics, which also retires the hand-rolled date interpolation that
+          # used to sit here and could not quote a Date safely.
           wp_journal_values = bulk_journals.map do |j|
             s = j[:state]
-            subject_escaped = conn.quote(s[:subject].to_s)
-            desc_escaped = conn.quote(s[:description].to_s)
-            due_date_sql = s[:due_date] ? "'#{s[:due_date]}'" : "NULL"
-            start_date_sql = s[:start_date] ? "'#{s[:start_date]}'" : "NULL"
-
-            "(#{s[:type_id] || 'NULL'}, #{s[:project_id] || 'NULL'}, #{subject_escaped}, #{desc_escaped}, " +
-            "#{due_date_sql}, #{s[:category_id] || 'NULL'}, #{s[:status_id] || 'NULL'}, #{s[:assigned_to_id] || 'NULL'}, " +
-            "#{sanitize_id_field.call(s[:priority_id], priority_cache, rec.priority_id) || 'NULL'}, #{s[:version_id] || 'NULL'}, #{s[:author_id] || 'NULL'}, " +
-            "#{s[:done_ratio] || 0}, #{s[:estimated_hours] || 'NULL'}, #{start_date_sql}, #{s[:parent_id] || 'NULL'}, " +
-            "#{s[:schedule_manually] || false}, #{s[:ignore_non_working_days] || false})"
+            row = shared_columns.map do |col|
+              value = s[col.to_sym]
+              # priority_id is the one column Python may hand over as a name
+              # ("High") rather than an id; NOT NULL, so it also needs the WP's
+              # own value as a floor.
+              value = sanitize_id_field.call(value, priority_cache, rec.priority_id) if col == 'priority_id'
+              value = 0 if col == 'done_ratio' && value.nil?
+              conn.quote(value)
+            end
+            "(#{row.join(', ')})"
           end
 
           wp_insert_sql = <<~SQL
-            INSERT INTO work_package_journals (type_id, project_id, subject, description,
-              due_date, category_id, status_id, assigned_to_id, priority_id, version_id, author_id,
-              done_ratio, estimated_hours, start_date, parent_id, schedule_manually, ignore_non_working_days)
+            INSERT INTO work_package_journals (#{shared_columns.join(', ')})
             VALUES #{wp_journal_values.join(",\n       ")}
             RETURNING id
           SQL
@@ -423,6 +591,29 @@ if input_data && input_data.respond_to?(:each)
                 conn.execute("INSERT INTO customizable_journals (journal_id, custom_field_id, value) VALUES #{cf_journal_values.join(', ')}")
               end
             end
+
+            # Bulk INSERT attachable_journals for v2+.
+            #
+            # Absolute sets, unlike the custom field rows above: OpenProject
+            # diffs a journal's attachment rows against its predecessor's, so
+            # writing only what changed would read as "everything else was
+            # removed". A work package whose attachments never moved therefore
+            # repeats the same set on every journal, which diffs to nothing.
+            attachable_values = []
+            bulk_journals.each do |j|
+              journal_id = version_to_id[j[:version]]
+              next unless journal_id
+              (j[:attachment_snapshot] || []).each do |att_id|
+                filename = attachment_filenames[att_id]
+                # No Attachment row means the file is gone from OpenProject;
+                # filename is NOT NULL, so skip rather than invent one.
+                next unless filename
+                attachable_values << "(#{journal_id}, #{att_id.to_i}, #{conn.quote(filename)})"
+              end
+            end
+            if attachable_values.any?
+              conn.execute("INSERT INTO attachable_journals (journal_id, attachment_id, filename) VALUES #{attachable_values.join(', ')}")
+            end
           end
         end
 
@@ -435,6 +626,31 @@ if input_data && input_data.respond_to?(:each)
               "(#{v1_journal.id}, #{cf_id.to_i}, #{conn.quote(cf_value.to_s)})"
             end.compact
             conn.execute("INSERT INTO customizable_journals (journal_id, custom_field_id, value) VALUES #{cf_values.join(', ')}") if cf_values.any?
+          end
+        end
+
+        # Insert attachable_journals for v1, delete-then-rewrite like the custom
+        # field rows above.
+        #
+        # v1 genuinely can hold attachment rows: OpenProject aggregates
+        # consecutive changes by the same user inside
+        # ``journal_aggregation_time_minutes``, so files attached right after the
+        # work package was created fold into the creation journal. Leaving those
+        # in place would put them alongside the baseline computed from Jira and
+        # the first attachment diff would come out wrong.
+        #
+        # Guarded on a non-nil snapshot: nil means this work package has no
+        # attachments this migration resolved, and wiping its rows on that basis
+        # would destroy history we cannot rebuild.
+        if v1_journal && !v1_attachment_snapshot.nil?
+          Journal::AttachableJournal.where(journal_id: v1_journal.id).delete_all
+          v1_attachable = v1_attachment_snapshot.map { |att_id|
+            filename = attachment_filenames[att_id]
+            next nil unless filename
+            "(#{v1_journal.id}, #{att_id.to_i}, #{conn.quote(filename)})"
+          }.compact
+          if v1_attachable.any?
+            conn.execute("INSERT INTO attachable_journals (journal_id, attachment_id, filename) VALUES #{v1_attachable.join(', ')}")
           end
         end
 
@@ -452,6 +668,20 @@ if input_data && input_data.respond_to?(:each)
     results << result
   end
 end
+
+# A custom field named in the payload that this instance does not have means
+# lost history, so it travels back as a diagnostics row rather than staying in
+# the Rails log. Prepended and tagged so Python can pull it out before it walks
+# the per-WP results; older Python readers skip it as a row with no wp_id.
+# ``missing_cf_names`` is assigned inside the ``input_data`` guard above. Ruby
+# creates the local at parse time either way, so an empty payload leaves it nil
+# rather than undefined — ``defined?`` alone would not save this.
+diagnostics = {}
+diagnostics['missing_cf_names'] = missing_cf_names if !missing_cf_names.nil? && missing_cf_names.any?
+if !unresolved_scoped_names.nil? && unresolved_scoped_names > 0
+  diagnostics['unresolved_scoped_names'] = unresolved_scoped_names
+end
+results.unshift({ 'diagnostics' => true }.merge(diagnostics)) if diagnostics.any?
 
 # Output JSON result with dynamic markers (set by Python via $j2o_start_marker / $j2o_end_marker)
 start_marker = defined?($j2o_start_marker) && $j2o_start_marker ? $j2o_start_marker : "JSON_OUTPUT_START"

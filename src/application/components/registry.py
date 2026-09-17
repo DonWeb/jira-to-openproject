@@ -111,6 +111,10 @@ DEFAULT_COMPONENT_SEQUENCE: list[ComponentName] = [
     # precede ``agile_boards`` so the board queries are created against
     # projects whose sprints already exist.
     "sprints",
+    # Native OpenProject boards (``Boards::Grid``). Has to precede
+    # ``agile_boards`` so that component can see the board strategy is
+    # already resolved and skip building a competing saved view per board.
+    "boards",
     "agile_boards",
     # === Phase 1: Work Package Skeletons (no content) ===
     "work_packages_skeleton",
@@ -180,6 +184,7 @@ PREDEFINED_PROFILES: dict[str, list[ComponentName]] = {
         "status_types",
         "workflows",
         "sprints",
+        "boards",
         "agile_boards",
         "sprint_epic",
         "admin_schemes",

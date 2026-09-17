@@ -30,6 +30,11 @@ class DummyJira:
 class DummyOp:
     def __init__(self) -> None:
         self.queries: list[str] = []
+        self.updates: list[dict] = []
+
+    def batch_update_work_packages(self, updates):
+        self.updates.extend(updates)
+        return {"updated": len(updates), "failed": 0}
 
     def get_custom_field_by_name(self, name: str):
         assert name == STORY_POINTS_CF_NAME
@@ -73,11 +78,66 @@ def _mock_mappings(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cfg, "mappings", DummyMappings(), raising=False)
 
 
-def test_story_points_migration_sets_cf():
-    mig = StoryPointsMigration(jira_client=DummyJira(), op_client=DummyOp())  # type: ignore[arg-type]
-    ex = mig._extract()
-    mp = mig._map(ex)
-    ld = mig._load(mp)
-    # PRJ-1, PRJ-2 have values -> 2 updates
+def test_story_points_migration_writes_the_native_column():
+    """Reverses the original design, deliberately.
+
+    This used to write a WorkPackage custom field, and asserted only the count.
+    The custom field on this instance is a *text* one, so it neither sorts nor
+    sums; OpenProject 17.6 has a real integer ``story_points`` column and that is
+    where the value goes as of 2026-09-01.
+    """
+    op = DummyOp()
+    mig = StoryPointsMigration(jira_client=DummyJira(), op_client=op)  # type: ignore[arg-type]
+    ld = mig._load(mig._map(mig._extract()))
+
     assert ld.success is True
-    assert ld.updated == 2
+    # PRJ-1 has 3; PRJ-2's 5.5 is fractional and the column is an integer.
+    assert op.updates == [{"id": 11001, "story_points": 3}]
+    assert ld.updated == 1
+
+
+def test_fractional_story_points_are_reported_not_truncated():
+    """Rounding a value away silently would be the wrong default.
+
+    None of this Jira's 81 values are fractional, but the column is an integer
+    and the component should say so rather than quietly store 5 for 5.5.
+    """
+    op = DummyOp()
+    mig = StoryPointsMigration(jira_client=DummyJira(), op_client=op)  # type: ignore[arg-type]
+    ld = mig._load(mig._map(mig._extract()))
+
+    assert all(u["id"] != 11002 for u in op.updates)
+    assert ld.failed == 1
+
+
+def test_the_tenants_real_custom_field_is_tried_first(monkeypatch: pytest.MonkeyPatch):
+    """The whole point of the fix: this Jira numbers the field customfield_10106,
+    which none of the guessed ids nor the attribute-name scan can find."""
+    import src.config as cfg
+
+    class Fields:
+        customfield_10106 = 8
+
+    class Issue:
+        key = "PRJ-9"
+        fields = Fields()
+
+    class Jira:
+        def batch_get_issues(self, keys):
+            return {"PRJ-9": Issue()}
+
+    class Mappings:
+        def get_mapping(self, name: str):
+            if name == "work_package":
+                return {"PRJ-9": {"openproject_id": 11009}}
+            if name == "custom_field":
+                return {"customfield_10106": {"jira_name": "Story Points"}}
+            return {}
+
+    monkeypatch.setattr(cfg, "mappings", Mappings(), raising=False)
+    op = DummyOp()
+    mig = StoryPointsMigration(jira_client=Jira(), op_client=op)  # type: ignore[arg-type]
+
+    mig._load(mig._map(mig._extract()))
+
+    assert op.updates == [{"id": 11009, "story_points": 8}]

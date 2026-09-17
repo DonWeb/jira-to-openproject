@@ -1,5 +1,15 @@
 """Migrate Jira Software boards and sprints into OpenProject equivalents.
 
+Compatibility fallback
+----------------------
+Both halves of this component are now the *older-release* path. On a
+target with native sprints (17.6+) the ``sprints`` component owns sprint
+creation; on a target with ``Boards::Grid`` the ``boards`` component owns
+boards. This one keeps the sprint-as-Version and board-as-saved-view
+behaviour for everything below that, and each half steps aside only when
+the corresponding native component has actually taken over — resolved
+against the live instance, never off the raw config flag.
+
 Phase 7d note
 -------------
 This migration is intentionally left structurally unchanged in the
@@ -19,6 +29,10 @@ from typing import Any
 
 from src import config
 from src.application.components.base_migration import BaseMigration, register_entity_types
+from src.application.components.board_migration import (
+    NATIVE_BOARD_STRATEGIES,
+    effective_board_strategy,
+)
 from src.application.components.sprint_migration import (
     SPRINT_STRATEGY_NATIVE,
     effective_sprint_strategy,
@@ -214,7 +228,16 @@ class AgileBoardMigration(BaseMigration):
         skipped_boards: list[dict[str, Any]] = []
         skipped_sprints: list[dict[str, Any]] = []
 
-        for board in boards:
+        # Resolved against the live instance for the same reason the sprint
+        # half is (below): on a target that supports native boards the
+        # ``boards`` component owns them and has already run, so building a
+        # saved view per board too would give every Jira board a second,
+        # competing representation. On a target without them this stays the
+        # only board migration there is.
+        board_strategy = effective_board_strategy(self.op_client)
+        board_source = [] if board_strategy in NATIVE_BOARD_STRATEGIES else boards
+
+        for board in board_source:
             project_key = board.get("project_key")
             project_entry = self.project_mapping.get(project_key) if project_key else None
             op_project_id = int(project_entry.get("openproject_id", 0)) if isinstance(project_entry, dict) else 0
@@ -321,6 +344,7 @@ class AgileBoardMigration(BaseMigration):
                 "skipped_boards": len(skipped_boards),
                 "skipped_sprints": len(skipped_sprints),
                 "sprint_strategy": strategy,
+                "board_strategy": board_strategy,
             },
         )
 

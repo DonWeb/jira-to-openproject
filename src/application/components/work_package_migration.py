@@ -139,7 +139,12 @@ class WorkPackageMigration(BaseMigration):
             "Parent",
             "Epic Link",
             "Epic Child",
-            # Attachments (migrated separately)
+            # Attachments. Kept here for the legacy ``work_packages`` flow, but
+            # in ``_build_rails_ops_for_issue`` these never reach the note
+            # fallback this list gates: the attachment branch there sets
+            # ``field_mapped`` and turns them into an ``attachable_journals``
+            # snapshot, i.e. a real "File added" change. Same precedence as
+            # ``Rank`` — see ``JIRA_FIELD_TO_OP_CF_NAME``.
             "Attachment",
             "attachment",
             # Sprint/agile (migrated separately)
@@ -155,6 +160,81 @@ class WorkPackageMigration(BaseMigration):
             "watches",  # Watchers not migrated
             "votes",  # Votes not migrated
             "Flagged",  # Jira flag indicator
+            # Jira's workflow *scheme*, an administration object with no
+            # OpenProject equivalent — changing it says nothing about the issue.
+            # Suppressed by decision rather than given a custom field: measured
+            # 2026-09-01 it was the single largest source of changelog-as-comment
+            # noise, 58 of 99 journals.
+            "Workflow",
+        },
+    )
+
+    # Lowercased companion, because Jira is not consistent about the case of a
+    # changelog field name ("Attachment" but "labels", "Sprint" but "timespent")
+    # and the set above was written by hand against whatever each report showed.
+    _IGNORED_CHANGELOG_FIELDS_LOWER = frozenset(name.lower() for name in IGNORED_CHANGELOG_FIELDS)
+
+    # Jira changelog field (lowercased) -> OpenProject custom field *name*.
+    #
+    # These are the changes with no native column to land in, so they become
+    # ``customizable_journals`` rows instead of journal notes — which is what
+    # turns them into changes in the activity tab rather than comments. Keyed by
+    # name because custom field ids are not stable across installs; the Ruby
+    # template resolves them per batch and reports the misses.
+    #
+    # Every name here must be a custom field the pipeline itself creates
+    # (``custom_fields``, ``resolutions``, ``labels``, …). A name with no custom
+    # field behind it is not a silent no-op any more, but it is still lost
+    # history, so keep the two in sync.
+    #
+    # Verified against the instance's inventory on 2026-08-26 (``cf_missing: []``):
+    # Resolution 58, Labels 59, Rank 46, Bugs 63, J2O Origin Key 5.
+    #
+    # ``Story Points`` used to live here and no longer does. It moved to the
+    # native ``story_points`` column that OpenProject 17.6 has, by decision on
+    # 2026-09-01: the custom field is a text one, so it neither sorts nor sums,
+    # and all 81 values in this Jira are whole numbers (1, 2, 3, 5, 8, 10, 13,
+    # 20, 40, 100) that fit the native column without loss.
+    #
+    # Precedence, and it matters: ``jira_to_op_field`` (native column) wins over
+    # this map, which wins over :attr:`IGNORED_CHANGELOG_FIELDS` — the ignore
+    # list only ever gates the note fallback. So ``Rank`` and ``Global Rank``
+    # appearing in both is not a contradiction: they become custom field changes,
+    # and the ignore list never gets asked about them.
+    JIRA_FIELD_TO_OP_CF_NAME: dict[str, str] = {
+        "resolution": "Resolution",
+        "labels": "Labels",
+        "rank": "Rank",
+        "global rank": "Rank",
+        "bugs": "Bugs",
+        # Jira renames an issue when it moves between projects. OpenProject has
+        # no key of its own, but the provenance field already holds the Jira one,
+        # so the rename belongs there.
+        "key": "J2O Origin Key",
+    }
+
+    # Journal columns where "Jira emptied this field" is a state OpenProject can
+    # actually hold, so a change to nothing is worth recording.
+    #
+    # The ones deliberately absent are NOT NULL: ``subject``, ``author_id``,
+    # ``priority_id``, ``status_id``, ``type_id``, ``project_id``. Asking to clear
+    # one of those would fail the insert, and in the normal path nothing puts the
+    # value back — ``ensure_required_fields`` only runs for the pre-built
+    # ``state_snapshot`` branch.
+    _CLEARABLE_JOURNAL_FIELDS = frozenset(
+        {
+            "assigned_to_id",
+            "responsible_id",
+            "sprint_id",
+            "version_id",
+            "category_id",
+            "parent_id",
+            "due_date",
+            "start_date",
+            "description",
+            "estimated_hours",
+            "remaining_hours",
+            "story_points",
         },
     )
 
@@ -194,6 +274,8 @@ class WorkPackageMigration(BaseMigration):
         self.project_mapping: dict[str, Any] = {}
         self.user_mapping: dict[str, Any] = {}
         self.issue_type_mapping: dict[str, Any] = {}
+        # Populated by callers that rebuild journals; see ``_resolve_sprint_id``.
+        self.sprint_mapping: dict[str, Any] = {}
         self.status_mapping: dict[str, Any] = {}
 
         # Track mentioned users per project for membership assignment
@@ -1273,6 +1355,226 @@ class WorkPackageMigration(BaseMigration):
         except Exception as e:
             self.logger.warning(f"Failed to update existing work package {existing_wp.get('jira_key')}: {e}")
 
+    def _resolve_changelog_user_id(self, raw_id: str | None, raw_display: str | None) -> int | None:
+        """Resolve a Jira changelog user value to an OpenProject user id.
+
+        A changelog item carries the *username* (Jira Server/DC) or account id
+        (Cloud) in ``from``/``to``, and the *display name* in
+        ``fromString``/``toString``. This used to read only the display names,
+        which resolved nothing: ``user_mapping.json`` is keyed by Jira user key
+        (``JIRAUSER10800``) plus, on this instance, 14 login-style keys — display
+        names appear in neither. Every assignee change came out ``[None, None]``,
+        the Ruby side skipped the nil, and because the field counted as mapped it
+        did not even leave a note. The change simply vanished.
+
+        Resolution still depends on :meth:`_augment_user_mapping_indices` having
+        run, which is what adds the secondary indices on username, display name
+        and email. ``IssueTransformer.process_changelog_item`` has read the right
+        fields since BUG #20; this brings the rebuild path in line.
+
+        Returns:
+            The OpenProject user id, or ``None`` when nothing resolves. Callers
+            must not read that as "unassigned" — see
+            :attr:`_CLEARABLE_JOURNAL_FIELDS` for how a real clear is signalled.
+
+        """
+        user_mapping = getattr(self, "user_mapping", None)
+        if not user_mapping:
+            return None
+
+        for candidate in (raw_id, raw_display):
+            if not candidate:
+                continue
+            entry = user_mapping.get(str(candidate).strip())
+            if not isinstance(entry, dict):
+                continue
+            op_id = entry.get("openproject_id")
+            try:
+                resolved = int(op_id) if op_id else 0
+            except (TypeError, ValueError):
+                resolved = 0
+            if resolved > 0:
+                return resolved
+        return None
+
+    @staticmethod
+    def _mapped_openproject_id(entry: Any) -> int | None:
+        """Read an OpenProject id out of a mapping row of either shape.
+
+        The mappings in this project are not consistent: ``issue_type`` holds a
+        dict per row while ``issue_type_id`` holds a bare int, and ``project``
+        has been seen both ways. Callers should not have to care.
+        """
+        if isinstance(entry, dict):
+            entry = entry.get("openproject_id")
+        try:
+            resolved = int(entry) if entry not in (None, "") else 0
+        except (TypeError, ValueError):
+            return None
+        return resolved if resolved > 0 else None
+
+    def _resolve_issue_type_id(self, raw_id: str | None, raw_name: str | None) -> int | None:
+        """Resolve a Jira issue type to an OpenProject type id.
+
+        A changelog item carries the type *id* in ``from``/``to`` and the *name*
+        in ``fromString``/``toString``. The previous code looked the id up in
+        ``issue_type_mapping``, which is keyed by **name** — so it never matched,
+        ``field_mapped`` stayed false, and every type change fell through to a
+        note. Measured on 2026-09-01: 18 journals rendered as comments whose text
+        showed the right names ("Task → Bug"), proving the data was there and only
+        the lookup was wrong. Same shape as the ``assignee`` defect.
+
+        ``issue_type_id_mapping`` is the one keyed by id, so it is tried first.
+        """
+        by_id = getattr(self, "issue_type_id_mapping", None) or {}
+        by_name = getattr(self, "issue_type_mapping", None) or {}
+        for candidate, mapping in ((raw_id, by_id), (raw_name, by_name)):
+            if not candidate:
+                continue
+            resolved = self._mapped_openproject_id(mapping.get(str(candidate).strip()))
+            if resolved:
+                return resolved
+        return None
+
+    def _resolve_project_id(self, raw: str | None) -> int | None:
+        """Resolve a Jira project to an OpenProject project id.
+
+        A ``project`` changelog item reports the Jira project *id* in
+        ``from``/``to`` and the project *name* in ``fromString``/``toString``.
+        Checked against the live Jira on ESUX-4: ``from='10001',
+        fromString='EnvialoSimple', to='10202', toString='EnvialoSimple UX'``.
+
+        ``project_mapping`` is keyed by project **key** ("ESUX") and stores the
+        numeric Jira id nowhere, so neither half of the changelog item matches the
+        key. What each entry does carry is ``jira_name`` — exactly the
+        ``toString`` — so the name is the only usable side, and it needs an index
+        built over the values.
+
+        The first version of this looked ``toString`` up against the keys and
+        never matched, leaving all 27 project moves as comments in the live run.
+        It passed a local check because that check fabricated the changelog item
+        with a project key in ``toString`` instead of taking the shape from Jira.
+        """
+        if not raw:
+            return None
+        project_mapping = getattr(self, "project_mapping", None) or {}
+        candidate = str(raw).strip()
+
+        # Direct hit on the key, which is how a fixture or a legacy mapping may
+        # phrase it.
+        resolved = self._mapped_openproject_id(project_mapping.get(candidate))
+        if resolved:
+            return resolved
+
+        by_name = getattr(self, "_project_id_by_name", None)
+        if by_name is None:
+            by_name = {}
+            for entry in project_mapping.values():
+                if not isinstance(entry, dict):
+                    continue
+                op_id = self._mapped_openproject_id(entry)
+                if not op_id:
+                    continue
+                for name_field in ("jira_name", "openproject_name", "jira_key"):
+                    name = entry.get(name_field)
+                    if name:
+                        by_name.setdefault(str(name), op_id)
+            self._project_id_by_name = by_name
+        return by_name.get(candidate)
+
+    def _resolve_work_package_id(self, raw_key: str | None) -> int | None:
+        """Resolve a Jira issue key to the work package it became.
+
+        Used for Epic Link, where the value is the epic's own Jira key. The
+        mapping is keyed by numeric Jira id with the human key nested inside, so
+        the lookup goes through the index the caller built.
+        """
+        if not raw_key:
+            return None
+        by_jira_key = getattr(self, "_wp_id_by_jira_key", None)
+        if by_jira_key is None:
+            by_jira_key = {}
+            for outer_key, raw in (getattr(self, "work_package_mapping", None) or {}).items():
+                if not isinstance(raw, dict):
+                    continue
+                inner = raw.get("jira_key") or outer_key
+                op_id = self._mapped_openproject_id(raw)
+                if inner and op_id:
+                    by_jira_key[str(inner)] = op_id
+            self._wp_id_by_jira_key = by_jira_key
+        return by_jira_key.get(str(raw_key).strip())
+
+    @staticmethod
+    def _seconds_to_hours(raw: Any) -> float | None:
+        """Jira reports durations in seconds; OpenProject stores hours."""
+        if raw in (None, ""):
+            return None
+        try:
+            return round(float(raw) / 3600.0, 2)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _to_story_points(raw: Any) -> int | None:
+        """Jira hands these over as floats (13.0); the column is an integer.
+
+        Every value in this Jira is whole (1, 2, 3, 5, 8, 10, 13, 20, 40, 100),
+        so nothing is lost — but a fractional one would be, hence the explicit
+        check rather than a silent ``int()``.
+        """
+        if raw in (None, ""):
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return int(value) if value == int(value) else None
+
+    def _resolve_sprint_id(self, raw_ids: str | None, raw_names: str | None) -> int | None:
+        """Resolve a Jira Sprint changelog value to an OpenProject sprint id.
+
+        A Sprint changelog item carries the sprint *ids* in ``from``/``to`` and
+        the *names* in ``fromString``/``toString``, comma-separated when the
+        issue sat in more than one sprint at once. ``work_packages.sprint_id`` is
+        a scalar foreign key, so only one can survive — the last one listed wins,
+        which is the sprint the issue ended up in.
+
+        ``sprint_mapping`` is indexed both ways (on this instance 259 ids plus
+        the same 259 names), so ids are tried first and names are the fallback
+        for the rows where Jira reported no id.
+
+        Returns:
+            The OpenProject sprint id, or ``None`` when nothing resolves — which
+            callers read as "no change to record" rather than "cleared".
+
+        """
+        # ``getattr`` rather than direct access: tests construct this class via
+        # ``__new__`` to skip ``__init__``, the same reason the caller guards
+        # ``markdown_converter`` with ``hasattr``.
+        sprint_mapping = getattr(self, "sprint_mapping", None)
+        if not sprint_mapping:
+            return None
+
+        for raw in (raw_ids, raw_names):
+            if not raw:
+                continue
+            candidates = [part.strip() for part in str(raw).split(",") if part and part.strip()]
+            for candidate in reversed(candidates):
+                entry = sprint_mapping.get(candidate)
+                if not isinstance(entry, dict):
+                    continue
+                # ``openproject_sprint_id`` is the native Sprint written by
+                # ``SprintMigration``; ``openproject_id`` is the legacy Version,
+                # which is not what ``sprint_id`` points at.
+                native_id = entry.get("openproject_sprint_id")
+                try:
+                    resolved = int(native_id) if native_id else 0
+                except (TypeError, ValueError):
+                    resolved = 0
+                if resolved > 0:
+                    return resolved
+        return None
+
     def _build_rails_ops_for_issue(
         self,
         jira_issue: Issue,
@@ -1280,13 +1582,18 @@ class WorkPackageMigration(BaseMigration):
     ) -> list[dict[str, Any]]:
         """Build rails_ops for a single Jira issue's journals with full pre-computation.
 
+        The first operation returned is always the synthetic creation journal
+        (v1), carrying the issue's state as Jira created it — reconstructed by
+        walking the changelog backwards. The real entries follow as v2, v3, …
+
         Pre-computes in Python (fast, parallel):
-        - Version numbers (v2, v3, v4...)
+        - Version numbers (v1 for creation, then v2, v3, v4...)
         - validity_period ranges as ISO strings
         - field_changes mapped to OpenProject field names/IDs
         - user_id from mapping
         - notes from comments/changelog
-        - cf_state_snapshot for J2O Workflow/Resolution
+        - cf_state_snapshot: the progressive custom field state, keyed by
+          OpenProject custom field name (see :attr:`JIRA_FIELD_TO_OP_CF_NAME`)
 
         Ruby only does (requires DB access):
         - Read WP initial state
@@ -1408,12 +1715,92 @@ class WorkPackageMigration(BaseMigration):
                 "Component": "category_id",
                 "component": "category_id",
                 "duedate": "due_date",
-                "Story Points": "story_points",
+                # OpenProject 17.6 journals the sprint natively
+                # (``work_package_journals.sprint_id``, confirmed by probe) and
+                # ``sprint_epic`` writes ``work_packages.sprint_id``, so a sprint
+                # change belongs in the snapshot rather than in a custom field.
+                "sprint": "sprint_id",
+                # OpenProject 17.6 has a native ``story_points`` column and it is
+                # where ``story_points`` writes the value, so the history belongs
+                # there too.
+                "story points": "story_points",
+                # An issue moved between projects. ``project_id`` is journaled.
+                "project": "project_id",
+                # Jira models the epic as a link; OpenProject models it as the
+                # parent, which is what ``sprint_epic`` writes.
+                "epic link": "parent_id",
+                # Jira reports both in seconds; OpenProject stores hours.
+                "timeestimate": "remaining_hours",
+                "timeoriginalestimate": "estimated_hours",
             }
 
-            # Track J2O Workflow/Resolution for cf_state_snapshot
-            cf_workflow_value: str | None = None
-            cf_resolution_value: str | None = None
+            # The two above are the only fields whose value is a duration in
+            # seconds, and neither column name ends in ``_id``, so they would
+            # otherwise fall through to the plain-string branch and land a
+            # seconds figure in an hours column.
+            seconds_fields = {"remaining_hours", "estimated_hours"}
+
+            # Progressive custom field state, keyed by OpenProject custom field
+            # *name*. Carried across entries (not reset per entry) so every
+            # journal ships the full state seen so far and the Ruby template can
+            # emit a customizable_journals row only where the value actually
+            # changed.
+            cf_state: dict[str, str] = {}
+            # The custom field values as of creation: the ``from`` of the first
+            # change to each field. Feeds the creation journal, so the first
+            # change renders as "X → Y" rather than "set to Y".
+            cf_baseline: dict[str, str] = {}
+
+            # The work package as Jira created it, reconstructed by walking the
+            # changelog and keeping the ``from`` of the *first* change to each
+            # field. Fields the changelog never touches are absent, and the Ruby
+            # side leaves those at the work package's current value.
+            #
+            # Without this the chain has no creation state at all: the replay
+            # starts from the work package as it is *now* and only moves forward,
+            # so the value each field was created with exists nowhere. Combined
+            # with the first operation being folded into v1, that made the first
+            # change to every field invisible — an issue that went
+            # ``Open → In Progress → Closed`` showed one transition instead of two.
+            initial_state: dict[str, Any] = {}
+            initial_clears: set[str] = set()
+
+            # Progressive attachment set, as OpenProject attachment ids.
+            #
+            # Unlike the custom field snapshot this is an *absolute set on every
+            # journal*, never a delta: OpenProject renders "File added" and
+            # "File removed" by diffing a journal's ``attachable_journals`` rows
+            # against its predecessor's, so a journal that carries nothing reads
+            # as "every attachment was removed". That is also why a work package
+            # whose attachments never changed still gets the same set repeated on
+            # each journal — a constant set diffs to nothing, which is correct.
+            # ``getattr`` for the same reason as ``sprint_mapping`` above: tests
+            # build this class via ``__new__`` and skip ``__init__``.
+            attachment_ids_by_filename = (getattr(self, "attachment_mapping", None) or {}).get(jira_key) or {}
+            attachment_state: set[int] = set()
+            if attachment_ids_by_filename:
+                added_later: set[int] = set()
+                for entry in all_entries:
+                    if entry["type"] != JournalEntryType.CHANGELOG:
+                        continue
+                    for item in entry["data"].get("items") or []:
+                        if str(item.get("field", "")).lower() != "attachment":
+                            continue
+                        resolved = attachment_ids_by_filename.get(item.get("toString"))
+                        if resolved:
+                            added_later.add(int(resolved))
+                # Jira's changelog only records what changed *after* creation, so
+                # anything that was migrated and never appears as an addition was
+                # already attached when the issue was created. That is the v1
+                # baseline, and getting it right is what keeps the newest journal
+                # in step with the work package's real attachments.
+                attachment_state = {
+                    int(op_id) for op_id in attachment_ids_by_filename.values() if op_id
+                } - added_later
+            # Snapshotted before the loop mutates the set: this is what the
+            # creation journal carries, so the first upload renders as an
+            # addition instead of being already there.
+            attachment_baseline = sorted(attachment_state)
 
             # Build rails_ops with full pre-computation
             for i, entry in enumerate(all_entries):
@@ -1422,20 +1809,36 @@ class WorkPackageMigration(BaseMigration):
                 entry_ts = entry.get("timestamp", "")
                 validity_start, validity_end = validity_periods[i]
 
-                # Get author and map to OP user_id
+                # Get author and map to OP user_id.
+                #
+                # Probes every key the mapping is indexed under, not just
+                # ``name``. ``user_mapping.json`` is keyed by Jira user key
+                # (``JIRAUSER10800``), so a changelog author only reachable by
+                # key resolved to nobody and the whole journal was attributed to
+                # the work package's author.
                 author_info = entry_data.get("author") or {}
-                author_name = author_info.get("name")
-                user_dict = self.user_mapping.get(author_name) if author_name else None
-                # Emit 0 (not a hardcoded builtin id) when the Jira author does
-                # not resolve. ``1`` used to be sent here, which is
-                # ``SystemUser`` on this instance and not stable across
-                # installs. 0 makes the Ruby side's ``raw_user_id > 0`` check
-                # fall through to its own chain: the work package's author
-                # first, then a real admin resolved from the DB.
-                user_id = (user_dict.get("openproject_id") if user_dict else None) or 0
+                user_id = 0
+                for probe_key in self._JOURNAL_AUTHOR_PROBE_KEYS:
+                    candidate = author_info.get(probe_key)
+                    if not candidate:
+                        continue
+                    user_dict = self.user_mapping.get(str(candidate).strip()) if self.user_mapping else None
+                    resolved = user_dict.get("openproject_id") if isinstance(user_dict, dict) else None
+                    if resolved:
+                        user_id = int(resolved)
+                        break
+                # 0 rather than a hardcoded builtin id when nothing resolves.
+                # ``1`` used to be sent here, which is ``SystemUser`` on this
+                # instance and not stable across installs. 0 makes the Ruby
+                # side's ``raw_user_id > 0`` check fall through to its own chain:
+                # the work package's author first, then a real admin from the DB.
 
                 # Build field_changes for changelog entries (mapped to OP field names)
                 field_changes: dict[str, Any] = {}
+                # Subset of ``field_changes`` whose nil is a real clear rather
+                # than a value we could not resolve. Per journal, like
+                # ``field_changes`` itself.
+                field_clears: set[str] = set()
                 notes = ""
 
                 if entry_type == JournalEntryType.COMMENT:
@@ -1476,7 +1879,6 @@ class WorkPackageMigration(BaseMigration):
 
                     for item in items:
                         jira_field = item.get("field", "")
-                        field_id = item.get("fieldId", "")
                         from_val = item.get("from")
                         from_str = item.get("fromString", "")
                         to_val = item.get("to")
@@ -1506,82 +1908,224 @@ class WorkPackageMigration(BaseMigration):
                                     if mapped_to:
                                         field_changes[op_field] = [mapped_from, mapped_to]
                                         field_mapped = True
-                                elif op_field == "type_id" and to_val:
-                                    mapped_to = (
-                                        self.issue_type_mapping.get(to_val, {}).get("openproject_id")
-                                        if self.issue_type_mapping
-                                        else None
-                                    )
-                                    mapped_from = (
-                                        self.issue_type_mapping.get(from_val, {}).get("openproject_id")
-                                        if self.issue_type_mapping and from_val
-                                        else None
-                                    )
-                                    if mapped_to:
+                                elif op_field == "type_id":
+                                    mapped_from = self._resolve_issue_type_id(from_val, from_str)
+                                    mapped_to = self._resolve_issue_type_id(to_val, to_str)
+                                    if mapped_to and mapped_from != mapped_to:
+                                        # ``type_id`` is NOT NULL, so an
+                                        # unresolvable new type leaves the
+                                        # previous one standing rather than
+                                        # clearing it.
                                         field_changes[op_field] = [mapped_from, mapped_to]
                                         field_mapped = True
-                                elif op_field == "assigned_to_id":
-                                    # Map user names to IDs
-                                    mapped_to = (
-                                        self.user_mapping.get(to_str, {}).get("openproject_id")
-                                        if self.user_mapping and to_str
-                                        else None
-                                    )
-                                    mapped_from = (
-                                        self.user_mapping.get(from_str, {}).get("openproject_id")
-                                        if self.user_mapping and from_str
-                                        else None
-                                    )
+                                elif op_field == "project_id":
+                                    mapped_from = self._resolve_project_id(from_str)
+                                    mapped_to = self._resolve_project_id(to_str)
+                                    if mapped_to and mapped_from != mapped_to:
+                                        # Also NOT NULL. And the work package
+                                        # itself has already been created in the
+                                        # target project, so this only records
+                                        # that the move happened.
+                                        field_changes[op_field] = [mapped_from, mapped_to]
+                                        field_mapped = True
+                                elif op_field == "parent_id":
+                                    mapped_from = self._resolve_work_package_id(from_str or from_val)
+                                    mapped_to = self._resolve_work_package_id(to_str or to_val)
+                                    if mapped_from == mapped_to:
+                                        continue
                                     field_changes[op_field] = [mapped_from, mapped_to]
                                     field_mapped = True
-                                elif op_field == "author_id":
-                                    mapped_to = (
-                                        self.user_mapping.get(to_str, {}).get("openproject_id")
-                                        if self.user_mapping and to_str
-                                        else None
-                                    )
-                                    mapped_from = (
-                                        self.user_mapping.get(from_str, {}).get("openproject_id")
-                                        if self.user_mapping and from_str
-                                        else None
-                                    )
+                                elif op_field == "sprint_id":
+                                    mapped_from = self._resolve_sprint_id(from_val, from_str)
+                                    mapped_to = self._resolve_sprint_id(to_val, to_str)
+                                    if mapped_from == mapped_to:
+                                        # Nothing resolved, or the issue moved
+                                        # between two Jira sprints that map to
+                                        # the same OpenProject one. Either way a
+                                        # journal here would show no change.
+                                        continue
+                                    field_changes[op_field] = [mapped_from, mapped_to]
+                                    field_mapped = True
+                                elif op_field in ("assigned_to_id", "author_id"):
+                                    # One branch for both: they were identical
+                                    # copies, and both read the display name
+                                    # instead of the username. See
+                                    # ``_resolve_changelog_user_id`` for why that
+                                    # resolved nothing.
+                                    mapped_from = self._resolve_changelog_user_id(from_val, from_str)
+                                    mapped_to = self._resolve_changelog_user_id(to_val, to_str)
+                                    if mapped_from == mapped_to:
+                                        # Neither side resolved, or both resolve
+                                        # to the same OpenProject user (two Jira
+                                        # accounts merged into one). A journal
+                                        # here would render nothing.
+                                        continue
                                     field_changes[op_field] = [mapped_from, mapped_to]
                                     field_mapped = True
                                 elif op_field == "priority_id" and to_str:
                                     # Priority uses string names that Ruby will resolve
                                     field_changes[op_field] = [from_str, to_str]
                                     field_mapped = True
+                                elif op_field in ("category_id", "version_id"):
+                                    # Names, not ids — and the Ruby side resolves
+                                    # them against the work package's project.
+                                    #
+                                    # These two used to fall through to the
+                                    # generic branch below, which put Jira's own
+                                    # component and version ids into
+                                    # ``category_id`` / ``version_id``. Those are
+                                    # foreign keys into OpenProject's
+                                    # ``categories`` and ``versions``, so the
+                                    # journal pointed at whatever row happened to
+                                    # share that number — a category from another
+                                    # project, or nothing at all.
+                                    #
+                                    # Python cannot do the lookup: it is scoped to
+                                    # a project, and the two on-disk maps are no
+                                    # help. ``category_mapping.json`` has the
+                                    # right shape (project id → name → id) but
+                                    # nothing in the codebase reads it, and
+                                    # ``versions`` never persisted a map at all —
+                                    # it builds one in memory and drops it.
+                                    if not from_str and not to_str:
+                                        continue
+                                    field_changes[op_field] = [from_str, to_str]
+                                    field_mapped = True
                                 else:
                                     # Generic ID field
                                     field_changes[op_field] = [from_val, to_val]
                                     field_mapped = True
+                            elif op_field in seconds_fields:
+                                # Seconds in Jira, hours in OpenProject. Sent as
+                                # numbers so the template writes them straight
+                                # into the column instead of the template's
+                                # digits-only string coercion turning "3600"
+                                # into 3600 hours.
+                                mapped_from = self._seconds_to_hours(from_val or from_str)
+                                mapped_to = self._seconds_to_hours(to_val or to_str)
+                                if mapped_from == mapped_to:
+                                    continue
+                                field_changes[op_field] = [mapped_from, mapped_to]
+                                field_mapped = True
+                            elif op_field == "story_points":
+                                mapped_from = self._to_story_points(from_val or from_str)
+                                mapped_to = self._to_story_points(to_val or to_str)
+                                if mapped_from == mapped_to:
+                                    continue
+                                field_changes[op_field] = [mapped_from, mapped_to]
+                                field_mapped = True
                             else:
                                 # Non-ID fields use string values
                                 field_changes[op_field] = [from_str, to_str]
                                 field_mapped = True
 
-                        # Track J2O Workflow/Resolution for cf_state_snapshot
-                        if jira_field.lower() == "workflow" or field_id == "customfield_10500":
-                            cf_workflow_value = to_str or to_val
-                        elif jira_field.lower() == "resolution":
-                            cf_resolution_value = to_str or to_val
+                            # Tell the Ruby side that this nil is deliberate.
+                            #
+                            # A nil in ``field_changes`` is ambiguous: either
+                            # Python could not resolve the new value, or Jira
+                            # emptied the field. The template skips nils, which is
+                            # right for the first case and wrong for the second —
+                            # so an unassignment, a removal from a sprint or a
+                            # deleted due date left the old value in place and
+                            # rendered no change at all.
+                            #
+                            # Jira reporting both halves of the new value as empty
+                            # is the signal. Restricted to the columns that can
+                            # hold NULL; see ``_CLEARABLE_JOURNAL_FIELDS``.
+                            if (
+                                field_mapped
+                                and op_field in self._CLEARABLE_JOURNAL_FIELDS
+                                and not to_val
+                                and not to_str
+                            ):
+                                field_clears.add(op_field)
 
-                        # Build human-readable notes ONLY for unmapped fields (not already in field_changes)
-                        if not field_mapped and jira_field:
+                            # The ``from`` of the *first* change to a field is what
+                            # that field held at creation. Entries are walked in
+                            # chronological order, so first occurrence wins — and
+                            # it is recorded even when it is empty, or a later
+                            # change would overwrite it with a value that was
+                            # never the creation one.
+                            if field_mapped and op_field not in initial_state and op_field in field_changes:
+                                creation_value = field_changes[op_field][0]
+                                initial_state[op_field] = creation_value
+                                # Created with the field empty. Same rule as
+                                # ``field_clears``: only where NULL is allowed.
+                                if (
+                                    creation_value in (None, "")
+                                    and op_field in self._CLEARABLE_JOURNAL_FIELDS
+                                ):
+                                    initial_clears.add(op_field)
+
+                        # Track changes that belong in a custom field.
+                        #
+                        # Dropped from here: the ``field_id == "customfield_10500"``
+                        # arm that used to feed the Workflow snapshot. On this
+                        # Jira ``customfield_10500`` is "Bugs" (the Okapya
+                        # checklist plugin), not the workflow scheme — the id came
+                        # from upstream's instance — so every Bugs value was
+                        # filed as a workflow change. Workflow itself is no longer
+                        # tracked at all: no custom field on this OpenProject
+                        # backs it, so the snapshot had nowhere to land.
+                        if jira_field.lower() == "attachment":
+                            # ``to``/``toString`` name the file on an addition,
+                            # ``from``/``fromString`` on a removal. A side that
+                            # does not resolve is a file Jira no longer has, so
+                            # it was never migrated and there is nothing to
+                            # snapshot — but the entry still counts as handled,
+                            # or it falls through to a note and the journal goes
+                            # back to being a comment.
+                            added = attachment_ids_by_filename.get(to_str)
+                            removed = attachment_ids_by_filename.get(from_str)
+                            if added:
+                                attachment_state.add(int(added))
+                            if removed:
+                                attachment_state.discard(int(removed))
+                            field_mapped = True
+
+                        cf_name = self.JIRA_FIELD_TO_OP_CF_NAME.get(jira_field.lower())
+                        if cf_name:
+                            if cf_name not in cf_baseline:
+                                cf_baseline[cf_name] = from_str or ""
+                            cf_state[cf_name] = to_str or to_val or ""
+                            # A field that produces a change must not also
+                            # produce a note, or the journal keeps rendering as
+                            # a comment on top of the change.
+                            field_mapped = True
+
+                        # Notes are the last resort: only for a field that got
+                        # neither a native column nor a custom field, and that no
+                        # other component already owns.
+                        #
+                        # ``IGNORED_CHANGELOG_FIELDS`` is applied *here*, after
+                        # the mapping, not before it. Filtering earlier would also
+                        # drop ``duedate`` — which is in the ignore list and in
+                        # ``jira_to_op_field`` — and lose a real due-date change.
+                        #
+                        # Until this gate existed the list had exactly one
+                        # reference in the module, at the ``work_packages``
+                        # component that is in neither DEFAULT_COMPONENT_SEQUENCE
+                        # nor the ``full`` profile, so it never ran. That is why
+                        # 1844 of the instance's 7557 work package journals —
+                        # 24.4%, measured 2026-08-26 — were changelog lines
+                        # rendered as comments: Link 90, RemoteIssueLink 326,
+                        # WorklogId and timespent 48 (they share a journal, Jira
+                        # emits both for one worklog edit), and the rest now
+                        # covered by a real change above.
+                        if (
+                            not field_mapped
+                            and jira_field
+                            and jira_field.lower() not in self._IGNORED_CHANGELOG_FIELDS_LOWER
+                        ):
                             notes_lines.append(f"**{jira_field}**: {from_str or '(none)'} → {to_str or '(none)'}")
 
                     notes = "\n".join(notes_lines) if notes_lines else ""
 
-                # Build cf_state_snapshot for J2O custom fields
-                cf_state_snapshot: dict[str, str] | None = None
-                if cf_workflow_value or cf_resolution_value:
-                    cf_state_snapshot = {}
-                    # We need the CF IDs - these are loaded elsewhere, use placeholders
-                    # Ruby will look these up by name if needed
-                    if cf_workflow_value:
-                        cf_state_snapshot["workflow"] = cf_workflow_value
-                    if cf_resolution_value:
-                        cf_state_snapshot["resolution"] = cf_resolution_value
+                # Snapshot of the custom field state as of this journal. Names,
+                # not ids: ids are not stable across installs, so the Ruby side
+                # resolves them once per batch and reports the ones it could not
+                # find instead of dropping the history in silence.
+                cf_state_snapshot: dict[str, str] | None = dict(cf_state) if cf_state else None
 
                 # Build the operation with all pre-computed data
                 op: dict[str, Any] = {
@@ -1598,11 +2142,66 @@ class WorkPackageMigration(BaseMigration):
                 if field_changes:
                     op["field_changes"] = field_changes
 
+                # Sorted for a stable payload, which keeps the Ruby-side
+                # comparisons and any diffing of two runs readable.
+                if field_clears:
+                    op["field_clears"] = sorted(field_clears)
+
                 # Only include cf_state_snapshot if we have values
                 if cf_state_snapshot:
                     op["cf_state_snapshot"] = cf_state_snapshot
 
+                # Emitted only when the issue has attachments this migration
+                # resolved. Absent means "leave this work package's attachment
+                # rows alone" — writing an empty set would tell OpenProject every
+                # file had been removed.
+                if attachment_state:
+                    op["attachment_snapshot"] = sorted(attachment_state)
+
                 rails_ops.append(op)
+
+            # The creation journal, prepended so it lands on v1.
+            #
+            # The Ruby template writes whatever operation comes first into the
+            # existing v1 row. That used to be the issue's first comment or
+            # changelog entry, which put an event *after* creation into the
+            # journal that represents creation itself: v1 carried that entry's
+            # notes, its author, and the state left behind by its changes. The
+            # first change to every field was invisible as a result — v1 already
+            # showed the post-change value, so the diff against v2 skipped it —
+            # and version 2 was never written, leaving a gap in the chain.
+            #
+            # Giving v1 its own operation fixes all three. It carries the
+            # reconstructed creation state, no notes, and ``user_id: 0`` so the
+            # template falls back to the work package's author — the person who
+            # created the issue, rather than whoever happened to touch it first.
+            #
+            # The timestamp is left empty on purpose: the template falls back to
+            # the work package's own ``created_at``, which is Jira's creation time
+            # once ``wp_timestamp_restore`` has run.
+            if rails_ops:
+                creation_op: dict[str, Any] = {
+                    "type": "journal",
+                    "created_at": "",
+                    "user_id": 0,
+                    "notes": "",
+                    "version": 1,
+                    "validity_period_start": "",
+                    "validity_period_end": None,
+                }
+                if initial_state:
+                    # Shaped as ``[from, to]`` like any other change so the
+                    # template's existing apply step handles it unchanged.
+                    creation_op["field_changes"] = {
+                        field: [None, value] for field, value in initial_state.items()
+                    }
+                if initial_clears:
+                    creation_op["field_clears"] = sorted(initial_clears)
+                if cf_baseline:
+                    creation_op["cf_state_snapshot"] = cf_baseline
+                if attachment_baseline:
+                    creation_op["attachment_snapshot"] = attachment_baseline
+                rails_ops.insert(0, creation_op)
 
         except Exception:
             # Propagate rather than returning what was built so far.

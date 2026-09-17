@@ -76,7 +76,7 @@ class TestOrphanCleanupScript:
     def test_both_orphan_tables_are_covered(self) -> None:
         script = _build_script(apply=True)
 
-        for table in ("work_package_journals", "customizable_journals"):
+        for table in _ORPHAN_PREDICATES:
             assert f"FROM {table} WHERE" in script
 
     def test_uses_not_exists_rather_than_not_in(self) -> None:
@@ -87,7 +87,13 @@ class TestOrphanCleanupScript:
         """
         script = _build_script(apply=True)
 
-        assert script.count("NOT EXISTS") == 2
+        # Asserted per predicate rather than as a total count: a hardcoded total
+        # pins how many tables the script sweeps, which is incidental, and broke
+        # the moment ``attachable_journals`` was added.
+        for table, predicate in _ORPHAN_PREDICATES.items():
+            assert "NOT EXISTS" in predicate, table
+            assert "NOT IN" not in predicate, table
+        assert script.count("NOT EXISTS") == len(_ORPHAN_PREDICATES)
         assert "NOT IN" not in script
 
     def test_work_package_predicate_filters_on_data_type(self) -> None:
