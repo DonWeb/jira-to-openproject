@@ -16,8 +16,15 @@ reporting ``success=True, updated=0``.
 
 The destination is the native column rather than a custom field (decision of
 2026-09-01): the "Story Points" custom field on this instance is a *text* one, so
-it neither sorts nor sums, while the native column is an integer and every value
-in this Jira is whole.
+it neither sorts nor sums, while the native column is an integer.
+
+Fractional values round **up** (decision of 2026-09-29): 0.25, 0.5 and 0.75 all
+become 1, and 1.5 becomes 2. The production copy of this Jira has 24 of them, and
+they used to be skipped outright — a value of 0.25 is an estimate that something
+is small, and recording it as "small" beats recording nothing. Rounding up rather
+than to nearest keeps every estimated issue non-zero, which is what the column is
+read for. The rounding is lossy on purpose, so the count is logged and reported
+in the component result.
 
 Note on dict access patterns kept here
 --------------------------------------
@@ -30,6 +37,8 @@ mapping ladder, on the other hand, is normalised through
 
 from __future__ import annotations
 
+import math
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from src.application.components.base_migration import BaseMigration, register_entity_types
@@ -161,9 +170,12 @@ class StoryPointsMigration(BaseMigration):  # noqa: D101
         This used to write a WorkPackage custom field, one Rails round-trip per
         issue. OpenProject 17.6 has a real ``work_packages.story_points`` column,
         and by decision on 2026-09-01 that is where the value goes: the custom
-        field this instance has is a *text* one, so it neither sorts nor sums,
-        while the native column is an integer and every value in this Jira is
-        whole (1, 2, 3, 5, 8, 10, 13, 20, 40, 100).
+        field this instance has is a *text* one, so it neither sorts nor sums.
+
+        The column is an integer, and fractional values round up rather than
+        being skipped (2026-09-29). Most of this Jira's values are already whole
+        (1, 2, 3, 5, 8, 13, 20, 40, 100); the 24 that are not would otherwise
+        reach OpenProject as nothing at all.
 
         Batching also replaces the per-work-package ``execute_query`` loop, and
         ``batch_update_work_packages`` reports back the attributes it could not
@@ -188,7 +200,7 @@ class StoryPointsMigration(BaseMigration):  # noqa: D101
                 continue
 
         updates: list[dict[str, Any]] = []
-        skipped_fractional = 0
+        rounded_up = 0
         for jira_key, text in text_by_key.items():
             if text is None or text == "0":
                 continue
@@ -196,25 +208,26 @@ class StoryPointsMigration(BaseMigration):  # noqa: D101
             if entry is None:
                 continue
             # Jira hands these over as floats ("13.0"); the column is an integer.
-            # A fractional value would be truncated, so it is reported instead —
-            # none exist on this instance, but silence would be the wrong default.
+            # Parsed as Decimal rather than float so the ceiling below acts on
+            # the value as written: rounding *up* turns any float noise above a
+            # whole number into a whole extra point.
             try:
-                value = float(text)
-            except (TypeError, ValueError):
+                value = Decimal(text)
+            except TypeError, InvalidOperation:
                 continue
-            if value != int(value):
-                logger.warning(
-                    "Story Points for %s is %s, which the integer column cannot"
-                    " hold without loss — skipped",
-                    jira_key,
-                    value,
-                )
-                skipped_fractional += 1
-                continue
-            updates.append({"id": int(entry.openproject_id), "story_points": int(value)})
+            points = math.ceil(value)
+            if points != value:
+                logger.debug("Story Points for %s rounded up: %s -> %d", jira_key, value, points)
+                rounded_up += 1
+            updates.append({"id": int(entry.openproject_id), "story_points": points})
+
+        if rounded_up:
+            # Lossy and deliberate, so it is said once at a level that shows up
+            # in a normal run rather than only under --debug.
+            logger.info("Story Points: %d fractional value(s) rounded up to the next integer", rounded_up)
 
         if not updates:
-            return ComponentResult(success=True, updated=0, failed=skipped_fractional)
+            return ComponentResult(success=True, updated=0, failed=0, details={"rounded_up": rounded_up})
 
         try:
             result = self.op_client.batch_update_work_packages(updates)
@@ -231,15 +244,16 @@ class StoryPointsMigration(BaseMigration):  # noqa: D101
             logger.warning("OpenProject did not apply: %s", unapplied)
 
         logger.info(
-            "Story Points: %d work packages updated, %d failed, %d skipped (fractional)",
+            "Story Points: %d work packages updated, %d failed, %d rounded up",
             updated,
             failed,
-            skipped_fractional,
+            rounded_up,
         )
         return ComponentResult(
             success=failed == 0,
             updated=updated,
-            failed=failed + skipped_fractional,
+            failed=failed,
+            details={"rounded_up": rounded_up},
         )
 
     def run(self) -> ComponentResult:

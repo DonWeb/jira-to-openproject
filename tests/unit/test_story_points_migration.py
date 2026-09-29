@@ -91,23 +91,61 @@ def test_story_points_migration_writes_the_native_column():
     ld = mig._load(mig._map(mig._extract()))
 
     assert ld.success is True
-    # PRJ-1 has 3; PRJ-2's 5.5 is fractional and the column is an integer.
-    assert op.updates == [{"id": 11001, "story_points": 3}]
-    assert ld.updated == 1
+    # PRJ-1 has 3 as-is; PRJ-2's 5.5 rounds up to 6.
+    assert op.updates == [
+        {"id": 11001, "story_points": 3},
+        {"id": 11002, "story_points": 6},
+    ]
+    assert ld.updated == 2
 
 
-def test_fractional_story_points_are_reported_not_truncated():
-    """Rounding a value away silently would be the wrong default.
+def test_fractional_story_points_round_up():
+    """Skipping them sent nothing at all to OpenProject.
 
-    None of this Jira's 81 values are fractional, but the column is an integer
-    and the component should say so rather than quietly store 5 for 5.5.
+    The column is an integer, so 5.5 cannot be stored as it stands. Until
+    2026-09-29 the component reported the value and moved on, which cost the
+    production copy of this Jira its 24 fractional estimates. Rounding up keeps
+    every estimated issue non-zero, which is what the column is read for.
     """
     op = DummyOp()
     mig = StoryPointsMigration(jira_client=DummyJira(), op_client=op)  # type: ignore[arg-type]
     ld = mig._load(mig._map(mig._extract()))
 
-    assert all(u["id"] != 11002 for u in op.updates)
-    assert ld.failed == 1
+    assert {"id": 11002, "story_points": 6} in op.updates
+    assert ld.failed == 0
+    # Lossy on purpose, so the count is part of the result, not just a log line.
+    assert ld.details["rounded_up"] == 1
+
+
+@pytest.mark.parametrize(
+    ("jira_value", "expected"),
+    [
+        (0.25, 1),
+        (0.5, 1),
+        (0.75, 1),
+        (1.5, 2),
+        (2.5, 3),
+        (3.0, 3),
+        (13, 13),
+    ],
+)
+def test_round_up_never_rounds_an_estimate_down_to_zero(jira_value, expected):
+    """The exact values the production Jira holds, plus the whole ones.
+
+    Rounding to *nearest* would put 0.25 and 0.5 at 0 — an issue that was
+    estimated would read as unestimated, which is worse than the fraction it
+    replaces.
+    """
+
+    class Jira:
+        def batch_get_issues(self, keys):
+            return {"PRJ-1": DummyIssue("PRJ-1", sp=jira_value)}
+
+    op = DummyOp()
+    mig = StoryPointsMigration(jira_client=Jira(), op_client=op)  # type: ignore[arg-type]
+    mig._load(mig._map(mig._extract()))
+
+    assert op.updates == [{"id": 11001, "story_points": expected}]
 
 
 def test_the_tenants_real_custom_field_is_tried_first(monkeypatch: pytest.MonkeyPatch):
