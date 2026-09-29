@@ -62,6 +62,12 @@ var_dirs: dict[DirType, Path] = {
     "debug": var_dir / "debug",
     "exports": var_dir / "exports",
     "logs": var_dir / "logs",
+    # Where the test suite's logs go instead. ``tests/integration/test_main.py``
+    # calls ``main()``, which bootstraps logging for real: without this the
+    # suite drops ``migration_<timestamp>.log`` files into ``var/logs`` next to
+    # the migrations', full of ``Mock`` objects and fixture keys, and they count
+    # against the retention that prunes real run logs.
+    "logs_test_suite": var_dir / "logs_test_suite",
     "output": var_dir / "output",
     "output_test": var_dir / "output_test",
     "results": var_dir / "results",

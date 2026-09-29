@@ -599,7 +599,8 @@ pytest -m "not slow" -v
 
 ### Essential Paths
 
-- Logs: `var/logs/`
+- Logs: `var/logs/` — migration runs only
+- Test-suite logs: `var/logs_test_suite/` — where the same logging goes when pytest is the one running it (`tests/integration/test_main.py` calls `main()`), so a test run never leaves files that read like a migration's
 - Data: `var/data/`
 - Results: `var/results/`
 - Mappings: `var/data/*_mapping.json`

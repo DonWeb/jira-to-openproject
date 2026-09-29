@@ -215,6 +215,7 @@ type DirType = Literal[
     "debug",
     "exports",
     "logs",
+    "logs_test_suite",
     "output",
     "output_test",
     "results",

@@ -19,13 +19,44 @@ mismatches.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 from src.display import ExtendedLogger, configure_logging
 
 # Module-level idempotency flag. Once bootstrap has run, repeat calls are
 # no-ops regardless of which side effects they request.
 _BOOTSTRAPPED: bool = False
+
+
+def _running_under_pytest() -> bool:
+    """Whether this process is a test run rather than a migration.
+
+    Checks both signals because they cover different moments: pytest sets
+    ``PYTEST_CURRENT_TEST`` only while a test is executing, and imports its
+    own module well before that (during collection, and in any subprocess a
+    test spawns with the module already loaded).
+    """
+    return "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules
+
+
+def _logs_dir() -> Path:
+    """Directory for this process's log files.
+
+    A test run writes to ``var/logs_test_suite``. ``tests/integration/test_main.py``
+    calls ``main()``, which bootstraps logging in earnest, so the suite used to
+    leave ``migration_<timestamp>.log`` files in ``var/logs`` alongside the real
+    ones — indistinguishable by name, full of ``Mock`` objects, and counting
+    against the retention that prunes actual migration logs.
+    """
+    from src.config import var_dirs
+
+    key = "logs_test_suite" if _running_under_pytest() else "logs"
+    log_dir = var_dirs[key]
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
 
 
 def _ensure_var_dirs() -> list[str]:
@@ -60,10 +91,10 @@ def _configure_logging_with_file_handler() -> ExtendedLogger:
     Mirrors the pre-Phase-6a behaviour: rich handler + a single aggregate
     log file in ``var/logs/migration.log``.
     """
-    from src.config import migration_config, var_dirs
+    from src.config import migration_config
 
     log_level = migration_config.get("log_level", "DEBUG")
-    latest_log_file = var_dirs["logs"] / "migration.log"
+    latest_log_file = _logs_dir() / "migration.log"
     return configure_logging(log_level, latest_log_file)
 
 
@@ -92,12 +123,12 @@ def _attach_per_run_log_handler(logger: ExtendedLogger) -> None:
     run's output easy to inspect in isolation. Failures are swallowed —
     they must never abort startup.
     """
-    from src.config import migration_config, var_dirs
+    from src.config import migration_config
 
     log_level = migration_config.get("log_level", "DEBUG")
     try:
         timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d_%H-%M-%S")
-        per_run_log_file = var_dirs["logs"] / f"migration_{timestamp}.log"
+        per_run_log_file = _logs_dir() / f"migration_{timestamp}.log"
 
         file_formatter = logging.Formatter(
             "%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s",
@@ -113,7 +144,7 @@ def _attach_per_run_log_handler(logger: ExtendedLogger) -> None:
 
 def _prune_old_log_files(logger: ExtendedLogger) -> None:
     """Keep only the most recent N per-run log files, configurable via ``log_retention_count``."""
-    from src.config import migration_config, var_dirs
+    from src.config import migration_config
 
     try:
         retention_count = int(migration_config.get("log_retention_count", 20))
@@ -128,7 +159,7 @@ def _prune_old_log_files(logger: ExtendedLogger) -> None:
     if retention_count <= 0:
         return
 
-    per_run_logs = sorted(var_dirs["logs"].glob("migration_*.log"))
+    per_run_logs = sorted(_logs_dir().glob("migration_*.log"))
     if len(per_run_logs) <= retention_count:
         return
 
