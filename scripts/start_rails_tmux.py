@@ -61,18 +61,43 @@ def start_tmux_session(
     container: str,
     log_path: Path,
 ) -> None:
-    # 1) Raise scrollback *before* creating the session — a pane allocates its
-    #    history when it is created, so setting this afterwards would not reach
-    #    the pane the console runs in.
-    run(["tmux", "set-option", "-g", "history-limit", str(HISTORY_LIMIT)])
+    # 1) Raise scrollback and create the session in ONE tmux invocation.
+    #
+    #    Both halves are load-bearing. A pane allocates its scrollback when it
+    #    is created, so `set-option` afterwards never reaches the pane the
+    #    console runs in — but `set-option` on its own cannot run *before*
+    #    either, because with no server up it has nothing to connect to and
+    #    exits 1 ("error connecting to /tmp/tmux-0/default"), which took the
+    #    whole script down before it created anything.
+    #
+    #    Passing both as one command list resolves the circle: tmux starts a
+    #    server for the list, applies the option, and only then creates the
+    #    session, whose pane picks up the new value. The bare ";" is tmux's own
+    #    command separator and must reach it as its own argv entry — there is
+    #    no shell here to strip an escape.
+    #
+    #    `start-server` first is NOT an alternative: it returns 0 and leaves no
+    #    server behind (verified on tmux 3.4), so the `set-option` after it
+    #    fails exactly as before.
+    run(
+        [
+            "tmux",
+            "set-option",
+            "-g",
+            "history-limit",
+            str(HISTORY_LIMIT),
+            ";",
+            "new-session",
+            "-d",
+            "-s",
+            session,
+        ],
+    )
 
-    # 2) Create session detached
-    run(["tmux", "new-session", "-d", "-s", session])
-
-    # 3) Pipe pane to log
+    # 2) Pipe pane to log
     run(["tmux", "pipe-pane", "-o", "-t", session, f"cat >>{log_path.as_posix()}"])
 
-    # 4) Build SSH + docker exec command
+    # 3) Build SSH + docker exec command
     ssh_target = ssh_host if not ssh_user else f"{ssh_user}@{ssh_host}"
     inner = (
         f"docker exec -e IRBRC=/app/.irbrc "
@@ -81,7 +106,7 @@ def start_tmux_session(
     )
     ssh_cmd = f'ssh -t {SSH_KEEPALIVE_OPTS} {ssh_target} "{inner}"'
 
-    # 5) Send command and press Enter
+    # 4) Send command and press Enter
     run(["tmux", "send-keys", "-t", session, ssh_cmd, "C-m"])
 
 
