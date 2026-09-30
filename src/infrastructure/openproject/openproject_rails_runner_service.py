@@ -56,7 +56,30 @@ from src.utils.rails_journal_user import prepend_to_script
 # ``openproject_client``.
 BATCH_SIZE_DEFAULT: int = 50
 SAFE_OFFSET_LIMIT: int = 5000
+
+# How long a file-based query is given, end to end. Both halves of the wait read
+# it: the console watches its pane for the script's completion marker, and the
+# poller then watches for the JSON file over SSH. They used to hold different
+# numbers — 90s and 600s — which meant any script slower than 90s logged a
+# failure and then quietly succeeded on the second wait. ``sprint_epic`` takes
+# ~195s and did exactly that.
+_DEFAULT_RESULT_WAIT_SECONDS: int = 600
+
 from src.infrastructure.openproject.openproject_client import OpenProjectClient
+
+
+def result_wait_seconds() -> int:
+    """Seconds to wait for a file-based query's result, env-overridable."""
+    raw = os.environ.get("J2O_QUERY_RESULT_WAIT_SECONDS")
+    if not raw:
+        return _DEFAULT_RESULT_WAIT_SECONDS
+    try:
+        return int(raw)
+    except ValueError:
+        # An unparseable override falls back to the default rather than to some
+        # unrelated shorter window, which is what silently shrank this wait 10x
+        # once already.
+        return _DEFAULT_RESULT_WAIT_SECONDS
 
 
 class OpenProjectRailsRunnerService:
@@ -970,14 +993,22 @@ class OpenProjectRailsRunnerService:
         Args:
             query: Rails query to execute; will be coerced to JSON in Ruby
             container_file: Absolute path inside the container to write JSON content
-            timeout: Optional Ruby execution timeout. When ``None`` the per-path
-                defaults are used: 90s for the persistent tmux console
-                ``execute()`` call and 300s for ``bundle exec rails runner``
-                subprocesses (the runner has higher cold-start cost on large
-                projects). These values are deliberately tighter than the
-                ``RailsConsoleClient.command_timeout`` default (180s) — large
-                JSON queries should fail fast when the console is unstable so
-                the rails-runner fallback can take over.
+            timeout: Optional Ruby execution timeout. When ``None`` the console
+                path uses :func:`result_wait_seconds` — the same budget the
+                result-file poll below gets — and ``bundle exec rails runner``
+                subprocesses use 300s (the runner has higher cold-start cost on
+                large projects).
+
+                The console default used to be 90s, on the reasoning that a
+                large JSON query should fail fast so the rails-runner fallback
+                could take over. That reasoning no longer holds: the fallback
+                fires on console *exceptions*, and a completion marker that
+                simply arrives late is not one — the call warns and lets the
+                result-file poll finish the job. So a short value here bought
+                nothing and cost a scary log line on every script slower than
+                90s, plus a switch from cheap local tmux polling to SSH
+                polling. A genuinely wedged console still fails fast, through
+                ``_has_fatal_console_error``.
 
         Returns:
             Parsed JSON data
@@ -1101,7 +1132,7 @@ class OpenProjectRailsRunnerService:
                 try:
                     _console_output = client.rails_client.execute(
                         f"load '{runner_script_path}'",
-                        timeout=timeout or 90,
+                        timeout=timeout or result_wait_seconds(),
                         suppress_output=True,
                     )
                     self.check_console_output_for_errors(
@@ -1137,7 +1168,7 @@ class OpenProjectRailsRunnerService:
             try:
                 _console_output = client.rails_client.execute(
                     ruby_script,
-                    timeout=timeout or 90,
+                    timeout=timeout or result_wait_seconds(),
                     suppress_output=True,
                 )
                 self.check_console_output_for_errors(
@@ -1197,15 +1228,7 @@ class OpenProjectRailsRunnerService:
         client = self._client
         ssh_command = f"docker exec {shlex.quote(client.container_name)} cat {shlex.quote(container_file)}"
 
-        wait_env = os.environ.get("J2O_QUERY_RESULT_WAIT_SECONDS")
-        try:
-            max_wait_seconds = int(wait_env) if wait_env else 600
-        except Exception:
-            # Invalid env value: fall back to the same 600s default as the
-            # no-env branch instead of an unrelated 60s short window. The
-            # original 60s here was a copy-paste from another caller and
-            # made invalid env values silently shrink the wait by 10×.
-            max_wait_seconds = 600
+        max_wait_seconds = result_wait_seconds()
         poll_interval = 0.5
         attempts = max(1, int(max_wait_seconds / poll_interval))
 

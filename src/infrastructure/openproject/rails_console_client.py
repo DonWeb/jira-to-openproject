@@ -1073,10 +1073,16 @@ class RailsConsoleClient:
                 msg = f"Error capturing tmux pane: {e}"
                 raise CommandExecutionError(msg) from e
 
+        # DEBUG, not ERROR: whether this is a failure is the caller's call, and
+        # only the caller knows. The script-end path raises straight after, so
+        # the exception is the signal; the suppressed path warns and lets the
+        # result-file poll adjudicate, which is a recoverable wait rather than
+        # an error. Logging ERROR here reported a completed 1581s ``sprint_epic``
+        # run as broken — the marker simply arrived after this window closed.
         if marker is not None:
-            logger.error("Marker '%s' not found after %ss", marker, timeout)
+            logger.debug("Marker '%s' not found after %ss", marker, timeout)
         else:
-            logger.error("Console output wait timed out after %ss without marker", timeout)
+            logger.debug("Console output wait timed out after %ss without marker", timeout)
         return False, current_output
 
     def _wait_for_console_ready(self, target: str, timeout: int = 5, *, reset_on_stall: bool = True) -> bool:
@@ -1262,7 +1268,7 @@ class RailsConsoleClient:
                         snippet = self._extract_error_summary(pane_output)
                         msg = f"Rails console crashed before script-end echo: {snippet}"
                         raise ConsoleNotReadyError(msg)
-                    msg = "Script end echo not observed in console output"
+                    msg = f"Script end echo not observed in console output within {timeout}s"
                     raise CommandExecutionError(msg)
 
                 # Wait for any new output beyond script-end echo
