@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from src.display import ExtendedLogger, configure_logging
+from src.type_definitions import DirType
 
 # Module-level idempotency flag. Once bootstrap has run, repeat calls are
 # no-ops regardless of which side effects they request.
@@ -53,7 +54,11 @@ def _logs_dir() -> Path:
     """
     from src.config import var_dirs
 
-    key = "logs_test_suite" if _running_under_pytest() else "logs"
+    # Annotated because the conditional widens both branches to ``str``, and
+    # ``var_dirs`` is keyed by ``DirType`` — mypy rejects the lookup otherwise.
+    # Naming the type also means a third branch added later gets checked
+    # against the real set of directories rather than accepting any string.
+    key: DirType = "logs_test_suite" if _running_under_pytest() else "logs"
     log_dir = var_dirs[key]
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
