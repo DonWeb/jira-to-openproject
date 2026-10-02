@@ -305,7 +305,13 @@ class WatcherMigration(BaseMigration):
         # just "how many".
         skip_reasons_with_bulk: dict[str, int] = dict(skip_reasons)
         if bulk_skipped:
-            skip_reasons_with_bulk["bulk_dedup_or_invalid"] = bulk_skipped
+            # ``bulk_already_present``, not ``bulk_dedup_or_invalid``: the Ruby
+            # that produces this number sends anything invalid — a work package
+            # or user it cannot find — to ``failed``, and counts here only the
+            # (work package, user) pairs already in ``watchers``. The old name
+            # suggested the two were mixed, which is what made a clean run look
+            # like it might be hiding 8711 lost watchers.
+            skip_reasons_with_bulk["bulk_already_present"] = bulk_skipped
         total_skipped = skipped + bulk_skipped
         result.details.update(
             {
@@ -315,12 +321,22 @@ class WatcherMigration(BaseMigration):
                 "unmapped_users": sorted_unmapped_users,
                 "unmapped_user_count": len(sorted_unmapped_users),
                 "errors": errors,
+                "already_present": bulk_skipped,
                 # The orchestrator's summary reads these three names and no
                 # others, the way ``relation_migration`` already supplies them.
-                # Without them a run that considered 8711 watchers and created
-                # none summarised as "0/0 items migrated", which reads as
-                # "nothing to do" rather than "none of them landed".
-                "success_count": created,
+                #
+                # A watcher that was already there counts as success: this
+                # component is idempotent and the end state is what it reports
+                # on. ``work_packages_content`` runs first and creates them, so
+                # the normal result here is "created 0, found all 8711" — and
+                # counting only ``created`` rendered that as "0/8711 items
+                # migrated", which reads as total loss. Verified against the
+                # database on 2026-10-02: 8711 present, 0 orphaned.
+                #
+                # Skips from *before* the bulk call — unmapped user, missing
+                # work package — are real losses and stay out of the numerator,
+                # so they still show up as a shortfall against the total.
+                "success_count": created + bulk_skipped,
                 "failed_count": errors,
                 "total_count": created + total_skipped + errors,
             },

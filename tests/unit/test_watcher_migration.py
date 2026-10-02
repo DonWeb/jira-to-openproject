@@ -266,7 +266,7 @@ def test_skip_reasons_breakdown_sums_to_total_skipped(
     Mirror of the relation-side ``test_run_skip_reasons_breakdown_sums_to_total_skipped``.
     Pins the load-bearing invariant: a future refactor that
     introduces a bare ``skipped += 1`` (bypassing the Counter) or
-    stops adding ``bulk_dedup_or_invalid`` to the breakdown dict
+    stops adding ``bulk_already_present`` to the breakdown dict
     would silently desynchronize the breakdown from the aggregate.
     Multiple buckets fire simultaneously here so the sum-check is
     actually exercised.
@@ -397,3 +397,79 @@ def test_watchers_added_without_issue_cache(
     assert "J1" in jira.calls, jira.calls
     # No ``empty_issue`` skip reason — that bucket has been removed.
     assert "empty_issue" not in res.details["skip_reasons"], res.details
+
+
+# ── what "migrated" means for an idempotent component ────────────────────────
+#
+# ``work_packages_content`` runs first and creates the watchers, so the normal
+# result here is "created 0, found all of them already there". Counting only
+# ``created`` rendered the 2026-09-30 run as "0/8711 items migrated", which
+# reads as total loss. It was not: a database probe on 2026-10-02 found all
+# 8711 present on the migrated work packages, with zero orphans.
+
+
+class _AllAlreadyPresentOpClient(DummyOpClient):
+    """Every watcher sent is already in OpenProject — the production case."""
+
+    def bulk_add_watchers(self, watchers: list[dict]):
+        self.bulk_watchers.extend(watchers)
+        return {"created": 0, "skipped": len(watchers), "failed": 0}
+
+
+def _run_with(op, jira, tmp_path, issues: str = '{"J1": {"key": "J1"}}'):
+    wm = WatcherMigration(jira_client=jira, op_client=op)  # type: ignore[arg-type]
+    cache_dir = tmp_path / "data"
+    cache_dir.mkdir()
+    (cache_dir / "jira_issues_cache.json").write_text(issues)
+    wm.data_dir = cache_dir
+    return wm.run()
+
+
+def test_watchers_already_present_count_as_migrated(_map_store, tmp_path) -> None:
+    """The end state is what this component reports on."""
+
+    class DummyJira:
+        def get_issue_watchers(self, key: str):
+            return [{"name": "alice"}]
+
+    res = _run_with(_AllAlreadyPresentOpClient(), DummyJira(), tmp_path)
+
+    assert res.details["success_count"] == 1
+    assert res.details["total_count"] == 1
+    assert res.details["failed_count"] == 0
+    assert res.success is True
+
+
+def test_the_bucket_says_present_not_invalid(_map_store, tmp_path) -> None:
+    """The Ruby sends anything invalid to ``failed``; this bucket is dedup only.
+
+    The old name, ``bulk_dedup_or_invalid``, is what made a clean run look like
+    it might be hiding thousands of lost watchers.
+    """
+
+    class DummyJira:
+        def get_issue_watchers(self, key: str):
+            return [{"name": "alice"}]
+
+    res = _run_with(_AllAlreadyPresentOpClient(), DummyJira(), tmp_path)
+
+    assert res.details["skip_reasons"].get("bulk_already_present") == 1
+    assert "bulk_dedup_or_invalid" not in res.details["skip_reasons"]
+    assert res.details["already_present"] == 1
+
+
+def test_a_watcher_dropped_before_the_bulk_call_is_not_success(_map_store, tmp_path) -> None:
+    """Real loss must stay out of the numerator and show as a shortfall.
+
+    An unmapped user never reaches OpenProject at all, so it is nothing like a
+    watcher that is already there.
+    """
+
+    class DummyJira:
+        def get_issue_watchers(self, key: str):
+            return [{"name": "alice"}, {"name": "nobody-in-the-mapping"}]
+
+    res = _run_with(_AllAlreadyPresentOpClient(), DummyJira(), tmp_path)
+
+    assert res.details["success_count"] == 1
+    assert res.details["total_count"] == 2, res.details
