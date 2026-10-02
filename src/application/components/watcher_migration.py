@@ -306,17 +306,26 @@ class WatcherMigration(BaseMigration):
         skip_reasons_with_bulk: dict[str, int] = dict(skip_reasons)
         if bulk_skipped:
             skip_reasons_with_bulk["bulk_dedup_or_invalid"] = bulk_skipped
+        total_skipped = skipped + bulk_skipped
         result.details.update(
             {
                 "created": created,
-                "skipped": skipped + bulk_skipped,
+                "skipped": total_skipped,
                 "skip_reasons": skip_reasons_with_bulk,
                 "unmapped_users": sorted_unmapped_users,
                 "unmapped_user_count": len(sorted_unmapped_users),
                 "errors": errors,
+                # The orchestrator's summary reads these three names and no
+                # others, the way ``relation_migration`` already supplies them.
+                # Without them a run that considered 8711 watchers and created
+                # none summarised as "0/0 items migrated", which reads as
+                # "nothing to do" rather than "none of them landed".
+                "success_count": created,
+                "failed_count": errors,
+                "total_count": created + total_skipped + errors,
             },
         )
         result.success = errors == 0
-        result.message = f"Watchers created={created}, skipped={skipped + bulk_skipped}, errors={errors}"
+        result.message = f"Watchers created={created}, skipped={total_skipped}, errors={errors}"
         logger.info(result.message)
         return result

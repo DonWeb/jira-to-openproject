@@ -229,6 +229,24 @@ def _extract_counts(result: ComponentResult) -> tuple[int, int, int]:
         failed_count = d_fail or m_fail
         total_count = d_total or m_total
 
+        # 2b) ``updated``/``failed`` — the pair most components actually fill in.
+        #
+        # ``ComponentResult`` carries both as first-class fields and this
+        # extractor ignored them, so a component that reported its work only
+        # that way summarised as "0/0 items migrated" no matter how much it
+        # had done. On the 2026-09-30 run that was eight of them at once,
+        # including ``customfields_generic`` (24492 updates, 88 minutes) and
+        # ``sprint_epic`` (11918). Read after the explicit counters so a
+        # component that sets both keeps the summary it chose.
+        if success_count == 0:
+            success_count = int(getattr(result, "updated", 0) or 0)
+            if success_count == 0 and isinstance(details, dict):
+                success_count = int(details.get("updated", 0) or 0)
+        if failed_count == 0:
+            failed_count = int(getattr(result, "failed", 0) or 0)
+            if failed_count == 0 and isinstance(details, dict):
+                failed_count = int(details.get("failed", 0) or 0)
+
         # 3) Derive from common shapes when still missing
         if (success_count == 0 and failed_count == 0) or total_count == 0:
             # Work packages: total_created / total_issues (either in details or data)
@@ -283,6 +301,13 @@ def _extract_counts(result: ComponentResult) -> tuple[int, int, int]:
         # 4) Final fallback
         if total_count == 0:
             total_count = success_count + failed_count
+
+        # A total smaller than what it is meant to contain reads as broken
+        # ("11918/0 items migrated"), and always means the pieces came from
+        # different sources. Items neither migrated nor failed — skipped ones —
+        # keep the total above the sum, which is why this is a floor and not an
+        # assignment.
+        total_count = max(total_count, success_count + failed_count)
 
         return int(success_count), int(failed_count), int(total_count)
     except Exception:

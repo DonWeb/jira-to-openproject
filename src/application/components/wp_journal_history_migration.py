@@ -503,5 +503,13 @@ class WpJournalHistoryMigration(BaseMigration):
                 f"Rebuilt activity on {details['wp_rebuilt']} work packages"
                 f" ({details['journals_created']} journals, {wp_failed} failed)"
             ),
+            # The unit is the work package, not the journal: a run that rebuilds
+            # 6685 of 6782 has done 6685 things, and the 109957 journals are how
+            # much writing that took. Without these the orchestrator had nothing
+            # countable to read and summarised 21 minutes of work as "0/0 items
+            # migrated".
+            success_count=details["wp_rebuilt"],
+            failed_count=wp_failed,
+            total_count=details["wp_mapping_rows"],
             details=details,
         )
